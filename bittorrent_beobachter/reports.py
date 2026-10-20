@@ -31,6 +31,37 @@ from typing import Any
 from .models import EvidenceRecord, ScanResult
 
 PROJECT_REPOSITORY_URL = "https://github.com/marioco/AfDLeakercatcher"
+PUBLISHED_SOURCE_URL = "https://hexane.cc/"
+PROJECT_ORIGINAL_MAGNET_LINKS = (
+    (
+        "magnet:?xt=urn:btih:852795102149749ad91123af01ceac5da6f9eb5a"
+        "&dn=hexane-corpus-tar"
+        "&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce"
+        "&tr=udp%3A%2F%2Fopen.demonii.com%3A1337%2Fannounce"
+        "&tr=udp%3A%2F%2Ftracker.torrent.eu.org%3A451%2Fannounce"
+        "&tr=udp%3A%2F%2Fexodus.desync.com%3A6969%2Fannounce"
+        "&tr=udp%3A%2F%2Ftracker.openbittorrent.com%3A6969%2Fannounce"
+        "&tr=udp%3A%2F%2Fopen.stealth.si%3A80%2Fannounce"
+        "&tr=udp%3A%2F%2Fexplodie.org%3A6969%2Fannounce"
+        "&tr=udp%3A%2F%2Ftracker.dler.org%3A6969%2Fannounce"
+        "&tr=udp%3A%2F%2Ftracker.bittor.pw%3A1337%2Fannounce"
+        "&tr=udp%3A%2F%2Fretracker01-msk-virt.corbina.net%3A80%2Fannounce"
+    ),
+    (
+        "magnet:?xt=urn:btih:db503db679f508aa31a9e07913b2aa8cf7aa6dff"
+        "&dn=hexane-corpus"
+        "&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce"
+        "&tr=udp%3A%2F%2Fopen.demonii.com%3A1337%2Fannounce"
+        "&tr=udp%3A%2F%2Ftracker.torrent.eu.org%3A451%2Fannounce"
+        "&tr=udp%3A%2F%2Fexodus.desync.com%3A6969%2Fannounce"
+        "&tr=udp%3A%2F%2Ftracker.openbittorrent.com%3A6969%2Fannounce"
+        "&tr=udp%3A%2F%2Fopen.stealth.si%3A80%2Fannounce"
+        "&tr=udp%3A%2F%2Fexplodie.org%3A6969%2Fannounce"
+        "&tr=udp%3A%2F%2Ftracker.dler.org%3A6969%2Fannounce"
+        "&tr=udp%3A%2F%2Ftracker.bittor.pw%3A1337%2Fannounce"
+        "&tr=udp%3A%2F%2Fretracker01-msk-virt.corbina.net%3A80%2Fannounce"
+    ),
+)
 PROJECT_LEAK_INFO_HASHES = frozenset(
     {
         "852795102149749ad91123af01ceac5da6f9eb5a",
@@ -1517,23 +1548,22 @@ def _write_complaint_email(
     if project_hashes:
         published_facts = "\n".join(f"- {fact}" for fact in PUBLISHED_DATASET_FACTS)
         legal_points = "\n".join(f"- {point}" for point in PROJECT_LEGAL_REVIEW_POINTS)
+        original_magnets = "\n".join(f"- {magnet}" for magnet in PROJECT_ORIGINAL_MAGNET_LINKS)
         possible_act = (
-            "Hiermit erstatte ich Strafanzeige gegen Unbekannt. Nach der öffentlichen "
-            "Beschreibung sollen die Daten ohne Berechtigung von Servern bzw. "
-            "Postfächern der AfD kopiert worden sein und nun über BitTorrent "
-            "verbreitet werden. BitTorrent ist ein Internet-Tauschsystem: Beteiligte "
-            "Computer können Daten empfangen und vorhandene Teile gleichzeitig anderen "
-            "Nutzern zum Abruf anbieten. Die veröffentlichende Seite beziffert das dort "
-            "als sogenannten AfD-Datenleak beschriebene Material wie folgt:\n"
+            "Hiermit erstatte ich Strafanzeige gegen Unbekannt.\n\n"
+            "Am 19. Oktober 2026 wurden auf der Internetseite "
+            f"{PUBLISHED_SOURCE_URL} zwei BitTorrent-Links veröffentlicht:\n"
+            f"{original_magnets}\n\n"
+            "Nach der öffentlichen Beschreibung sollen die Daten ohne Berechtigung "
+            "von Servern bzw. Postfächern der AfD kopiert worden sein und nun über "
+            "BitTorrent verbreitet werden. BitTorrent ist ein Internet-Tauschsystem: "
+            "Beteiligte Computer können Daten empfangen und vorhandene Teile "
+            "gleichzeitig anderen Nutzern zum Abruf anbieten. Die veröffentlichende "
+            "Seite beziffert das dort als sogenannten AfD-Datenleak beschriebene "
+            "Material wie folgt:\n"
             f"{published_facts}\n\n"
-            "Diese Angaben werden als zugrunde gelegter Sachverhalt wiedergegeben. "
-            "Das Programm hat die Inhalte nicht abgerufen oder geprüft; die Angaben "
-            "sind mit dieser Anzeige nicht gerichtlich bewiesen.\n\n"
-            "Bitte prüfen Sie einen möglichen Anfangsverdacht insbesondere "
-            "hinsichtlich:\n"
-            f"{legal_points}\n\n"
-            "Der technische Befund allein belegt keines der gesetzlichen "
-            "Tatbestandsmerkmale."
+            "Bitte prüfen Sie insbesondere folgende Straftatbestände:\n"
+            f"{legal_points}"
         )
     else:
         possible_act = (
@@ -1544,26 +1574,37 @@ def _write_complaint_email(
             "Inhalts voraus."
         )
 
+    if project_hashes:
+        ip_finding = (
+            "Bei der gezielten Überprüfung wurde die öffentliche IP-Adresse "
+            f"{aggregate.ip} als BitTorrent-Endpunkt ermittelt. Der Endpunkt "
+            "bestätigte die überwachte eindeutige digitale Kennung (Infohash). "
+            "Unter dieser IP wurden nach dem dokumentierten BitTorrent-Protokollbefund "
+            "Teile des mutmaßlich rechtswidrig entwendeten Datenbestands \N{EN DASH} "
+            "möglicherweise auch der vollständige Bestand \N{EN DASH} zum Download angeboten."
+        )
+    else:
+        ip_finding = (
+            "Bei der gezielten Überprüfung der dokumentierten Infohashes wurde die "
+            f"öffentliche IP-Adresse {aggregate.ip} als BitTorrent-Endpunkt ermittelt. "
+            "Der Endpunkt bestätigte die überwachte eindeutige digitale Kennung "
+            "(Infohash)."
+        )
+
     body = (
         "Sehr geehrte Damen und Herren,\n\n"
-        "1. Mögliche Tat\n"
+        "1. Gegenstand der Strafanzeige\n"
         f"{possible_act}"
         f"{additional_legal_text}\n\n"
-        "2. Fund der IP-Adresse\n"
-        "Bei der gezielten Überprüfung der dokumentierten Infohashes wurde die "
-        f"öffentliche IP-Adresse {aggregate.ip} als BitTorrent-Endpunkt ermittelt. "
-        "Der Endpunkt beantwortete den BitTorrent-Handshake für die überwachte "
-        "eindeutige digitale Kennung (Infohash). Beobachtungszeitraum (UTC): "
-        f"{row['erste_beobachtung_utc']} bis {row['letzte_beobachtung_utc']}. "
-        "Eine IP-Adresse identifiziert für sich allein keine Person.\n\n"
-        "3. Direkte Verfügbarkeitsprüfung\n"
+        "2. Ermittlung der IP-Adresse\n"
+        f"{ip_finding} Beobachtungszeitraum (UTC): "
+        f"{row['erste_beobachtung_utc']} bis {row['letzte_beobachtung_utc']}.\n\n"
+        "3. Direkte Überprüfung des BitTorrent-Clients\n"
         f"{direct_check}\n\n"
-        "4. Technischer Beleg und Nachprüfbarkeit\n"
+        "4. Technischer Beleg\n"
         f"Die technischen Einzelheiten stehen in der angehängten PDF-Datei "
         f"{attachment_pdf.name}. Quellcode und Beschreibung der Messmethode sind "
-        f"unter {PROJECT_REPOSITORY_URL} öffentlich einsehbar. Das Repository "
-        "macht die Methode nachprüfbar; es belegt nicht für sich allein die "
-        "konkrete Beobachtung.\n\n"
+        f"unter {PROJECT_REPOSITORY_URL} öffentlich einsehbar.\n\n"
         "Ich bitte um Aufnahme der Ermittlungen gegen Unbekannt, um zeitnahe "
         "Sicherung der zum genauen Beobachtungszeitpunkt verfügbaren Anschlussdaten "
         "und um Ermittlung der verantwortlichen Person. Bitte bestätigen Sie den "

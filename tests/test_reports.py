@@ -26,6 +26,7 @@ from bittorrent_beobachter.models import (
 )
 from bittorrent_beobachter.reports import (
     PROJECT_LEGAL_REVIEW_POINTS,
+    PROJECT_ORIGINAL_MAGNET_LINKS,
     ReportConfig,
     _format_endpoint,
     _publish_staged_files,
@@ -34,6 +35,37 @@ from bittorrent_beobachter.reports import (
 )
 
 REPORTLAB_AVAILABLE = importlib.util.find_spec("reportlab") is not None
+
+EXPECTED_PROJECT_MAGNET_LINKS = (
+    (
+        "magnet:?xt=urn:btih:852795102149749ad91123af01ceac5da6f9eb5a"
+        "&dn=hexane-corpus-tar"
+        "&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce"
+        "&tr=udp%3A%2F%2Fopen.demonii.com%3A1337%2Fannounce"
+        "&tr=udp%3A%2F%2Ftracker.torrent.eu.org%3A451%2Fannounce"
+        "&tr=udp%3A%2F%2Fexodus.desync.com%3A6969%2Fannounce"
+        "&tr=udp%3A%2F%2Ftracker.openbittorrent.com%3A6969%2Fannounce"
+        "&tr=udp%3A%2F%2Fopen.stealth.si%3A80%2Fannounce"
+        "&tr=udp%3A%2F%2Fexplodie.org%3A6969%2Fannounce"
+        "&tr=udp%3A%2F%2Ftracker.dler.org%3A6969%2Fannounce"
+        "&tr=udp%3A%2F%2Ftracker.bittor.pw%3A1337%2Fannounce"
+        "&tr=udp%3A%2F%2Fretracker01-msk-virt.corbina.net%3A80%2Fannounce"
+    ),
+    (
+        "magnet:?xt=urn:btih:db503db679f508aa31a9e07913b2aa8cf7aa6dff"
+        "&dn=hexane-corpus"
+        "&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce"
+        "&tr=udp%3A%2F%2Fopen.demonii.com%3A1337%2Fannounce"
+        "&tr=udp%3A%2F%2Ftracker.torrent.eu.org%3A451%2Fannounce"
+        "&tr=udp%3A%2F%2Fexodus.desync.com%3A6969%2Fannounce"
+        "&tr=udp%3A%2F%2Ftracker.openbittorrent.com%3A6969%2Fannounce"
+        "&tr=udp%3A%2F%2Fopen.stealth.si%3A80%2Fannounce"
+        "&tr=udp%3A%2F%2Fexplodie.org%3A6969%2Fannounce"
+        "&tr=udp%3A%2F%2Ftracker.dler.org%3A6969%2Fannounce"
+        "&tr=udp%3A%2F%2Ftracker.bittor.pw%3A1337%2Fannounce"
+        "&tr=udp%3A%2F%2Fretracker01-msk-virt.corbina.net%3A80%2Fannounce"
+    ),
+)
 
 
 def _evidence_record(
@@ -243,10 +275,10 @@ class ReportGenerationTests(unittest.TestCase):
             plain_body = message.get_body(preferencelist=("plain",)).get_content()
             self.assertIn("Hiermit erstatte ich Strafanzeige gegen Unbekannt", plain_body)
             self.assertIn("Vorgangsnummer oder das Aktenzeichen", plain_body)
-            self.assertIn("1. Mögliche Tat", plain_body)
-            self.assertIn("2. Fund der IP-Adresse", plain_body)
-            self.assertIn("3. Direkte Verfügbarkeitsprüfung", plain_body)
-            self.assertIn("4. Technischer Beleg und Nachprüfbarkeit", plain_body)
+            self.assertIn("1. Gegenstand der Strafanzeige", plain_body)
+            self.assertIn("2. Ermittlung der IP-Adresse", plain_body)
+            self.assertIn("3. Direkte Überprüfung des BitTorrent-Clients", plain_body)
+            self.assertIn("4. Technischer Beleg", plain_body)
             self.assertIn("meldete, dass bei ihm Teile verfügbar seien", plain_body)
             self.assertIn("technische Nachricht: UNCHOKE", plain_body)
             self.assertIn("forderte diese Teile nicht an", plain_body)
@@ -269,7 +301,7 @@ class ReportGenerationTests(unittest.TestCase):
                 actual_hash = hashlib.sha256(by_name[filename].read_bytes()).hexdigest()
                 self.assertEqual(expected_hash, actual_hash)
 
-    def test_project_case_creates_clear_complaint_without_hashes_in_email(self) -> None:
+    def test_project_case_creates_complete_complaint_email(self) -> None:
         project_hash = "852795102149749ad91123af01ceac5da6f9eb5a"
         custom_hash = "f" * 40
         result = ScanResult(
@@ -304,6 +336,22 @@ class ReportGenerationTests(unittest.TestCase):
             )
             body = message.get_body(preferencelist=("plain",)).get_content()
             self.assertIn("Hiermit erstatte ich Strafanzeige gegen Unbekannt", body)
+            headings = (
+                "1. Gegenstand der Strafanzeige",
+                "2. Ermittlung der IP-Adresse",
+                "3. Direkte Überprüfung des BitTorrent-Clients",
+                "4. Technischer Beleg",
+            )
+            heading_positions = [body.index(heading) for heading in headings]
+            self.assertEqual(heading_positions, sorted(heading_positions))
+            self.assertIn("2026-10-20T10:09:02Z", body)
+            self.assertIn("2026-10-20T10:10:02Z", body)
+            self.assertIn("(60.0 Sekunden; vorgesehen: 60.0 Sekunden)", body)
+            self.assertIn(
+                "Am 19. Oktober 2026 wurden auf der Internetseite "
+                "https://hexane.cc/ zwei BitTorrent-Links veröffentlicht:",
+                body,
+            )
             self.assertIn("ohne Berechtigung von Servern", body)
             self.assertIn("nun über BitTorrent verbreitet werden", body)
             self.assertIn("281,2 GB", body)
@@ -313,7 +361,19 @@ class ReportGenerationTests(unittest.TestCase):
             self.assertIn("3.230 sensible Datensätze", body)
             self.assertIn("57.000 Einträge", body)
             self.assertIn("180 Datenbanken", body)
-            self.assertIn("nicht gerichtlich bewiesen", body)
+            self.assertEqual(PROJECT_ORIGINAL_MAGNET_LINKS, EXPECTED_PROJECT_MAGNET_LINKS)
+            for magnet in EXPECTED_PROJECT_MAGNET_LINKS:
+                self.assertIn(magnet, body)
+            self.assertEqual(body.count("magnet:?xt=urn:btih:"), 2)
+            self.assertEqual(body.count("tracker.openbittorrent.com%3A6969"), 2)
+            self.assertNotIn("tracker.openbittorent.com", body)
+            self.assertIn(
+                "Unter dieser IP wurden nach dem dokumentierten "
+                "BitTorrent-Protokollbefund Teile des mutmaßlich rechtswidrig "
+                "entwendeten Datenbestands \N{EN DASH} möglicherweise auch der vollständige "
+                "Bestand \N{EN DASH} zum Download angeboten.",
+                body,
+            )
             self.assertIn("Aufnahme der Ermittlungen gegen Unbekannt", body)
             self.assertIn("zeitnahe Sicherung", body)
             self.assertIn("Ermittlung der verantwortlichen Person", body)
@@ -321,11 +381,17 @@ class ReportGenerationTests(unittest.TestCase):
             self.assertIn("https://github.com/marioco/AfDLeakercatcher", body)
             for point in PROJECT_LEGAL_REVIEW_POINTS:
                 self.assertIn(point, body)
-            self.assertNotIn(project_hash, body)
             self.assertNotIn(custom_hash, body)
+            self.assertNotIn("Eine IP-Adresse identifiziert", body)
+            self.assertNotIn("belegt keines der gesetzlichen Tatbestandsmerkmale", body)
+            self.assertNotIn("belegt nicht für sich allein die konkrete Beobachtung", body)
             self.assertNotIn("ENTWURF", body)
 
             pdf_path = by_name["project-case_anlage_ipv4_198_51_100_80.pdf"]
+            attachments = list(message.iter_attachments())
+            self.assertEqual(len(attachments), 1)
+            self.assertEqual(attachments[0].get_filename(), pdf_path.name)
+            self.assertEqual(attachments[0].get_payload(decode=True), pdf_path.read_bytes())
             pdf_bytes = pdf_path.read_bytes()
             self.assertIn(b"Technische Anlage zur Strafanzeige", pdf_bytes)
             self.assertNotIn(b"ENTWURF", pdf_bytes)
