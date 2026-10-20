@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -25,13 +26,15 @@ from bittorrent_beobachter.config import (
     default_app_config,
     parse_magnet,
 )
-from bittorrent_beobachter.evidence import EvidenceJournal
+from bittorrent_beobachter.evidence import EvidenceJournal, canonical_json_bytes
 from bittorrent_beobachter.models import (
+    EvidenceRecord,
     HandshakeResult,
     NetworkEnrichment,
     PeerAvailabilityObservation,
     PeerCandidate,
     Target,
+    VpnClassification,
 )
 from bittorrent_beobachter.monitor import MonitorError, run_scan
 from bittorrent_beobachter.run_store import RunStore
@@ -236,8 +239,10 @@ def _install_run_fake(
         _report_config: Any,
         *,
         generated_at_utc: str,
+        changed_ips: Any = None,
     ) -> list[Path]:
         assert generated_at_utc.endswith("Z")
+        assert changed_ips is None or len(changed_ips) <= 5
         report_generations.append(_result.offering_count)
         output_dir.mkdir(parents=True, exist_ok=True)
         report = output_dir / "bericht.pdf"
@@ -298,6 +303,9 @@ def test_run_scan_persists_batches_and_keeps_large_lists_empty(
     assert journal_batch_sizes == [1, 5, 3, 1]
     assert report_generations == [5, 8]
     assert [count for _path, count in ready_events] == [5, 8]
+    intermediate_dirs = tuple((tmp_path / "reports" / result.run_id).glob("zwischenstand-*"))
+    assert len(intermediate_dirs) == 1
+    assert (intermediate_dirs[0] / "bericht.pdf").is_file()
     assert len(enrichment_calls) == 4
     assert {item.info_hash_hex for item in result.target_metrics} == {
         HASH_A.hex(),
@@ -319,6 +327,19 @@ def test_run_scan_persists_batches_and_keeps_large_lists_empty(
     assert events[-1]["report_manifest"] == "bericht.pdf"
     assert events[-1]["report_manifest_sha256"] == hashlib.sha256(b"offline-test").hexdigest()
     assert "report_files" not in events[-1]
+
+    config_snapshot = result.run_store_path.with_suffix(".config.json")
+    snapshot_payload = json.loads(config_snapshot.read_text(encoding="utf-8"))
+    assert (
+        hashlib.sha256(canonical_json_bytes(snapshot_payload)).hexdigest()
+        == events[0]["config_sha256"]
+    )
+    assert events[0]["config_snapshot"] == config_snapshot.name
+    assert (
+        events[0]["config_snapshot_file_sha256"]
+        == hashlib.sha256(config_snapshot.read_bytes()).hexdigest()
+    )
+    assert events[-1]["config_snapshot"] == config_snapshot.name
 
     if os.name != "nt":
         assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o700
@@ -344,6 +365,103 @@ def test_disabled_enrichment_never_constructs_network_client(
         record.vpn.status == "known_vpn" or "deaktiviert" in (record.enrichment.error or "")
         for record in records
     )
+
+
+def test_previous_evidence_is_recovered_before_new_network_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    ready_events: list[tuple[Path, int]] = []
+    config = _config(enrichment_enabled=False)
+    candidate = _candidate(config.targets[0], 7)
+    record = EvidenceRecord(
+        handshake=_handshake(candidate),
+        enrichment=NetworkEnrichment(
+            ip=candidate.ip,
+            enriched_at_utc="2026-10-20T10:01:00.000Z",
+        ),
+        vpn=VpnClassification(status="unknown", provider=None, reason="kein Treffer"),
+        evidence_event_sha256="ab" * 32,
+    )
+
+    def fake_recover(
+        evidence_dir: Path,
+        *,
+        on_reconciled: Any,
+        **_kwargs: Any,
+    ) -> Any:
+        order.append("recovery")
+        assert not tuple((evidence_dir / "runs").glob("*.sqlite3"))
+        on_reconciled(
+            monitor.RecoveredEvidenceBatch(
+                run_id="legacy-compatible-run",
+                config_sha256=monitor._config_sha256(config),
+                software_sha256="ef" * 32,
+                config_snapshot=None,
+                config_snapshot_file_sha256=None,
+                records=(record,),
+            )
+        )
+        return SimpleNamespace(inserted_records=1)
+
+    async def fake_network(*_args: Any, **_kwargs: Any) -> list[str]:
+        order.append("network")
+        return []
+
+    def fake_reports(
+        result: Any,
+        output_dir: Path,
+        _report_config: Any,
+        **_kwargs: Any,
+    ) -> list[Path]:
+        order.append("recovery-report" if result.records else "final-report")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        report = output_dir / "bericht.pdf"
+        report.write_bytes(b"offline-test")
+        return [report]
+
+    monkeypatch.setattr(monitor, "recover_evidence_journal", fake_recover)
+    monkeypatch.setattr(monitor, "_network_phase", fake_network)
+    monkeypatch.setattr(monitor, "generate_reports", fake_reports)
+    monkeypatch.setattr(monitor, "_software_sha256", lambda: "ef" * 32)
+
+    run_scan(
+        config,
+        tmp_path,
+        reports_ready=lambda path, count: ready_events.append((path, count)),
+    )
+
+    assert order[:3] == ["recovery", "recovery-report", "network"]
+    assert ready_events[0][1] == 1
+    assert "legacy-compatible-run" in str(ready_events[0][0])
+
+
+def test_terminal_journal_event_is_not_duplicated_after_permission_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_run_fake(monkeypatch)
+    original_ensure_private_file = monitor._ensure_private_file
+
+    def fail_after_terminal_append(path: Path) -> None:
+        if path.name == "events.jsonl" and path.is_file():
+            events = [json.loads(line)["event"] for line in path.read_text().splitlines()]
+            if events and events[-1]["event_type"] == "scan_completed":
+                raise OSError("simulierter chmod-Fehler")
+        original_ensure_private_file(path)
+
+    monkeypatch.setattr(monitor, "_ensure_private_file", fail_after_terminal_append)
+
+    with pytest.raises(OSError, match="chmod-Fehler"):
+        run_scan(_config(enrichment_enabled=False), tmp_path)
+
+    events = [
+        json.loads(line)["event"]["event_type"]
+        for line in (tmp_path / "evidence" / "events.jsonl").read_text().splitlines()
+    ]
+    assert events.count("scan_completed") == 1
+    assert "scan_failed" not in events
 
 
 def test_controlled_cancel_flushes_partial_batch_and_writes_final_reports(
@@ -446,3 +564,109 @@ def test_network_timeout_is_sanitized_and_journaled(
     ]
     assert [event["event_type"] for event in events] == ["scan_started", "scan_failed"]
     assert "203.0.113" not in json.dumps(events[-1])
+
+
+def test_network_failure_flushes_positive_rest_batch_and_final_reports(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_run_fake(monkeypatch)
+    ready_events: list[tuple[Path, int]] = []
+
+    async def fail_after_three_results(
+        config: AppConfig,
+        store: RunStore,
+        _data_dir: Path,
+        runtimes: dict[str, Any],
+        _progress: Any,
+        **_kwargs: Any,
+    ) -> list[str]:
+        candidates = tuple(_candidate(config.targets[0], index) for index in range(3))
+        store.add_candidates(candidates)
+        claimed = store.claim_candidate_batch((config.targets[0].info_hash_hex,), size=5)
+        results = tuple(_handshake(candidate) for candidate in claimed)
+        store.store_handshake_batch(results)
+        runtimes[config.targets[0].info_hash_hex].verification_attempts += len(results)
+        raise OSError("sensitive endpoint 203.0.113.20:6881")
+
+    monkeypatch.setattr(monitor, "_network_phase", fail_after_three_results)
+
+    with pytest.raises(MonitorError, match="Netzwerkfehler"):
+        run_scan(
+            _config(enrichment_enabled=False),
+            tmp_path,
+            reports_ready=lambda path, count: ready_events.append((path, count)),
+        )
+
+    run_databases = tuple((tmp_path / "evidence" / "runs").glob("*.sqlite3"))
+    assert len(run_databases) == 1
+    assert RunStore(run_databases[0]).evidence_count() == 3
+    assert ready_events and ready_events[-1][1] == 3
+    assert any((tmp_path / "reports").rglob("bericht.pdf"))
+    events = [
+        json.loads(line)["event"]
+        for line in (tmp_path / "evidence" / "events.jsonl").read_text().splitlines()
+    ]
+    assert events[-1]["event_type"] == "scan_failed"
+    assert events[-1]["evidence_count"] == 3
+    assert "203.0.113" not in json.dumps(events[-1])
+
+
+def test_discovery_fails_when_no_configured_source_answers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        target = Target("Ziel ohne Quelle", HASH_A)
+        config = AppConfig(
+            targets=(target,),
+            dht=DhtSettings(
+                timeout_seconds=1.0,
+                overall_timeout_seconds=1.0,
+                concurrency=1,
+                quiet_seconds=1.0,
+                refresh_interval_seconds=0.1,
+                bootstrap_nodes=(("bootstrap.invalid", 6881),),
+            ),
+        )
+        store = RunStore(tmp_path / "no-source.sqlite3")
+        runtime = monitor._TargetRuntimeMetrics(target=target)
+        clock = [0.0]
+        real_sleep = asyncio.sleep
+
+        async def fake_sleep(delay: float) -> None:
+            clock[0] += delay
+            await real_sleep(0)
+
+        class NoAnswerCrawler:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                self.queries_started = 1
+                self.queries_completed = 0
+                self.queries_failed = 1
+                self.issue_count = 1
+                self.has_pending_work = False
+
+            def close(self) -> None:
+                return None
+
+            async def discover(self, *_args: object, **_kwargs: object) -> list[PeerCandidate]:
+                return []
+
+        monkeypatch.setattr(monitor, "DHTCrawler", NoAnswerCrawler)
+        monkeypatch.setattr(monitor.time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(monitor.asyncio, "sleep", fake_sleep)
+
+        with pytest.raises(MonitorError, match="Keine Peer-Quelle"):
+            await monitor._discover_target_until_quiet(
+                config,
+                target,
+                (("9.9.9.9", 6881),),
+                b"n" * 20,
+                store,
+                runtime,
+                tmp_path,
+                [],
+                lambda _message: None,
+            )
+
+    asyncio.run(scenario())

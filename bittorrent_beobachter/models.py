@@ -98,6 +98,32 @@ class HandshakeResult:
     error: str | None
     availability: PeerAvailabilityObservation | None = None
 
+    @staticmethod
+    def _simultaneous_offer_observed(
+        observation: PeerAvailabilityObservation,
+    ) -> bool:
+        """Prüft, ob gemeldete Stücke und UNCHOKE zeitgleich galten.
+
+        Historische Einzelmerkmale reichen nicht: Ein Peer, der zuerst kurz
+        UNCHOKE und erst nach einem späteren CHOKE ein BITFIELD sendet, hat zu
+        keinem dokumentierten Zeitpunkt Datenanfragen für gemeldete Stücke
+        freigegeben.
+        """
+        peer_choking = True
+        pieces_available = False
+        for event in observation.control_events:
+            if event.kind == "unchoke":
+                peer_choking = False
+            elif event.kind == "choke":
+                peer_choking = True
+            elif event.kind == "have" or (event.kind == "bitfield" and event.non_empty):
+                pieces_available = True
+            if pieces_available and not peer_choking:
+                return True
+        return bool(
+            observation.piece_availability_announced and not observation.peer_choking_at_end
+        )
+
     @property
     def offering_observed(self) -> bool:
         """Ein direkt validierter Verfügbarkeits- und Freigabebefund ohne Datenabruf."""
@@ -108,6 +134,7 @@ class HandshakeResult:
             and observation.interested_sent
             and observation.piece_availability_announced
             and observation.unchoked
+            and self._simultaneous_offer_observed(observation)
             and observation.request_messages_sent == 0
             and observation.piece_payload_bytes_received == 0
             and observation.metadata_requests_sent == 0
@@ -194,6 +221,7 @@ class ScanResult:
     run_store_path: Path | None = None
     report_paths: list[Path] = field(default_factory=list)
     cancelled: bool = False
+    enrichment_failure_count: int = 0
     errors: list[str] = field(default_factory=list)
     notices: list[str] = field(default_factory=list)
 

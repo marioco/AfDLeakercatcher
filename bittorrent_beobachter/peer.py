@@ -542,11 +542,8 @@ async def _observe_control_messages(
                     raise PeerProtocolError(
                         f"Fast-Extension-Nachricht {message_id} darf keine Nutzlast haben."
                     )
-                if message_id == MESSAGE_HAVE_ALL:
-                    state.have_announced = True
-                    event_kind = "have_all"
-                else:
-                    event_kind = "have_none"
+                # Ohne ausgehandeltes BEP 6 sind dies keine Stücknachweise.
+                event_kind = "have_all" if message_id == MESSAGE_HAVE_ALL else "have_none"
                 _record_event(state, event_kind, payload_length=0)
                 continue
 

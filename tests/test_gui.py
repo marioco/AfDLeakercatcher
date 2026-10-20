@@ -52,6 +52,7 @@ def _install_headless_tkinter() -> None:
         module.END = "end"
         module.LEFT = "left"
         module.RIGHT = "right"
+        module.Canvas = _TkBase
         module.X = "x"
         module.BooleanVar = object
         module.StringVar = object
@@ -86,6 +87,7 @@ class _WidgetDouble:
         self.options: dict[str, Any] = {}
         self.started = False
         self.stopped = False
+        self.scroll_calls: list[tuple[int, str]] = []
 
     def get_children(self) -> tuple[str, ...]:
         return tuple(str(index) for index, _item in enumerate(self.inserted))
@@ -111,6 +113,9 @@ class _WidgetDouble:
     def stop(self) -> None:
         self.stopped = True
 
+    def yview_scroll(self, amount: int, units: str) -> None:
+        self.scroll_calls.append((amount, units))
+
 
 class _RootDouble:
     def __init__(self) -> None:
@@ -126,6 +131,26 @@ class _RootDouble:
 
     def wait_window(self, dialog: Any) -> None:
         self.waited_for.append(dialog)
+
+
+class _ScreenRootDouble:
+    def __init__(self, width: int, height: int) -> None:
+        self.width = width
+        self.height = height
+        self.geometry_value: str | None = None
+        self.minimum_size: tuple[int, int] | None = None
+
+    def winfo_screenwidth(self) -> int:
+        return self.width
+
+    def winfo_screenheight(self) -> int:
+        return self.height
+
+    def geometry(self, value: str) -> None:
+        self.geometry_value = value
+
+    def minsize(self, width: int, height: int) -> None:
+        self.minimum_size = (width, height)
 
 
 def _bare_app(config_path: Path) -> Any:
@@ -146,6 +171,7 @@ def _runtime_app(tmp_path: Path, config: AppConfig | None = None) -> Any:
     app.cancel_event = threading.Event()
     app.close_requested = False
     app.latest_output_dir = None
+    app._run_output_dir = None
     app.config = config or AppConfig(targets=DEFAULT_TARGETS)
     app.scan_button = _WidgetDouble()
     app.cancel_button = _WidgetDouble()
@@ -155,6 +181,38 @@ def _runtime_app(tmp_path: Path, config: AppConfig | None = None) -> Any:
     app.status_text = _WidgetDouble()
     app.config_controls = (_WidgetDouble(), _WidgetDouble(), _WidgetDouble())
     return app
+
+
+def test_main_window_fits_small_high_dpi_desktop() -> None:
+    root = _ScreenRootDouble(800, 500)
+
+    gui._configure_window_geometry(root)
+
+    assert root.geometry_value == "760x450"
+    assert root.minimum_size == (760, 450)
+
+
+def test_main_window_keeps_normal_desktop_dimensions() -> None:
+    root = _ScreenRootDouble(1920, 1080)
+
+    gui._configure_window_geometry(root)
+
+    assert root.geometry_value == "1040x700"
+    assert root.minimum_size == (880, 600)
+
+
+def test_main_mousewheel_scrolls_page_but_not_result_table(tmp_path: Path) -> None:
+    app = _runtime_app(tmp_path)
+    app._content_canvas = _WidgetDouble()
+
+    handled = app._scroll_main_view(types.SimpleNamespace(widget=object(), delta=-120, num=0))
+    result_table_event = app._scroll_main_view(
+        types.SimpleNamespace(widget=app.result_tree, delta=-120, num=0)
+    )
+
+    assert handled == "break"
+    assert app._content_canvas.scroll_calls == [(1, "units")]
+    assert result_table_event is None
 
 
 def _candidate(*, ipv6: bool = False) -> PeerCandidate:
@@ -882,6 +940,62 @@ def test_finish_restores_previous_report_button_after_failed_retry(tmp_path: Pat
     assert all(control.options["state"] == "normal" for control in app.config_controls)
     assert app.open_button.options["state"] == "normal"
     assert app.progress.stopped is True
+
+
+def test_new_early_failure_does_not_present_previous_run_as_partial_result(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    app = _runtime_app(tmp_path)
+    previous = tmp_path / "reports" / "vorher"
+    previous.mkdir(parents=True)
+    app.running = True
+    app._publish_reports_ready(previous, 5)
+    app._poll_events()
+    app._finish_running_state()
+
+    class _ThreadDouble:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        def start(self) -> None:
+            return None
+
+    errors: list[str] = []
+    monkeypatch.setattr(
+        gui.messagebox,
+        "askyesno",
+        lambda *_args, **_kwargs: True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        gui.messagebox,
+        "showerror",
+        lambda _title, message, **_kwargs: errors.append(message),
+        raising=False,
+    )
+    monkeypatch.setattr(gui.threading, "Thread", _ThreadDouble)
+
+    app._start_scan()
+
+    assert app.latest_output_dir == previous
+    assert app._run_output_dir is None
+    assert app.open_button.options["state"] == "disabled"
+
+    app.events.put(("error", "MonitorError: früher Fehler"))
+    app._poll_events()
+
+    assert errors == ["MonitorError: früher Fehler"]
+    assert app.latest_output_dir == previous
+    assert app._run_output_dir is None
+    assert app.open_button.options["state"] == "disabled"
+    assert "Teilergebnisse" not in app.status_text.value
+    assert "fehlgeschlagen" in app.status_text.value
+
+    opened: list[Path] = []
+    monkeypatch.setattr(gui, "open_directory", lambda path: opened.append(path))
+    app._open_output()
+    assert opened == [previous]
 
 
 def test_window_close_is_immediate_when_idle_and_deferred_when_running(

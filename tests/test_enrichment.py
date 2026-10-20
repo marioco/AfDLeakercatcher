@@ -557,7 +557,7 @@ def test_ipv6_lookup_keeps_ip_binding_and_uses_encoded_start_url(tmp_path: Path)
     assert "https://rdap.arin.net/registry/ip/2606:4700:4700::1111" in result.source_urls
 
 
-def test_vpn_classifier_uses_only_explicit_cidr_or_exact_marker() -> None:
+def test_vpn_classifier_uses_only_explicit_cidr_or_configured_marker() -> None:
     classifier = VpnClassifier(
         vpn_ranges={"Configured VPN": ("8.8.8.0/24",)},
         vpn_provider_markers={"Marker VPN": ("Exact VPN Network",)},
@@ -580,6 +580,45 @@ def test_vpn_classifier_uses_only_explicit_cidr_or_exact_marker() -> None:
     assert substring.status == "unknown"
     assert substring.provider is None
     assert "keine Aussage" in (substring.reason or "")
+
+
+@pytest.mark.parametrize(
+    "holder",
+    [
+        "protonvpn",
+        "ProtonVPN-2 Proton AG",
+        "PROTONVPN Proton AG",
+        "ProtonVPN/Proton AG",
+    ],
+)
+def test_vpn_classifier_accepts_exact_or_delimited_marker_at_start(holder: str) -> None:
+    result = VpnClassifier(vpn_provider_markers={"Proton VPN": "protonvpn"}).classify(
+        "9.9.9.9",
+        holder=holder,
+    )
+
+    assert result.status == "known_vpn"
+    assert result.provider == "Proton VPN"
+
+
+@pytest.mark.parametrize(
+    "holder",
+    [
+        "Example ProtonVPN-2 Proton AG",
+        "NotProtonVPN",
+        "ProtonVPN2 Proton AG",
+        "ProtonVPNPlus AG",
+        "ProtonVPN_2 Proton AG",
+    ],
+)
+def test_vpn_classifier_rejects_substrings_and_unbounded_prefixes(holder: str) -> None:
+    result = VpnClassifier(vpn_provider_markers={"Proton VPN": "protonvpn"}).classify(
+        "9.9.9.9",
+        holder=holder,
+    )
+
+    assert result.status == "unknown"
+    assert result.provider is None
 
 
 def test_vpn_classifier_supports_explicit_ipv6_ranges() -> None:

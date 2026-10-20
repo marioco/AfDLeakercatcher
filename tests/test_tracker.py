@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import socket
 import struct
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from unittest.mock import patch
 
 import pytest
@@ -386,9 +386,97 @@ def test_started_failure_still_attempts_stopped_and_raises_original(
                 transaction_id_factory=lambda: next(transactions),
                 key_factory=lambda: 33,
                 announce_port_factory=lambda: 51413,
+                retry_backoff_seconds=0.0,
             )
 
-        assert observed_events == [TRACKER_EVENT_STARTED, TRACKER_EVENT_STOPPED]
+        assert observed_events == [
+            *([TRACKER_EVENT_STARTED] * 3),
+            TRACKER_EVENT_STOPPED,
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_stale_connect_response_during_announce_is_ignored_by_retry() -> None:
+    async def scenario() -> None:
+        transactions = iter((11, 22, 44))
+        started_calls = 0
+
+        async def exchange(_endpoint: tuple[str, int], packet: bytes) -> bytes:
+            nonlocal started_calls
+            action = struct.unpack_from("!I", packet, 8)[0]
+            transaction = struct.unpack_from("!I", packet, 12)[0]
+            if action == TRACKER_ACTION_CONNECT:
+                return struct.pack("!IIQ", TRACKER_ACTION_CONNECT, transaction, 1234)
+            event = struct.unpack_from("!I", packet, 80)[0]
+            if event == TRACKER_EVENT_STARTED:
+                started_calls += 1
+                if started_calls == 1:
+                    return struct.pack("!IIQ", TRACKER_ACTION_CONNECT, 11, 1234)
+                return struct.pack(
+                    "!IIIII", TRACKER_ACTION_ANNOUNCE, transaction, 60, 1, 1
+                ) + _compact_ipv4("8.8.4.4", 51413)
+            return struct.pack("!IIIII", TRACKER_ACTION_ANNOUNCE, transaction, 60, 1, 1)
+
+        response = await _announce_to_endpoint(
+            TARGET,
+            ("1.1.1.1", 6969),
+            timeout=1.0,
+            peer_id=PEER_ID,
+            exchange_hook=exchange,
+            transaction_id_factory=lambda: next(transactions),
+            key_factory=lambda: 33,
+            announce_port_factory=lambda: 51413,
+            retry_backoff_seconds=0.0,
+        )
+
+        assert started_calls == 2
+        assert response.peers == (("8.8.4.4", 51413),)
+
+    asyncio.run(scenario())
+
+
+def test_connect_and_started_are_retransmitted_after_transient_network_errors() -> None:
+    async def scenario() -> None:
+        transactions = iter((11, 22, 44))
+        connect_calls = 0
+        started_calls = 0
+        stopped_calls = 0
+
+        async def exchange(_endpoint: tuple[str, int], packet: bytes) -> bytes:
+            nonlocal connect_calls, started_calls, stopped_calls
+            action = struct.unpack_from("!I", packet, 8)[0]
+            transaction = struct.unpack_from("!I", packet, 12)[0]
+            if action == TRACKER_ACTION_CONNECT:
+                connect_calls += 1
+                if connect_calls == 1:
+                    raise TimeoutError("first connect packet lost")
+                return struct.pack("!IIQ", TRACKER_ACTION_CONNECT, transaction, 1234)
+            event = struct.unpack_from("!I", packet, 80)[0]
+            if event == TRACKER_EVENT_STARTED:
+                started_calls += 1
+                if started_calls == 1:
+                    raise ConnectionResetError("transient UDP error")
+                return struct.pack(
+                    "!IIIII", TRACKER_ACTION_ANNOUNCE, transaction, 60, 1, 1
+                ) + _compact_ipv4("8.8.4.4", 51413)
+            stopped_calls += 1
+            return struct.pack("!IIIII", TRACKER_ACTION_ANNOUNCE, transaction, 60, 1, 1)
+
+        response = await _announce_to_endpoint(
+            TARGET,
+            ("1.1.1.1", 6969),
+            timeout=1.0,
+            peer_id=PEER_ID,
+            exchange_hook=exchange,
+            transaction_id_factory=lambda: next(transactions),
+            key_factory=lambda: 33,
+            announce_port_factory=lambda: 51413,
+            retry_backoff_seconds=0.0,
+        )
+
+        assert response.peers == (("8.8.4.4", 51413),)
+        assert (connect_calls, started_calls, stopped_calls) == (2, 2, 1)
 
     asyncio.run(scenario())
 
@@ -451,12 +539,237 @@ def test_streaming_mode_batches_five_without_cross_tracker_peer_set() -> None:
         assert len(flattened) == 11
         assert flattened[0].target_label == TARGET.label
         assert flattened[0].source_note == TARGET.source_note
-        assert flattened[-1].dht_node_port == 1002
+        assert {candidate.dht_node_port for candidate in flattened} == {1001, 1002}
         assert stats.trackers_configured == 2
         assert stats.endpoints_attempted == 2
         assert stats.queries_completed == 2
-        assert stats.queries_failed == 1
+        assert stats.queries_failed == 0
         assert stats.stop_queries_failed == 1
+
+    asyncio.run(scenario())
+
+
+def test_streaming_tracker_discovery_has_no_candidate_count_cap() -> None:
+    async def scenario() -> None:
+        peers = tuple(("8.8.8.8", 10_000 + index) for index in range(607))
+        batch_sizes: list[int] = []
+
+        async def fake_resolve(
+            _tracker: TrackerURL,
+            *,
+            timeout: float,
+        ) -> AsyncIterator[tuple[str, int]]:
+            assert timeout == 1.0
+            yield ("1.1.1.1", 6969)
+
+        async def fake_announce(
+            _target: Target,
+            tracker: tuple[str, int],
+            **_kwargs: object,
+        ) -> TrackerAnnounceResponse:
+            return TrackerAnnounceResponse(
+                tracker=tracker,
+                transaction_id=1,
+                peers=peers,
+                response_sha256="a" * 64,
+            )
+
+        async def receive(batch: tuple[PeerCandidate, ...]) -> None:
+            batch_sizes.append(len(batch))
+
+        with (
+            patch.object(tracker_module, "iter_resolved_tracker_endpoints", new=fake_resolve),
+            patch.object(tracker_module, "_announce_to_endpoint", new=fake_announce),
+        ):
+            await discover_tracker_peers(
+                TARGET,
+                ("udp://tracker.example:6969/announce",),
+                timeout=1.0,
+                candidate_callback=receive,
+            )
+
+        assert sum(batch_sizes) == 607
+        assert batch_sizes[-1] == 2
+        assert all(size == 5 for size in batch_sizes[:-1])
+
+    asyncio.run(scenario())
+
+
+def test_endpoint_queries_are_parallel_but_candidate_callback_is_serial() -> None:
+    async def scenario() -> None:
+        both_queries_started = asyncio.Event()
+        active_queries = 0
+        peak_queries = 0
+        active_callbacks = 0
+        peak_callbacks = 0
+        batches: list[tuple[PeerCandidate, ...]] = []
+
+        async def fake_resolve(
+            _tracker: TrackerURL,
+            *,
+            timeout: float,
+        ) -> AsyncIterator[tuple[str, int]]:
+            assert timeout == 1.0
+            yield ("1.1.1.1", 1001)
+            yield ("1.1.1.1", 1002)
+
+        async def fake_announce(
+            _target: Target,
+            tracker: tuple[str, int],
+            **_kwargs: object,
+        ) -> TrackerAnnounceResponse:
+            nonlocal active_queries, peak_queries
+            active_queries += 1
+            peak_queries = max(peak_queries, active_queries)
+            if active_queries == 2:
+                both_queries_started.set()
+            await asyncio.wait_for(both_queries_started.wait(), timeout=1.0)
+            await asyncio.sleep(0)
+            active_queries -= 1
+            peers = tuple(("8.8.8.8", tracker[1] * 10 + index) for index in range(3))
+            return TrackerAnnounceResponse(
+                tracker=tracker,
+                transaction_id=tracker[1],
+                peers=peers,
+                response_sha256=f"{tracker[1]:064x}",
+            )
+
+        async def receive(batch: tuple[PeerCandidate, ...]) -> None:
+            nonlocal active_callbacks, peak_callbacks
+            active_callbacks += 1
+            peak_callbacks = max(peak_callbacks, active_callbacks)
+            await asyncio.sleep(0)
+            batches.append(batch)
+            active_callbacks -= 1
+
+        with (
+            patch.object(tracker_module, "iter_resolved_tracker_endpoints", new=fake_resolve),
+            patch.object(tracker_module, "_announce_to_endpoint", new=fake_announce),
+        ):
+            await discover_tracker_peers(
+                TARGET,
+                ("udp://tracker.example:6969/announce",),
+                timeout=1.0,
+                candidate_callback=receive,
+            )
+
+        assert peak_queries == 2
+        assert peak_callbacks == 1
+        assert [len(batch) for batch in batches] == [5, 1]
+
+    asyncio.run(scenario())
+
+
+def test_cancellation_flushes_partial_batch_and_propagates() -> None:
+    async def scenario() -> None:
+        peers_consumed = asyncio.Event()
+        persisted: list[tuple[PeerCandidate, ...]] = []
+
+        class ObservedPeers(tuple):
+            def __iter__(self) -> Iterator[tuple[str, int]]:
+                yield from super().__iter__()
+                peers_consumed.set()
+
+        async def fake_resolve(
+            _tracker: TrackerURL,
+            *,
+            timeout: float,
+        ) -> AsyncIterator[tuple[str, int]]:
+            assert timeout == 1.0
+            yield ("1.1.1.1", 1001)
+            yield ("1.1.1.1", 1002)
+
+        async def fake_announce(
+            _target: Target,
+            tracker: tuple[str, int],
+            **_kwargs: object,
+        ) -> TrackerAnnounceResponse:
+            if tracker[1] == 1002:
+                await asyncio.Event().wait()
+            peers = ObservedPeers(("8.8.8.8", 10_000 + index) for index in range(3))
+            return TrackerAnnounceResponse(
+                tracker=tracker,
+                transaction_id=1,
+                peers=peers,
+                response_sha256="a" * 64,
+            )
+
+        async def persist(batch: tuple[PeerCandidate, ...]) -> None:
+            persisted.append(batch)
+
+        with (
+            patch.object(tracker_module, "iter_resolved_tracker_endpoints", new=fake_resolve),
+            patch.object(tracker_module, "_announce_to_endpoint", new=fake_announce),
+        ):
+            task = asyncio.create_task(
+                discover_tracker_peers(
+                    TARGET,
+                    ("udp://tracker.example:6969/announce",),
+                    timeout=1.0,
+                    candidate_callback=persist,
+                )
+            )
+            await asyncio.wait_for(peers_consumed.wait(), timeout=1.0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert [len(batch) for batch in persisted] == [3]
+
+    asyncio.run(scenario())
+
+
+def test_unexpected_endpoint_error_flushes_partial_batch_before_propagation() -> None:
+    async def scenario() -> None:
+        peers_consumed = asyncio.Event()
+        persisted: list[tuple[PeerCandidate, ...]] = []
+
+        class ObservedPeers(tuple):
+            def __iter__(self) -> Iterator[tuple[str, int]]:
+                yield from super().__iter__()
+                peers_consumed.set()
+
+        async def fake_resolve(
+            _tracker: TrackerURL,
+            *,
+            timeout: float,
+        ) -> AsyncIterator[tuple[str, int]]:
+            assert timeout == 1.0
+            yield ("1.1.1.1", 1001)
+            yield ("1.1.1.1", 1002)
+
+        async def fake_announce(
+            _target: Target,
+            tracker: tuple[str, int],
+            **_kwargs: object,
+        ) -> TrackerAnnounceResponse:
+            if tracker[1] == 1002:
+                await peers_consumed.wait()
+                raise AssertionError("programming bug")
+            peers = ObservedPeers(("8.8.8.8", 20_000 + index) for index in range(3))
+            return TrackerAnnounceResponse(
+                tracker=tracker,
+                transaction_id=1,
+                peers=peers,
+                response_sha256="b" * 64,
+            )
+
+        async def persist(batch: tuple[PeerCandidate, ...]) -> None:
+            persisted.append(batch)
+
+        with (
+            patch.object(tracker_module, "iter_resolved_tracker_endpoints", new=fake_resolve),
+            patch.object(tracker_module, "_announce_to_endpoint", new=fake_announce),
+            pytest.raises(AssertionError, match="programming bug"),
+        ):
+            await discover_tracker_peers(
+                TARGET,
+                ("udp://tracker.example:6969/announce",),
+                timeout=1.0,
+                candidate_callback=persist,
+            )
+
+        assert [len(batch) for batch in persisted] == [3]
 
     asyncio.run(scenario())
 

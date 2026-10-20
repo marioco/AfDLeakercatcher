@@ -5,4 +5,4 @@ from __future__ import annotations
 __all__ = ["APP_NAME", "VERSION"]
 
 APP_NAME = "BitTorrent-Beobachter"
-VERSION = "0.3.1"
+VERSION = "0.3.2"

@@ -26,7 +26,7 @@ from threading import Event
 from typing import BinaryIO
 
 from . import APP_NAME, VERSION
-from .config import AppConfig, config_from_dict, config_to_dict
+from .config import AppConfig, ConfigError, config_from_dict, config_to_dict, load_config
 from .dht import (
     BOOTSTRAP_ISSUE_DNS,
     BOOTSTRAP_ISSUE_NO_GLOBAL_ADDRESS,
@@ -38,7 +38,12 @@ from .dht import (
     resolve_bootstrap_nodes,
 )
 from .enrichment import EnrichmentError, NetworkEnricher, VpnClassifier
-from .evidence import EvidenceJournal, canonical_json_bytes
+from .evidence import (
+    EvidenceJournal,
+    EvidenceJournalError,
+    atomic_write_json,
+    canonical_json_bytes,
+)
 from .models import (
     EvidenceRecord,
     HandshakeResult,
@@ -50,6 +55,13 @@ from .models import (
     VpnClassification,
 )
 from .peer import PeerVerifier
+from .recovery import (
+    EvidenceRecoveryError,
+    LegacyRecoveryNotice,
+    RecoveredEvidenceBatch,
+    RecoveredRunContext,
+    recover_evidence_journal,
+)
 from .reports import ReportConfig, generate_reports
 from .run_store import RunStore
 from .tracker import TrackerDiscoveryStats, discover_tracker_peers
@@ -57,7 +69,7 @@ from .tracker import TrackerDiscoveryStats, discover_tracker_peers
 ProgressCallback = Callable[[str], None]
 ReportsReadyCallback = Callable[[Path, int], None]
 EvidenceReadyCallback = Callable[[], Awaitable[None]]
-EvidenceBatchCallback = Callable[[int, int], None]
+EvidenceBatchCallback = Callable[[tuple[EvidenceRecord, ...]], None]
 PERSIST_BATCH_SIZE = 5
 PARALLEL_VERIFY_BATCHES = 8
 VERIFY_IDLE_POLL_SECONDS = 0.1
@@ -135,8 +147,8 @@ def _enforce_storage_capacity(data_dir: Path) -> None:
     if free_bytes < MIN_FREE_SPACE_BYTES:
         raise MonitorError(
             "Weniger als 100 MB freier Speicherplatz. Bisherige Laufdaten bleiben "
-            "lokal erhalten; dieser Lauf wird nach einem Programmneustart derzeit "
-            "nicht automatisch fortgesetzt. Bitte Speicherplatz freigeben."
+            "lokal erhalten und werden beim naechsten Start vor einem neuen Lauf "
+            "automatisch geprueft. Bitte Speicherplatz freigeben."
         )
 
 
@@ -334,6 +346,16 @@ async def _discover_target_until_quiet(
     rounds = 0
     dht_issue_count = 0
     tracker_outer_failures = 0
+    crawler = (
+        DHTCrawler(
+            bootstrap_nodes,
+            node_id=dht_node_id,
+            config=_dht_config(config),
+            frontier_directory=data_dir,
+        )
+        if bootstrap_nodes
+        else None
+    )
 
     async def persist_candidates(batch: tuple[PeerCandidate, ...]) -> None:
         nonlocal new_candidates_in_round
@@ -349,72 +371,79 @@ async def _discover_target_until_quiet(
                 f"{target.label}: {inserted} neue eindeutige Kandidat(en) dauerhaft gespeichert."
             )
 
-    while True:
-        rounds += 1
-        new_candidates_in_round = 0
-        progress(f"Peer-Suche {target.label}: Runde {rounds} gestartet.")
+    try:
+        while True:
+            rounds += 1
+            new_candidates_in_round = 0
+            dht_pending_work = False
+            progress(f"Peer-Suche {target.label}: Runde {rounds} gestartet.")
 
-        if bootstrap_nodes:
-            crawler = DHTCrawler(bootstrap_nodes, node_id=dht_node_id, config=_dht_config(config))
-            try:
-                await crawler.discover(
-                    target,
-                    candidate_callback=persist_candidates,
-                    collect=False,
-                )
-            except (OSError, TimeoutError) as exc:
-                runtime.dht_queries_failed += 1
-                dht_issue_count += 1
-                progress(
-                    f"DHT-Runde fuer {target.label} hatte ein technisches Teilproblem "
-                    f"({type(exc).__name__})."
-                )
-            finally:
-                runtime.dht_queries_started += crawler.queries_started
-                runtime.dht_queries_completed += crawler.queries_completed
-                runtime.dht_queries_failed += crawler.queries_failed
-                dht_issue_count += crawler.issue_count
+            if crawler is not None:
+                try:
+                    await crawler.discover(
+                        target,
+                        candidate_callback=persist_candidates,
+                        collect=False,
+                    )
+                except (OSError, TimeoutError) as exc:
+                    runtime.dht_queries_failed += 1
+                    dht_issue_count += 1
+                    progress(
+                        f"DHT-Runde fuer {target.label} hatte ein technisches Teilproblem "
+                        f"({type(exc).__name__})."
+                    )
+                finally:
+                    runtime.dht_queries_started += crawler.queries_started
+                    runtime.dht_queries_completed += crawler.queries_completed
+                    runtime.dht_queries_failed += crawler.queries_failed
+                    dht_issue_count += crawler.issue_count
 
-        if target.trackers:
-            tracker_stats = TrackerDiscoveryStats()
-            try:
-                await discover_tracker_peers(
-                    target,
-                    target.trackers,
-                    timeout=config.dht.timeout_seconds,
-                    candidate_callback=persist_candidates,
-                    collect=False,
-                    stats=tracker_stats,
-                )
-            except (OSError, TimeoutError) as exc:
-                runtime.tracker_queries_completed += tracker_stats.queries_completed
-                runtime.tracker_queries_failed += tracker_stats.queries_failed + 1
-                tracker_outer_failures += 1
-                progress(
-                    f"Tracker-Runde fuer {target.label} hatte ein technisches Teilproblem "
-                    f"({type(exc).__name__})."
-                )
+                dht_pending_work = crawler.has_pending_work
+            if target.trackers:
+                tracker_stats = TrackerDiscoveryStats()
+                try:
+                    await discover_tracker_peers(
+                        target,
+                        target.trackers,
+                        timeout=config.dht.timeout_seconds,
+                        candidate_callback=persist_candidates,
+                        collect=False,
+                        stats=tracker_stats,
+                    )
+                except (OSError, TimeoutError) as exc:
+                    runtime.tracker_queries_completed += tracker_stats.queries_completed
+                    runtime.tracker_queries_failed += tracker_stats.queries_failed + 1
+                    tracker_outer_failures += 1
+                    progress(
+                        f"Tracker-Runde fuer {target.label} hatte ein technisches Teilproblem "
+                        f"({type(exc).__name__})."
+                    )
+                else:
+                    runtime.tracker_queries_completed += tracker_stats.queries_completed
+                    runtime.tracker_queries_failed += tracker_stats.queries_failed
+
+            round_completed_at = time.monotonic()
+            if dht_pending_work:
+                quiet_started_at = None
+            elif new_candidates_in_round or quiet_started_at is None:
+                quiet_started_at = round_completed_at
             else:
-                runtime.tracker_queries_completed += tracker_stats.queries_completed
-                runtime.tracker_queries_failed += tracker_stats.queries_failed
+                quiet_for = round_completed_at - quiet_started_at
+                if rounds >= 2 and quiet_for >= config.dht.quiet_seconds:
+                    break
 
-        round_completed_at = time.monotonic()
-        if new_candidates_in_round or quiet_started_at is None:
-            quiet_started_at = round_completed_at
-        else:
-            quiet_for = round_completed_at - quiet_started_at
-            if rounds >= 2 and quiet_for >= config.dht.quiet_seconds:
-                break
-
-        quiet_for = (
-            0.0 if quiet_started_at is None else max(0.0, time.monotonic() - quiet_started_at)
-        )
-        await asyncio.sleep(
-            min(
-                config.dht.refresh_interval_seconds,
-                max(0.0, config.dht.quiet_seconds - quiet_for),
+            quiet_for = (
+                0.0 if quiet_started_at is None else max(0.0, time.monotonic() - quiet_started_at)
             )
-        )
+            await asyncio.sleep(
+                min(
+                    config.dht.refresh_interval_seconds,
+                    max(0.0, config.dht.quiet_seconds - quiet_for),
+                )
+            )
+    finally:
+        if crawler is not None:
+            crawler.close()
 
     if dht_issue_count:
         notice = (
@@ -430,6 +459,11 @@ async def _discover_target_until_quiet(
         )
         notices.append(notice)
         progress(notice)
+    if runtime.dht_queries_completed == 0 and runtime.tracker_queries_completed == 0:
+        raise MonitorError(
+            f"Keine Peer-Quelle fuer {target.label} lieferte eine gueltige Antwort. "
+            "Bitte Netzwerkzugang, Firewall und Tracker-Erreichbarkeit pruefen."
+        )
     progress(
         f"Peer-Suche fuer {target.label} nach {rounds} Runde(n) und "
         f"{config.dht.quiet_seconds:g} Sekunden ohne neuen eindeutigen Kandidaten beendet."
@@ -454,8 +488,8 @@ async def _discover_candidates_to_store(
             "Kein globaler DHT-Bootstrap-Knoten und kein UDP-Tracker war konfiguriert."
         )
 
-    await asyncio.gather(
-        *(
+    target_tasks = tuple(
+        asyncio.create_task(
             _discover_target_until_quiet(
                 config,
                 target,
@@ -467,9 +501,27 @@ async def _discover_candidates_to_store(
                 notices,
                 progress,
             )
-            for target in config.targets
         )
+        for target in config.targets
     )
+    outcomes = await asyncio.gather(*target_tasks, return_exceptions=True)
+    failures: list[tuple[Target, BaseException]] = []
+    for target, outcome in zip(config.targets, outcomes, strict=True):
+        if isinstance(outcome, asyncio.CancelledError):
+            raise outcome
+        if isinstance(outcome, BaseException):
+            failures.append((target, outcome))
+    if failures:
+        summary = ", ".join(
+            f"{target.label} ({type(failure).__name__})" for target, failure in failures
+        )
+        aggregated = MonitorError(
+            f"Peer-Suche war bei {len(failures)} von {len(config.targets)} Ziel(en) "
+            f"nicht erfolgreich: {summary}."
+        )
+        for target, failure in failures[1:]:
+            aggregated.add_note(f"Weiterer Zielfehler: {target.label} ({type(failure).__name__}).")
+        raise aggregated from failures[0][1]
     return notices
 
 
@@ -580,52 +632,99 @@ async def _verify_all_candidates(
     )
     checked = sum(metric.done for metric in store.metrics_by_hash(target_hashes).values())
 
-    while True:
-        tasks: list[asyncio.Task[tuple[HandshakeResult, ...]]] = []
-        for _ in range(PARALLEL_VERIFY_BATCHES):
+    active_tasks: set[asyncio.Task[tuple[HandshakeResult, ...]]] = set()
+    unpersisted_tasks: set[asyncio.Task[tuple[HandshakeResult, ...]]] = set()
+    task_order: dict[asyncio.Task[tuple[HandshakeResult, ...]], int] = {}
+    next_task_order = 0
+
+    def fill_available_slots() -> None:
+        nonlocal next_task_order
+        while len(active_tasks) < PARALLEL_VERIFY_BATCHES:
             batch = store.claim_candidate_batch(target_hashes, size=PERSIST_BATCH_SIZE)
             if not batch:
                 break
-            tasks.append(
-                asyncio.create_task(
-                    _verify_candidate_batch(
-                        batch,
-                        info_hashes,
-                        verifier,
-                        config,
-                        runtimes,
-                    )
+            task = asyncio.create_task(
+                _verify_candidate_batch(
+                    batch,
+                    info_hashes,
+                    verifier,
+                    config,
+                    runtimes,
                 )
             )
-        if not tasks:
-            if producers_done is None or producers_done.is_set():
-                break
-            await asyncio.sleep(VERIFY_IDLE_POLL_SECONDS)
-            continue
+            active_tasks.add(task)
+            unpersisted_tasks.add(task)
+            task_order[task] = next_task_order
+            next_task_order += 1
 
-        try:
-            for completed in asyncio.as_completed(tasks):
-                result_batch = await completed
-                _enforce_storage_capacity(data_dir)
-                store.store_handshake_batch(result_batch)
-                checked += len(result_batch)
-                progress(f"Direkte Peer-Pruefung: {checked} Kandidat(en) dauerhaft verarbeitet.")
+    def persist_completed_task(
+        task: asyncio.Task[tuple[HandshakeResult, ...]],
+        *,
+        failure_completion: bool,
+    ) -> tuple[HandshakeResult, ...]:
+        nonlocal checked
+        result_batch = task.result()
+        _enforce_storage_capacity(data_dir)
+        store.store_handshake_batch(result_batch)
+        unpersisted_tasks.remove(task)
+        task_order.pop(task)
+        checked += len(result_batch)
+        if failure_completion:
+            progress(
+                f"Fehlerabschluss: {checked} bereits geprüfte Kandidat(en) dauerhaft verarbeitet."
+            )
+        else:
+            progress(f"Direkte Peer-Pruefung: {checked} Kandidat(en) dauerhaft verarbeitet.")
+        return result_batch
+
+    try:
+        while True:
+            fill_available_slots()
+            if not active_tasks:
+                if producers_done is None or producers_done.is_set():
+                    break
+                await asyncio.sleep(VERIFY_IDLE_POLL_SECONDS)
+                continue
+
+            completed_tasks, _pending_tasks = await asyncio.wait(
+                active_tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            active_tasks.difference_update(completed_tasks)
+            for completed in sorted(completed_tasks, key=task_order.__getitem__):
+                result_batch = persist_completed_task(completed, failure_completion=False)
+                fill_available_slots()
                 if evidence_ready is not None and any(
                     result.offering_observed for result in result_batch
                 ):
                     await evidence_ready()
-        except BaseException as exc:
-            for task in tasks:
+    except BaseException as exc:
+        for task in unpersisted_tasks:
+            if not task.done():
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            try:
-                store.requeue_in_progress()
-            except Exception as requeue_error:
-                exc.add_note(
-                    "Unterbrochene Kandidaten konnten nicht zurueckgestellt werden: "
-                    f"{_safe_error(requeue_error)}"
-                )
-            raise
+        if unpersisted_tasks:
+            await asyncio.gather(*unpersisted_tasks, return_exceptions=True)
+        try:
+            for task in sorted(tuple(unpersisted_tasks), key=task_order.__getitem__):
+                if task.cancelled():
+                    continue
+                task_error = task.exception()
+                if task_error is not None:
+                    continue
+                persist_completed_task(task, failure_completion=True)
+        except BaseException as drain_error:
+            exc.add_note(
+                "Ein bereits fertiger Kandidatenbatch konnte beim Fehlerabschluss nicht "
+                f"persistiert werden: {_safe_error(drain_error)}"
+            )
+        try:
+            store.requeue_in_progress()
+        except Exception as requeue_error:
+            exc.add_note(
+                "Unterbrochene Kandidaten konnten nicht zurueckgestellt werden: "
+                f"{_safe_error(requeue_error)}"
+            )
+        raise
 
     final_metrics = store.metrics_by_hash(target_hashes)
     unfinished = sum(metric.pending + metric.in_progress for metric in final_metrics.values())
@@ -690,8 +789,35 @@ async def _network_phase(
 
         cancellation_task = asyncio.create_task(cancel_network_when_requested())
     try:
-        notices, _verification_result = await asyncio.gather(*tasks)
+        completed, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        if verification_task in completed and not discovery_task.done():
+            verification_task.result()
+            raise MonitorError(
+                "Direkte Peer-Pruefung endete unerwartet vor Abschluss der Peer-Suche."
+            )
+
+        discovery_failure: Exception | None = None
+        try:
+            notices = discovery_task.result()
+        except Exception as exc:
+            discovery_failure = exc
+            notices = []
+
+        try:
+            await verification_task
+        except Exception as exc:
+            if discovery_failure is not None:
+                exc.add_note(
+                    "Die Peer-Suche war ebenfalls nicht erfolgreich "
+                    f"({type(discovery_failure).__name__})."
+                )
+            raise
+        if discovery_failure is not None:
+            raise discovery_failure
     except asyncio.CancelledError as exc:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         if cancel_event is not None and cancel_event.is_set():
             raise ScanCancelled("Der Prueflauf wurde vom Benutzer abgebrochen.") from exc
         raise
@@ -850,13 +976,17 @@ def _persist_all_evidence(
         stored += len(records)
         progress(f"{stored} positive Befund(e) dauerhaft als Evidenz gespeichert.")
         if batch_persisted is not None:
-            batch_persisted(len(records), batch_vpn_count)
+            batch_persisted(records)
 
     if enrichment_failures:
         total = sum(enrichment_failures.values())
+        result.enrichment_failure_count += total
+        prefix = "Netzauskunft war bei "
+        result.notices[:] = [notice for notice in result.notices if not notice.startswith(prefix)]
         result.notices.append(
-            f"Netzauskunft war bei {total} positivem Befund(en) unvollstaendig oder "
-            "nicht erreichbar; die technischen Beobachtungen wurden dennoch gespeichert."
+            f"{prefix}{result.enrichment_failure_count} positivem Befund(en) "
+            "unvollstaendig oder nicht erreichbar; die technischen Beobachtungen "
+            "wurden dennoch gespeichert."
         )
     return known_vpn_count
 
@@ -925,6 +1055,255 @@ def _report_config(config: AppConfig) -> ReportConfig:
     )
 
 
+def _load_recovery_config(
+    current_config: AppConfig,
+    evidence_dir: Path,
+    *,
+    run_id: str,
+    config_sha256: str,
+    config_snapshot: str | None,
+    config_snapshot_file_sha256: str | None,
+) -> AppConfig | None:
+    """Laedt den unveraenderlichen Lauf-Snapshot oder einen passenden Legacy-Stand."""
+
+    if (config_snapshot is None) != (config_snapshot_file_sha256 is None):
+        raise MonitorError(f"Lauf {run_id!r} hat eine unvollstaendige Snapshot-Bindung.")
+    if config_snapshot is None:
+        return current_config if _config_sha256(current_config) == config_sha256 else None
+
+    snapshot_path = evidence_dir / "runs" / config_snapshot
+    if snapshot_path.is_symlink() or not snapshot_path.is_file():
+        raise MonitorError(f"Konfigurationssnapshot fuer Lauf {run_id!r} fehlt.")
+    try:
+        snapshot_file_hash = _file_sha256(snapshot_path)
+    except OSError as exc:
+        raise MonitorError(
+            f"Konfigurationssnapshot fuer Lauf {run_id!r} kann nicht gelesen werden."
+        ) from exc
+    if not secrets.compare_digest(snapshot_file_hash, config_snapshot_file_sha256):
+        raise MonitorError(f"Konfigurationssnapshot fuer Lauf {run_id!r} ist veraendert.")
+    try:
+        recovered_config = load_config(snapshot_path)
+    except ConfigError as exc:
+        raise MonitorError(
+            f"Konfigurationssnapshot fuer Lauf {run_id!r} ist ungueltig: {_safe_error(exc)}"
+        ) from exc
+    if not secrets.compare_digest(_config_sha256(recovered_config), config_sha256):
+        raise MonitorError(f"Konfigurationssnapshot fuer Lauf {run_id!r} passt nicht zum Journal.")
+    return recovered_config
+
+
+def _recovery_report_is_complete(output_dir: Path, report_run_id: str) -> bool:
+    """Prueft ein bereits publiziertes Recovery-Paket gegen sein Manifest."""
+
+    manifest_path = output_dir / f"{report_run_id}_SHA256SUMS.txt"
+    try:
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            return False
+        if manifest_path.stat().st_size > 4_000_000:
+            return False
+        seen_names: set[str] = set()
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.rstrip("\n")
+                if not line or line.startswith("#"):
+                    continue
+                digest, separator, file_name = line.partition(" *")
+                if (
+                    not separator
+                    or len(digest) != 64
+                    or any(character not in "0123456789abcdef" for character in digest)
+                    or not file_name
+                    or Path(file_name).name != file_name
+                    or file_name in seen_names
+                ):
+                    return False
+                report_path = output_dir / file_name
+                if report_path.is_symlink() or not report_path.is_file():
+                    return False
+                if not secrets.compare_digest(_file_sha256(report_path), digest):
+                    return False
+                seen_names.add(file_name)
+    except (OSError, UnicodeError):
+        return False
+
+    required_suffixes = (
+        "_laufbericht.pdf",
+        "_beobachtungen.csv",
+        "_vpn_liste.csv",
+        "_vpn_liste.pdf",
+    )
+    return all(f"{report_run_id}{suffix}" in seen_names for suffix in required_suffixes)
+
+
+def _publish_recovered_batch(
+    batch: RecoveredEvidenceBatch,
+    config: AppConfig,
+    data_dir: Path,
+    progress: ProgressCallback,
+    reports_ready: ReportsReadyCallback | None,
+) -> None:
+    """Erzeugt ein idempotentes, sofort nutzbares Berichtspaket fuer hoechstens 5 Befunde."""
+
+    digest = hashlib.sha256(
+        "\n".join(record.evidence_event_sha256 for record in batch.records).encode("ascii")
+    ).hexdigest()[:16]
+    report_run_id = f"recovery-{batch.run_id[-32:]}-{digest}"
+    run_output_dir = _ensure_private_directory(
+        data_dir / "reports" / batch.run_id,
+        app_owned=True,
+    )
+    batch_output_dir = _ensure_private_directory(
+        run_output_dir / f"wiederhergestellt-{digest}",
+        app_owned=True,
+    )
+    if not _recovery_report_is_complete(batch_output_dir, report_run_id):
+        generated_at = _utc_now_text()
+        result = ScanResult(
+            run_id=report_run_id,
+            started_at_utc=min(record.handshake.attempted_at_utc for record in batch.records),
+            completed_at_utc=generated_at,
+            records=list(batch.records),
+            candidate_count=len(batch.records),
+            handshake_count=len(batch.records),
+            confirmed_handshake_count=sum(record.handshake.confirmed for record in batch.records),
+            offering_observation_count=len(batch.records),
+            known_vpn_total=sum(record.vpn.status == "known_vpn" for record in batch.records),
+            notices=[
+                "Diese Befunde wurden nach einem unterbrochenen Lauf aus dem "
+                "verifizierten Evidenzjournal wiederhergestellt."
+            ],
+        )
+        generated_paths = generate_reports(
+            result,
+            batch_output_dir,
+            _report_config(config),
+            generated_at_utc=generated_at,
+        )
+        for path in generated_paths:
+            _ensure_private_file(path)
+    progress(
+        f"{len(batch.records)} Befund(e) aus Lauf {batch.run_id} wurden "
+        "wiederhergestellt und als Berichte bereitgestellt."
+    )
+    if reports_ready is not None:
+        reports_ready(run_output_dir, len(batch.records))
+
+
+def _recover_previous_runs(
+    current_config: AppConfig,
+    data_dir: Path,
+    evidence_dir: Path,
+    journal: EvidenceJournal,
+    progress: ProgressCallback,
+    reports_ready: ReportsReadyCallback | None,
+) -> None:
+    """Reconciliert Journal und Laufdatenbanken vor jedem neuen Netzwerkzugriff."""
+
+    def recovery_config(
+        *,
+        run_id: str,
+        config_sha256: str,
+        config_snapshot: str | None,
+        config_snapshot_file_sha256: str | None,
+    ) -> AppConfig | None:
+        return _load_recovery_config(
+            current_config,
+            evidence_dir,
+            run_id=run_id,
+            config_sha256=config_sha256,
+            config_snapshot=config_snapshot,
+            config_snapshot_file_sha256=config_snapshot_file_sha256,
+        )
+
+    def publish_reconciled(batch: RecoveredEvidenceBatch) -> None:
+        config = recovery_config(
+            run_id=batch.run_id,
+            config_sha256=batch.config_sha256,
+            config_snapshot=batch.config_snapshot,
+            config_snapshot_file_sha256=batch.config_snapshot_file_sha256,
+        )
+        if config is None:
+            progress(
+                f"Legacy-Lauf {batch.run_id} wurde in der Laufdatenbank abgeglichen; "
+                "sein damaliger Konfigurationsstand ist nicht mehr verfuegbar, daher "
+                "wurde kein neuer Bericht erzeugt."
+            )
+            return
+        _publish_recovered_batch(batch, config, data_dir, progress, reports_ready)
+
+    def persist_incomplete(context: RecoveredRunContext) -> None:
+        config = recovery_config(
+            run_id=context.run_id,
+            config_sha256=context.config_sha256,
+            config_snapshot=context.config_snapshot,
+            config_snapshot_file_sha256=context.config_snapshot_file_sha256,
+        )
+        if config is None:
+            progress(
+                f"Legacy-Lauf {context.run_id} hat unverarbeitete Befunde, kann aber "
+                "ohne seinen damaligen Konfigurationsstand nicht automatisch "
+                "fertiggestellt werden."
+            )
+            return
+        store = RunStore(context.store_path)
+        result = ScanResult(
+            run_id=context.run_id,
+            started_at_utc=_utc_now_text(),
+            run_store_path=context.store_path,
+        )
+
+        def publish_new_records(records: tuple[EvidenceRecord, ...]) -> None:
+            publish_reconciled(
+                RecoveredEvidenceBatch(
+                    run_id=context.run_id,
+                    config_sha256=context.config_sha256,
+                    software_sha256=context.software_sha256,
+                    config_snapshot=context.config_snapshot,
+                    config_snapshot_file_sha256=context.config_snapshot_file_sha256,
+                    records=records,
+                )
+            )
+
+        _persist_all_evidence(
+            config,
+            data_dir,
+            store,
+            journal,
+            result,
+            progress,
+            config_sha256=context.config_sha256,
+            software_sha256=context.software_sha256,
+            batch_persisted=publish_new_records,
+        )
+
+    def report_legacy_skip(notice: LegacyRecoveryNotice) -> None:
+        progress(f"Legacy-Lauf {notice.run_id} wurde nicht migriert: {notice.reason}")
+
+    try:
+        summary = recover_evidence_journal(
+            evidence_dir,
+            on_reconciled=publish_reconciled,
+            on_incomplete_run=persist_incomplete,
+            on_legacy_skipped=report_legacy_skip,
+        )
+    except EvidenceJournalError as exc:
+        raise MonitorError(
+            "Das Evidenzjournal ist beschaedigt; die Wiederherstellung wurde vor "
+            f"allen Netzwerkzugriffen abgebrochen: {_safe_error(exc)}"
+        ) from exc
+    except (EvidenceRecoveryError, OSError, ValueError, TypeError) as exc:
+        raise MonitorError(
+            "Fruehere Laufdaten konnten vor dem neuen Lauf nicht sicher "
+            f"wiederhergestellt werden: {_safe_error(exc)}"
+        ) from exc
+    if summary.inserted_records:
+        progress(
+            f"{summary.inserted_records} journalisierte Befund(e) wurden vor dem "
+            "neuen Lauf in ihre Laufdatenbank uebernommen."
+        )
+
+
 def _run_scan_locked_impl(
     config: AppConfig,
     data_dir: Path,
@@ -935,10 +1314,28 @@ def _run_scan_locked_impl(
     reports_ready: ReportsReadyCallback | None = None,
 ) -> ScanResult:
     _enforce_storage_capacity(data_dir)
-    run_id = _new_run_id()
-    started_at = _utc_now_text()
     evidence_dir = _ensure_private_directory(data_dir / "evidence", app_owned=True)
     run_store_dir = _ensure_private_directory(evidence_dir / "runs", app_owned=True)
+    reports_dir = _ensure_private_directory(data_dir / "reports", app_owned=True)
+    journal_path = evidence_dir / "events.jsonl"
+    journal = EvidenceJournal(journal_path)
+    _recover_previous_runs(
+        config,
+        data_dir,
+        evidence_dir,
+        journal,
+        progress,
+        reports_ready,
+    )
+    verification = journal.verify()
+    if not verification.valid:
+        raise MonitorError(
+            "Das Evidenzjournal ist beschaedigt; der Lauf wurde vor allen "
+            f"Netzwerkzugriffen abgebrochen: {verification.error or 'unbekannter Fehler'}"
+        )
+
+    run_id = _new_run_id()
+    started_at = _utc_now_text()
     run_store_path = run_store_dir / f"{run_id}.sqlite3"
     store = RunStore(run_store_path)
     _ensure_private_file(run_store_path)
@@ -950,25 +1347,21 @@ def _run_scan_locked_impl(
     runtimes = {
         target.info_hash_hex: _TargetRuntimeMetrics(target=target) for target in config.targets
     }
-    reports_dir = _ensure_private_directory(data_dir / "reports", app_owned=True)
     output_dir = _ensure_private_directory(reports_dir / run_id, app_owned=True)
-
-    journal_path = evidence_dir / "events.jsonl"
-    journal = EvidenceJournal(journal_path)
-    verification = journal.verify()
-    if not verification.valid:
-        raise MonitorError(
-            "Das Evidenzjournal ist beschaedigt; der Lauf wurde vor allen "
-            f"Netzwerkzugriffen abgebrochen: {verification.error or 'unbekannter Fehler'}"
-        )
 
     config_hash = _config_sha256(config)
     software_hash = _software_sha256()
+    config_snapshot_path = run_store_dir / f"{run_id}.config.json"
+    atomic_write_json(config_snapshot_path, config_to_dict(config))
+    _ensure_private_file(config_snapshot_path)
+    config_snapshot_file_hash = _file_sha256(config_snapshot_path)
     journal.append(
         {
             "event_type": "scan_started",
             "run_id": run_id,
             "config_sha256": config_hash,
+            "config_snapshot": config_snapshot_path.name,
+            "config_snapshot_file_sha256": config_snapshot_file_hash,
             "software_sha256": software_hash,
             "targets": [
                 {"label": target.label, "info_hash": target.info_hash_hex}
@@ -980,42 +1373,76 @@ def _run_scan_locked_impl(
     )
     _ensure_private_file(journal_path)
     failure_state.append((journal, run_id, config_hash, software_hash, journal_path))
+    intermediate_batch_number = 0
 
-    def publish_report_snapshot(batch_count: int, batch_vpn_count: int) -> None:
-        result.known_vpn_total += batch_vpn_count
+    def publish_report_snapshot(records: tuple[EvidenceRecord, ...]) -> None:
+        nonlocal intermediate_batch_number
+        batch_count = len(records)
+        if not 1 <= batch_count <= PERSIST_BATCH_SIZE:
+            raise MonitorError("Zwischenbericht erhielt keinen gueltigen Fuenferbatch.")
+        intermediate_batch_number += 1
+        result.known_vpn_total += sum(record.vpn.status == "known_vpn" for record in records)
         _refresh_result_metrics(result, config, store, runtimes)
+        generated_at = _utc_now_text()
+        batch_run_id = f"{run_id}-zwischenstand-{intermediate_batch_number:06d}"
+        batch_result = ScanResult(
+            run_id=batch_run_id,
+            started_at_utc=result.started_at_utc,
+            completed_at_utc=generated_at,
+            records=list(records),
+            candidate_count=batch_count,
+            handshake_count=batch_count,
+            confirmed_handshake_count=sum(record.handshake.confirmed for record in records),
+            offering_observation_count=batch_count,
+            known_vpn_total=sum(record.vpn.status == "known_vpn" for record in records),
+        )
+        batch_output_dir = _ensure_private_directory(
+            output_dir / f"zwischenstand-{intermediate_batch_number:06d}",
+            app_owned=True,
+        )
         generated_paths = generate_reports(
-            result,
-            output_dir,
+            batch_result,
+            batch_output_dir,
             _report_config(config),
-            generated_at_utc=_utc_now_text(),
+            generated_at_utc=generated_at,
         )
         for path in generated_paths:
             _ensure_private_file(path)
         evidence_count = store.evidence_count()
         progress(
             f"{evidence_count} positive Befund(e) sind fertig im Ergebnisordner "
-            f"gespeichert (+{batch_count})."
+            f"gespeichert (+{batch_count}, Zwischenstand {intermediate_batch_number})."
         )
         if reports_ready is not None:
             reports_ready(output_dir, evidence_count)
 
     async def persist_ready_batches() -> None:
-        await asyncio.to_thread(
-            _persist_all_evidence,
-            config,
-            data_dir,
-            store,
-            journal,
-            result,
-            progress,
-            config_sha256=config_hash,
-            software_sha256=software_hash,
-            full_batches_only=True,
-            batch_persisted=publish_report_snapshot,
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                _persist_all_evidence,
+                config,
+                data_dir,
+                store,
+                journal,
+                result,
+                progress,
+                config_sha256=config_hash,
+                software_sha256=software_hash,
+                full_batches_only=True,
+                batch_persisted=publish_report_snapshot,
+            )
         )
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            # Ein Thread lässt sich nach dem Start nicht sicher abbrechen. Vor der
+            # kontrollierten Beendigung muss deshalb genau dieser Writer fertig sein,
+            # damit Journal, SQLite und Bericht nicht parallel erneut beschrieben werden.
+            await asyncio.shield(worker)
+            raise
 
     network_notices: list[str] = []
+    network_failure: MonitorError | None = None
     try:
         network_notices = asyncio.run(
             _network_phase(
@@ -1036,11 +1463,19 @@ def _run_scan_locked_impl(
         )
         progress("Prueflauf wird kontrolliert beendet; Restbefunde werden gespeichert.")
     except TimeoutError as exc:
-        raise MonitorError("Eine einzelne Netzwerkoperation ueberschritt ihr Zeitlimit.") from exc
+        network_failure = MonitorError(
+            "Eine einzelne Netzwerkoperation ueberschritt ihr Zeitlimit."
+        )
+        network_failure.__cause__ = exc
     except OSError as exc:
-        raise MonitorError(
+        network_failure = MonitorError(
             "Die Peer-Suche oder Direktpruefung scheiterte wegen eines Netzwerkfehlers."
-        ) from exc
+        )
+        network_failure.__cause__ = exc
+    except MonitorError as exc:
+        network_failure = exc
+    if network_failure is not None:
+        result.errors.append(str(network_failure))
     result.notices.extend(network_notices)
     _persist_all_evidence(
         config,
@@ -1051,8 +1486,10 @@ def _run_scan_locked_impl(
         progress,
         config_sha256=config_hash,
         software_sha256=software_hash,
-        batch_persisted=lambda _count, vpn_count: setattr(
-            result, "known_vpn_total", result.known_vpn_total + vpn_count
+        batch_persisted=lambda records: setattr(
+            result,
+            "known_vpn_total",
+            result.known_vpn_total + sum(record.vpn.status == "known_vpn" for record in records),
         ),
     )
     _refresh_result_metrics(result, config, store, runtimes)
@@ -1073,13 +1510,21 @@ def _run_scan_locked_impl(
         reports_ready(output_dir, store.evidence_count())
 
     manifest_path = generated_paths[-1]
-    terminal_event = "scan_cancelled" if result.cancelled else "scan_completed"
+    terminal_event = (
+        "scan_failed"
+        if network_failure is not None
+        else "scan_cancelled"
+        if result.cancelled
+        else "scan_completed"
+    )
 
     journal.append(
         {
             "event_type": terminal_event,
             "run_id": run_id,
             "config_sha256": config_hash,
+            "config_snapshot": config_snapshot_path.name,
+            "config_snapshot_file_sha256": config_snapshot_file_hash,
             "software_sha256": software_hash,
             "completed_at_utc": result.completed_at_utc,
             "candidate_count": result.total_candidate_count,
@@ -1093,11 +1538,27 @@ def _run_scan_locked_impl(
             "warning_count": len(result.errors),
             "notice_count": len(result.notices),
             "operational_notices": list(result.notices),
+            **(
+                {
+                    "error_type": type(network_failure).__name__,
+                    "error": _safe_error(network_failure),
+                }
+                if network_failure is not None
+                else {}
+            ),
         },
         recorded_at_utc=result.completed_at_utc,
     )
-    _ensure_private_file(journal_path)
+    # Ab hier existiert bereits ein terminales Ereignis. Ein nachfolgender
+    # Dateirechtefehler darf nicht durch den Wrapper als zweites scan_failed
+    # journalisiert werden.
     failure_state.clear()
+    _ensure_private_file(journal_path)
+    if network_failure is not None:
+        progress(
+            f"Prueflauf {run_id} mit Netzwerkfehler beendet; vorhandene Ergebnisse sind fertig."
+        )
+        raise network_failure
     if result.cancelled:
         progress(f"Prueflauf {run_id} kontrolliert abgebrochen; vorhandene Ergebnisse sind fertig.")
     else:

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import sqlite3
 import stat
-from dataclasses import replace
+from dataclasses import asdict, replace
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -19,7 +22,11 @@ from bittorrent_beobachter.models import (
     PeerControlEvent,
     VpnClassification,
 )
-from bittorrent_beobachter.run_store import RunStore, RunStoreError
+from bittorrent_beobachter.run_store import (
+    RunStore,
+    RunStoreError,
+    decode_evidence_journal_event,
+)
 
 HASH_A = "11" * 20
 HASH_B = "22" * 20
@@ -74,7 +81,7 @@ def _handshake(candidate: PeerCandidate) -> HandshakeResult:
     return HandshakeResult(
         candidate=candidate,
         attempted_at_utc="2026-10-20T10:00:00.500Z",
-        completed_at_utc="2026-10-20T10:01:01.000Z",
+        completed_at_utc="2026-10-20T10:00:00.750Z",
         confirmed=True,
         remote_peer_id_hex="ab" * 20,
         reserved_bits_hex="00" * 8,
@@ -385,3 +392,548 @@ def test_305_candidates_are_claimed_fairly_in_five_item_batches(tmp_path: Path) 
     assert metrics[HASH_A].in_progress == 153
     assert metrics[HASH_B].in_progress == 152
     assert store.claim_candidate_batch([HASH_A, HASH_B], size=5) == []
+
+
+def _offset_utc(timestamp: str, *, seconds: float) -> str:
+    parsed = datetime.fromisoformat(timestamp.removesuffix("Z") + "+00:00")
+    return (
+        (parsed + timedelta(seconds=seconds))
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _stored_completion(database_path: Path) -> str:
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT completed_at_utc FROM candidates WHERE status = 'done'"
+        ).fetchone()
+    assert row is not None
+    assert isinstance(row[0], str)
+    return row[0]
+
+
+def test_late_sighting_requeues_only_completed_negative_candidate(tmp_path: Path) -> None:
+    database_path = tmp_path / "run.sqlite3"
+    store = RunStore(database_path)
+    candidate = _candidate(HASH_A, 70)
+    assert store.add_candidates([candidate]) == 1
+    claimed = store.claim_candidate_batch([HASH_A])
+    assert claimed == [candidate]
+    negative = replace(_handshake(candidate), availability=None)
+    assert store.store_handshake_batch([negative]) == 1
+    completed_at = _stored_completion(database_path)
+
+    too_early = replace(
+        candidate,
+        discovered_at_utc=_offset_utc(completed_at, seconds=9.999),
+        source_note="Zu fruehe neue Sichtung",
+    )
+    ignored = store.ingest_candidates(
+        [candidate, too_early],
+        negative_recheck_cooldown_seconds=10.0,
+    )
+    assert ignored.new_candidates == 0
+    assert ignored.requeued_negative_candidates == 0
+    assert ignored.ignored_sightings == 2
+    assert ignored.scheduled_candidates == 0
+    assert store.claim_candidate_batch([HASH_A]) == []
+
+    late = replace(
+        candidate,
+        discovered_at_utc=_offset_utc(completed_at, seconds=10.0),
+        transaction_id_hex="deadbeef",
+        response_sha256="fe" * 32,
+        source_note="Spaetere neue Sichtung",
+    )
+    scheduled = store.ingest_candidates(
+        [late],
+        negative_recheck_cooldown_seconds=10.0,
+    )
+    assert scheduled.new_candidates == 0
+    assert scheduled.requeued_negative_candidates == 1
+    assert scheduled.ignored_sightings == 0
+    assert scheduled.scheduled_candidates == 1
+    metrics = store.metrics_by_hash()[HASH_A]
+    assert metrics.pending == 1
+    assert metrics.handshake_results == 0
+
+    duplicate = store.ingest_candidates(
+        [late],
+        negative_recheck_cooldown_seconds=10.0,
+    )
+    assert duplicate.requeued_negative_candidates == 0
+    assert duplicate.ignored_sightings == 1
+    assert store.claim_candidate_batch([HASH_A]) == [late]
+    assert store.store_handshake_batch([replace(_handshake(late), availability=None)]) == 1
+
+    repeated = store.ingest_candidates(
+        [late],
+        negative_recheck_cooldown_seconds=10.0,
+    )
+    assert repeated.scheduled_candidates == 0
+    assert repeated.ignored_sightings == 1
+    assert store.claim_candidate_batch([HASH_A]) == []
+
+
+def test_positive_candidate_is_never_requeued(tmp_path: Path) -> None:
+    database_path = tmp_path / "run.sqlite3"
+    store = RunStore(database_path)
+    candidate = _candidate(HASH_A, 71)
+    assert store.add_candidates([candidate]) == 1
+    assert store.claim_candidate_batch([HASH_A]) == [candidate]
+    assert store.store_handshake_batch([_handshake(candidate)]) == 1
+    completed_at = _stored_completion(database_path)
+
+    much_later = replace(
+        candidate,
+        discovered_at_utc=_offset_utc(completed_at, seconds=3_600),
+        source_note="Viel spaetere Sichtung",
+    )
+    result = store.ingest_candidates(
+        [much_later],
+        negative_recheck_cooldown_seconds=0,
+    )
+
+    assert result.scheduled_candidates == 0
+    assert result.ignored_sightings == 1
+    assert store.claim_candidate_batch([HASH_A]) == []
+    metrics = store.metrics_by_hash()[HASH_A]
+    assert metrics.done == 1
+    assert metrics.offering_observed == 1
+
+
+@pytest.mark.parametrize("cooldown", [-1, float("inf"), float("nan"), True])
+def test_candidate_recheck_cooldown_must_be_finite_and_nonnegative(
+    tmp_path: Path,
+    cooldown: float,
+) -> None:
+    store = RunStore(tmp_path / "run.sqlite3")
+    with pytest.raises(ValueError, match="negative_recheck_cooldown_seconds"):
+        store.ingest_candidates([], negative_recheck_cooldown_seconds=cooldown)
+
+
+def _persist_one_evidence(database_path: Path) -> RunStore:
+    store = RunStore(database_path)
+    candidate = _candidate(HASH_A, 72)
+    assert store.add_candidates([candidate]) == 1
+    assert store.claim_candidate_batch([HASH_A]) == [candidate]
+    handshake = _handshake(candidate)
+    assert store.store_handshake_batch([handshake]) == 1
+    assert store.store_evidence_batch([_evidence(handshake, 0)]) == 1
+    return store
+
+
+@pytest.mark.parametrize(
+    ("corruption", "expected_error"),
+    [
+        ("event_hash", "evidence_event_sha256"),
+        ("vpn_status", "VPN-Status"),
+        ("known_vpn_without_provider", "benoetigt einen Anbieter"),
+        ("provider_without_known_vpn", "Nur ein bekannter VPN-Treffer"),
+        ("enrichment_ip", "nicht auf dieselbe IP"),
+        ("negative_counter", "nichtnegative Ganzzahl"),
+        ("invalid_timestamp", "UTC-Zeitstempel"),
+        ("invalid_asn", "ungueltigen Wert"),
+    ],
+)
+def test_corrupt_evidence_json_is_rejected_during_deserialization(
+    tmp_path: Path,
+    corruption: str,
+    expected_error: str,
+) -> None:
+    database_path = tmp_path / "run.sqlite3"
+    store = _persist_one_evidence(database_path)
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute("SELECT evidence_json FROM evidence_records").fetchone()
+        assert row is not None
+        payload = json.loads(str(row[0]))
+        if corruption == "event_hash":
+            payload["evidence_event_sha256"] = "z" * 64
+        elif corruption == "vpn_status":
+            payload["vpn"]["status"] = "maybe_vpn"
+        elif corruption == "known_vpn_without_provider":
+            payload["vpn"]["status"] = "known_vpn"
+            payload["vpn"]["provider"] = None
+        elif corruption == "provider_without_known_vpn":
+            payload["vpn"]["provider"] = "Unerwarteter Anbieter"
+        elif corruption == "enrichment_ip":
+            payload["enrichment"]["ip"] = "9.9.9.9"
+        elif corruption == "negative_counter":
+            payload["handshake"]["bytes_received"] = -1
+        elif corruption == "invalid_timestamp":
+            payload["handshake"]["availability"]["ended_at_utc"] = "2026-10-20 10:01:01"
+        elif corruption == "invalid_asn":
+            payload["enrichment"]["asns"] = [0]
+        else:
+            raise AssertionError(f"Unbekannter Testfall: {corruption}")
+        serialized = json.dumps(payload)
+        connection.execute(
+            "UPDATE evidence_records SET evidence_json = ?, evidence_json_sha256 = ?",
+            (serialized, hashlib.sha256(serialized.encode("utf-8")).hexdigest()),
+        )
+        connection.commit()
+
+    with pytest.raises(RunStoreError, match=expected_error):
+        list(store.iter_evidence_records())
+
+
+def test_canonical_equivalent_enrichment_ip_is_accepted(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run.sqlite3")
+    candidate = replace(
+        _candidate(HASH_A, 73),
+        ip="2001:4860:4860::8888",
+        port=30_073,
+    )
+    assert store.add_candidates([candidate]) == 1
+    assert store.claim_candidate_batch([HASH_A]) == [candidate]
+    handshake = _handshake(candidate)
+    assert store.store_handshake_batch([handshake]) == 1
+    evidence = _evidence(handshake, 0)
+    evidence = replace(
+        evidence,
+        enrichment=replace(
+            evidence.enrichment,
+            ip="2001:4860:4860:0:0:0:0:8888",
+        ),
+    )
+
+    assert store.store_evidence_batch([evidence]) == 1
+    stored = list(store.iter_evidence_records())
+    assert len(stored) == 1
+    assert stored[0].enrichment.ip == "2001:4860:4860::8888"
+
+
+@pytest.mark.parametrize("read_path", ["all_records", "ip_groups", "records_for_ip"])
+def test_semantically_valid_vpn_tampering_is_rejected_on_every_read_path(
+    tmp_path: Path,
+    read_path: str,
+) -> None:
+    database_path = tmp_path / "run.sqlite3"
+    store = _persist_one_evidence(database_path)
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT e.evidence_json, c.ip
+            FROM evidence_records AS e
+            JOIN candidates AS c ON c.id = e.candidate_id
+            """
+        ).fetchone()
+        assert row is not None
+        payload = json.loads(str(row[0]))
+        ip = str(row[1])
+        payload["vpn"]["status"] = "known_vpn"
+        payload["vpn"]["provider"] = "Manipulierter Anbieter"
+        connection.execute(
+            "UPDATE evidence_records SET evidence_json = ?",
+            (json.dumps(payload),),
+        )
+        connection.commit()
+
+    with pytest.raises(RunStoreError, match="Integritaetspruefung"):
+        if read_path == "all_records":
+            list(store.iter_evidence_records())
+        elif read_path == "ip_groups":
+            list(store.iter_positive_ip_groups())
+        elif read_path == "records_for_ip":
+            list(store.iter_positive_evidence_for_ip(ip))
+        else:
+            raise AssertionError(f"Unbekannter Lesepfad: {read_path}")
+
+
+def test_schema_v1_migration_backfills_exact_evidence_json_digest(tmp_path: Path) -> None:
+    database_path = tmp_path / "run.sqlite3"
+    _persist_one_evidence(database_path)
+    with sqlite3.connect(database_path) as connection:
+        raw = connection.execute("SELECT evidence_json FROM evidence_records").fetchone()[0]
+        assert isinstance(raw, str)
+        connection.execute("ALTER TABLE evidence_records DROP COLUMN evidence_json_sha256")
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+
+    migrated = RunStore(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        row = connection.execute(
+            "SELECT evidence_json, evidence_json_sha256 FROM evidence_records"
+        ).fetchone()
+    assert version == 3
+    assert row is not None
+    assert row[0] == raw
+    assert row[1] == hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    assert len(list(migrated.iter_evidence_records())) == 1
+
+
+def _journal_event(record: EvidenceRecord) -> dict[str, object]:
+    return {
+        "event_type": "observed_bittorrent_piece_availability",
+        "run_id": "run-1",
+        "config_sha256": "a" * 64,
+        "software_sha256": "b" * 64,
+        "handshake": asdict(record.handshake),
+        "enrichment": asdict(record.enrichment),
+        "vpn": asdict(record.vpn),
+    }
+
+
+def test_decode_evidence_journal_event_binds_run_hashes_and_record() -> None:
+    evidence = _evidence(_handshake(_candidate(HASH_A, 80)), 0)
+    event_sha256 = "c" * 64
+
+    decoded = decode_evidence_journal_event(
+        _journal_event(evidence),
+        event_sha256,
+        expected_run_id="run-1",
+        expected_config_sha256="a" * 64,
+        expected_software_sha256="b" * 64,
+    )
+
+    assert decoded.run_id == "run-1"
+    assert decoded.config_sha256 == "a" * 64
+    assert decoded.software_sha256 == "b" * 64
+    assert decoded.record == replace(evidence, evidence_event_sha256=event_sha256)
+
+
+@pytest.mark.parametrize(
+    ("corruption", "expected_error"),
+    [
+        ("run", "anderen Lauf"),
+        ("config", "anderen Konfiguration"),
+        ("software", "anderen Softwarestand"),
+        ("event_hash", "event_sha256"),
+        ("event_type", "Ereignistyp"),
+        ("extra_key", "unerwartete Felder"),
+    ],
+)
+def test_decode_evidence_journal_event_rejects_wrong_binding_or_shape(
+    corruption: str,
+    expected_error: str,
+) -> None:
+    evidence = _evidence(_handshake(_candidate(HASH_A, 81)), 0)
+    event = _journal_event(evidence)
+    event_sha256 = "c" * 64
+    expected_run_id = "run-1"
+    expected_config_sha256 = "a" * 64
+    expected_software_sha256 = "b" * 64
+    if corruption == "run":
+        expected_run_id = "run-2"
+    elif corruption == "config":
+        expected_config_sha256 = "d" * 64
+    elif corruption == "software":
+        expected_software_sha256 = "e" * 64
+    elif corruption == "event_hash":
+        event_sha256 = "z" * 64
+    elif corruption == "event_type":
+        event["event_type"] = "scan_completed"
+    elif corruption == "extra_key":
+        event["unexpected"] = True
+    else:
+        raise AssertionError(f"Unbekannter Testfall: {corruption}")
+
+    with pytest.raises(RunStoreError, match=expected_error):
+        decode_evidence_journal_event(
+            event,
+            event_sha256,
+            expected_run_id=expected_run_id,
+            expected_config_sha256=expected_config_sha256,
+            expected_software_sha256=expected_software_sha256,
+        )
+
+
+def test_reconcile_evidence_batch_inserts_five_and_is_idempotent(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run.sqlite3")
+    candidates = [_candidate(HASH_A, 82 + index) for index in range(5)]
+    assert store.add_candidates(candidates) == 5
+    assert store.claim_candidate_batch([HASH_A], size=5) == candidates
+    handshakes = [_handshake(candidate) for candidate in candidates]
+    assert store.store_handshake_batch(handshakes) == 5
+    records = [_evidence(handshake, index) for index, handshake in enumerate(handshakes)]
+
+    assert store.reconcile_evidence_batch(records) == 5
+    assert store.reconcile_evidence_batch(records) == 0
+    assert list(store.iter_evidence_records()) == records
+    with sqlite3.connect(store.path) as connection:
+        stored = connection.execute(
+            "SELECT evidence_json, evidence_json_sha256 FROM evidence_records ORDER BY candidate_id"
+        ).fetchall()
+    assert len(stored) == 5
+    assert all(
+        digest == hashlib.sha256(payload.encode("utf-8")).hexdigest() for payload, digest in stored
+    )
+
+
+def test_reconcile_evidence_batch_rolls_back_on_divergent_existing_record(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "run.sqlite3")
+    candidates = [_candidate(HASH_A, 90 + index) for index in range(2)]
+    assert store.add_candidates(candidates) == 2
+    assert store.claim_candidate_batch([HASH_A], size=2) == candidates
+    handshakes = [_handshake(candidate) for candidate in candidates]
+    assert store.store_handshake_batch(handshakes) == 2
+    missing = _evidence(handshakes[0], 0)
+    existing = _evidence(handshakes[1], 1)
+    assert store.store_evidence_batch([existing]) == 1
+    divergent = replace(
+        existing,
+        vpn=VpnClassification(status="unknown", reason="Abweichender Datensatz"),
+    )
+
+    with pytest.raises(RunStoreError, match="weicht vom gespeicherten Datensatz ab"):
+        store.reconcile_evidence_batch([missing, divergent])
+
+    assert store.evidence_count() == 1
+    assert list(store.iter_evidence_records()) == [existing]
+    assert store.reconcile_evidence_batch([missing]) == 1
+
+
+def test_reconcile_evidence_batch_requires_exact_stored_candidate(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run.sqlite3")
+    candidate = _candidate(HASH_A, 94)
+    assert store.add_candidates([candidate]) == 1
+    assert store.claim_candidate_batch([HASH_A]) == [candidate]
+    handshake = _handshake(candidate)
+    assert store.store_handshake_batch([handshake]) == 1
+    changed_handshake = replace(
+        handshake,
+        candidate=replace(candidate, source_note="Abweichende Kandidatendaten"),
+    )
+
+    with pytest.raises(RunStoreError, match="abweichende Kandidatendaten"):
+        store.reconcile_evidence_batch([_evidence(changed_handshake, 0)])
+
+    assert store.evidence_count() == 0
+
+
+def test_reconcile_evidence_batch_rejects_more_than_five_records(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run.sqlite3")
+    evidence = [_evidence(_handshake(_candidate(HASH_A, 95 + index)), index) for index in range(6)]
+
+    with pytest.raises(ValueError, match="hoechstens 5"):
+        store.reconcile_evidence_batch(evidence)
+
+    assert store.evidence_count() == 0
+
+
+def _claimed_at(database_path: Path) -> str:
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT claimed_at_utc FROM candidates WHERE status = 'in_progress'"
+        ).fetchone()
+    assert row is not None
+    assert isinstance(row[0], str)
+    return row[0]
+
+
+def test_new_sighting_during_negative_check_is_requeued_after_completion(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "run.sqlite3"
+    store = RunStore(database_path)
+    candidate = _candidate(HASH_A, 100)
+    assert store.add_candidates([candidate]) == 1
+    assert store.claim_candidate_batch([HASH_A]) == [candidate]
+    rediscovered = replace(
+        candidate,
+        discovered_at_utc=_offset_utc(_claimed_at(database_path), seconds=20),
+        transaction_id_hex="feedbeef",
+        response_sha256="cd" * 32,
+        source_note="Sichtung waehrend laufender Pruefung",
+    )
+
+    ingest = store.ingest_candidates(
+        [rediscovered],
+        negative_recheck_cooldown_seconds=10,
+    )
+    assert ingest.deferred_negative_rechecks == 1
+    assert ingest.scheduled_candidates == 0
+    assert store.store_handshake_batch([replace(_handshake(candidate), availability=None)]) == 1
+
+    metrics = store.metrics_by_hash()[HASH_A]
+    assert metrics.pending == 1
+    assert metrics.done == 0
+    assert metrics.handshake_results == 0
+    assert store.claim_candidate_batch([HASH_A]) == [rediscovered]
+
+
+def test_new_sighting_during_positive_check_remains_terminal(tmp_path: Path) -> None:
+    database_path = tmp_path / "run.sqlite3"
+    store = RunStore(database_path)
+    candidate = _candidate(HASH_A, 101)
+    assert store.add_candidates([candidate]) == 1
+    assert store.claim_candidate_batch([HASH_A]) == [candidate]
+    rediscovered = replace(
+        candidate,
+        discovered_at_utc=_offset_utc(_claimed_at(database_path), seconds=20),
+        source_note="Spaetere Sichtung desselben positiven Endpunkts",
+    )
+    assert (
+        store.ingest_candidates(
+            [rediscovered],
+            negative_recheck_cooldown_seconds=10,
+        ).deferred_negative_rechecks
+        == 1
+    )
+
+    assert store.store_handshake_batch([_handshake(candidate)]) == 1
+
+    metrics = store.metrics_by_hash()[HASH_A]
+    assert metrics.pending == 0
+    assert metrics.done == 1
+    assert metrics.offering_observed == 1
+    assert store.claim_candidate_batch([HASH_A]) == []
+
+
+def test_crash_requeue_promotes_latest_deferred_sighting(tmp_path: Path) -> None:
+    database_path = tmp_path / "run.sqlite3"
+    store = RunStore(database_path)
+    candidate = _candidate(HASH_A, 102)
+    assert store.add_candidates([candidate]) == 1
+    assert store.claim_candidate_batch([HASH_A]) == [candidate]
+    rediscovered = replace(
+        candidate,
+        discovered_at_utc=_offset_utc(_claimed_at(database_path), seconds=20),
+        source_note="Vor Absturz vorgemerkte Sichtung",
+    )
+    assert (
+        store.ingest_candidates(
+            [rediscovered],
+            negative_recheck_cooldown_seconds=10,
+        ).deferred_negative_rechecks
+        == 1
+    )
+
+    restarted = RunStore(database_path)
+    assert restarted.requeue_in_progress() == 1
+    assert restarted.claim_candidate_batch([HASH_A]) == [rediscovered]
+
+
+def test_schema_v2_migration_adds_rediscovery_columns(tmp_path: Path) -> None:
+    database_path = tmp_path / "run.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE candidates (
+                id INTEGER PRIMARY KEY,
+                info_hash TEXT NOT NULL,
+                ip TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                candidate_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                claimed_at_utc TEXT,
+                completed_at_utc TEXT,
+                UNIQUE (info_hash, ip, port)
+            )
+            """
+        )
+        connection.execute("PRAGMA user_version = 2")
+        connection.commit()
+
+    RunStore(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(candidates)").fetchall()}
+    assert version == 3
+    assert {"rediscovery_candidate_json", "rediscovered_at_utc"} <= columns

@@ -465,8 +465,9 @@ def generate_reports(
     config: ReportConfig,
     *,
     generated_at_utc: str | None = None,
+    changed_ips: Iterable[str] | None = None,
 ) -> list[Path]:
-    """Erzeugt alle Dateien streamend und merkt nur fünf feste Kernpfade.
+    """Erzeugt Dateien streamend und merkt nur fünf feste Kernpfade.
 
     Die vollständige Dateiliste mit SHA-256-Werten steht im Manifest. Im
     ScanResult verbleiben nur Laufbericht, beide CSV-Dateien, VPN-PDF und
@@ -475,6 +476,9 @@ def generate_reports(
     """
 
     _validate_report_config(config)
+    normalized_changed_ips = (
+        None if changed_ips is None else frozenset(_canonical_ip(ip) for ip in changed_ips)
+    )
     _single_line(result.run_id, "run_id")
     report_index = _build_report_index(result)
     generated_timestamp = _normalise_utc_timestamp(
@@ -489,6 +493,13 @@ def generate_reports(
 
     run_slug = _safe_component(result.run_id, fallback="lauf")
     toolkit = _load_reportlab()
+    changed_report_names = (
+        None
+        if normalized_changed_ips is None
+        else frozenset(
+            name for ip in normalized_changed_ips for name in _individual_report_names(run_slug, ip)
+        )
+    )
 
     with tempfile.TemporaryDirectory(prefix=".berichte-", dir=output_dir) as temp_name:
         staging_dir = Path(temp_name)
@@ -506,6 +517,14 @@ def generate_reports(
             manifest_entry_count += 1
 
         try:
+            if changed_report_names is not None:
+                manifest_entry_count += _append_preserved_report_entries(
+                    manifest_handle,
+                    output_dir,
+                    run_slug,
+                    changed_report_names,
+                )
+
             summary_path = staging_dir / f"{run_slug}_laufbericht.pdf"
             _write_summary_pdf(
                 summary_path,
@@ -538,6 +557,11 @@ def generate_reports(
             record_generated(vpn_pdf_path)
 
             for aggregate in _iter_ip_aggregates(result):
+                if (
+                    normalized_changed_ips is not None
+                    and aggregate.ip not in normalized_changed_ips
+                ):
+                    continue
                 if aggregate.is_known_vpn:
                     continue
                 ip_slug = safe_ip_filename(aggregate.ip)
@@ -565,7 +589,12 @@ def generate_reports(
         finally:
             manifest_handle.close()
 
-        published_count = _publish_staged_files(staging_dir, output_dir)
+        published_count = _publish_staged_files(
+            staging_dir,
+            output_dir,
+            run_slug=run_slug,
+            replaceable_names=changed_report_names,
+        )
         if published_count != manifest_entry_count + 1:
             raise RuntimeError(
                 "Anzahl veröffentlichter Berichtsdateien stimmt nicht mit dem Manifest überein."
@@ -851,17 +880,151 @@ def _iter_staged_files(staging_dir: Path) -> Iterable[Path]:
             yield Path(entry.path)
 
 
-def _publish_staged_files(staging_dir: Path, output_dir: Path) -> int:
-    """Veröffentlicht Staging-Dateien iteratorbasiert und liefert nur ihre Anzahl."""
+def _individual_report_names(run_slug: str, ip: str) -> tuple[str, str]:
+    ip_slug = safe_ip_filename(ip)
+    return (
+        f"{run_slug}_anlage_{ip_slug}.pdf",
+        f"{run_slug}_strafanzeige_{ip_slug}.eml",
+    )
 
-    published_count = 0
+
+def _is_individual_report_name(name: str, run_slug: str) -> bool:
+    return (name.startswith(f"{run_slug}_anlage_") and name.endswith(".pdf")) or (
+        name.startswith(f"{run_slug}_strafanzeige_") and name.endswith(".eml")
+    )
+
+
+def _append_preserved_report_entries(
+    manifest_handle: TextIO,
+    output_dir: Path,
+    run_slug: str,
+    replaceable_names: frozenset[str],
+) -> int:
+    """Übernimmt unveränderte Einzeldateien in ein inkrementelles Manifest."""
+
+    preserved = 0
+    with os.scandir(output_dir) as entries:
+        for entry in entries:
+            if not _is_individual_report_name(entry.name, run_slug):
+                continue
+            if entry.name in replaceable_names:
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                raise RuntimeError(f"Unerwarteter Eintrag im Berichtsordner: {entry.name}")
+            _append_manifest_entry(manifest_handle, Path(entry.path))
+            preserved += 1
+    return preserved
+
+
+def _remove_obsolete_individual_reports(
+    staging_dir: Path,
+    output_dir: Path,
+    run_slug: str,
+    replaceable_names: frozenset[str] | None,
+) -> None:
+    """Entfernt nur vom Programm verwaltete, im neuen Stand obsolete Dateien."""
+
+    if replaceable_names is not None:
+        names: Iterable[str] = replaceable_names
+    else:
+        names = (
+            entry.name
+            for entry in os.scandir(output_dir)
+            if _is_individual_report_name(entry.name, run_slug)
+        )
+    try:
+        for name in names:
+            staged = staging_dir / name
+            target = output_dir / name
+            if staged.is_file() or not target.exists():
+                continue
+            if target.is_dir():
+                raise RuntimeError(f"Obsoleter Berichtsname ist unerwartet ein Verzeichnis: {name}")
+            target.unlink()
+    finally:
+        close = getattr(names, "close", None)
+        if callable(close):
+            close()
+
+
+def _sync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _sync_file(path: Path) -> None:
+    with path.open("rb") as handle:
+        os.fsync(handle.fileno())
+
+
+def _publish_staged_files(
+    staging_dir: Path,
+    output_dir: Path,
+    *,
+    run_slug: str | None = None,
+    replaceable_names: frozenset[str] | None = None,
+) -> int:
+    """Veröffentlicht Nutzdateien zuerst und das vollständige Manifest zuletzt."""
+
+    manifests = tuple(
+        path for path in _iter_staged_files(staging_dir) if path.name.endswith("_SHA256SUMS.txt")
+    )
+    if len(manifests) != 1:
+        raise RuntimeError("Das Berichts-Staging benötigt genau ein SHA256SUMS-Manifest.")
+    manifest_source = manifests[0]
+    active_run_slug = run_slug or manifest_source.name.removesuffix("_SHA256SUMS.txt")
+
+    manifest_target = output_dir / manifest_source.name
+    previous_manifest = output_dir / f".{manifest_source.name}.previous"
+    if previous_manifest.exists():
+        if previous_manifest.is_dir():
+            raise RuntimeError(
+                f"Manifest-Sicherungsname ist unerwartet ein Verzeichnis: {previous_manifest.name}"
+            )
+        previous_manifest.unlink()
+    if manifest_target.exists():
+        if not manifest_target.is_file():
+            raise RuntimeError("Vorhandenes SHA256SUMS-Manifest ist keine Datei.")
+        os.replace(manifest_target, previous_manifest)
+        _sync_directory(output_dir)
+
+    _remove_obsolete_individual_reports(
+        staging_dir,
+        output_dir,
+        active_run_slug,
+        replaceable_names,
+    )
+
     for source in _iter_staged_files(staging_dir):
+        if source == manifest_source:
+            continue
         target = output_dir / source.name
         _set_private_mode(source, 0o600)
+        _sync_file(source)
         os.replace(source, target)
         _set_private_mode(target, 0o600)
-        published_count += 1
-    return published_count
+
+    _set_private_mode(manifest_source, 0o600)
+    _sync_file(manifest_source)
+    os.replace(manifest_source, manifest_target)
+    _set_private_mode(manifest_target, 0o600)
+
+    if previous_manifest.exists():
+        previous_manifest.unlink()
+    _sync_directory(output_dir)
+
+    with os.scandir(output_dir) as entries:
+        return sum(
+            1
+            for entry in entries
+            if entry.name.startswith(f"{active_run_slug}_") and entry.is_file(follow_symlinks=False)
+        )
 
 
 def _set_private_mode(path: Path, mode: int) -> None:

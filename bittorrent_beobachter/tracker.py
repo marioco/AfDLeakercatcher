@@ -52,6 +52,9 @@ MAX_TRACKER_RESPONSE_BYTES = 65_507
 MAX_TRACKER_URL_BYTES = 4_096
 MAX_TRACKER_HOST_LENGTH = 253
 MAX_TRACKER_TIMEOUT_SECONDS = 30.0
+TRACKER_EXCHANGE_ATTEMPTS = 3
+TRACKER_RETRY_BACKOFF_SECONDS = 0.1
+TRACKER_DISCOVERY_CONCURRENCY = 8
 CANDIDATE_BATCH_SIZE = 5
 
 
@@ -325,15 +328,6 @@ async def resolve_tracker(
     return tuple(endpoints)
 
 
-async def _prepend_endpoint(
-    first: Endpoint,
-    remaining: AsyncIterator[Endpoint],
-) -> AsyncIterator[Endpoint]:
-    yield first
-    async for endpoint in remaining:
-        yield endpoint
-
-
 async def _announce_to_endpoint(
     target: Target,
     tracker: Endpoint,
@@ -344,6 +338,8 @@ async def _announce_to_endpoint(
     transaction_id_factory: Callable[[], int] | None = None,
     key_factory: Callable[[], int] | None = None,
     announce_port_factory: Callable[[], int] | None = None,
+    exchange_attempts: int = TRACKER_EXCHANGE_ATTEMPTS,
+    retry_backoff_seconds: float = TRACKER_RETRY_BACKOFF_SECONDS,
 ) -> TrackerAnnounceResponse:
     """Ermittelt Peers und entfernt danach bestmoeglich den Tracker-Eintrag."""
     if not isinstance(target, Target):
@@ -356,6 +352,22 @@ async def _announce_to_endpoint(
     normalized_timeout = _require_timeout(timeout)
     if not isinstance(peer_id, bytes) or len(peer_id) != 20:
         raise ValueError("Tracker-Peer-ID muss genau 20 Byte lang sein.")
+    if (
+        isinstance(exchange_attempts, bool)
+        or not isinstance(exchange_attempts, int)
+        or not 1 <= exchange_attempts <= 5
+    ):
+        raise ValueError("exchange_attempts muss zwischen 1 und 5 liegen.")
+    if (
+        isinstance(retry_backoff_seconds, bool)
+        or not isinstance(retry_backoff_seconds, (int, float))
+        or not 0.0 <= float(retry_backoff_seconds) <= MAX_TRACKER_TIMEOUT_SECONDS
+    ):
+        raise ValueError(
+            "retry_backoff_seconds muss zwischen 0 und "
+            f"{MAX_TRACKER_TIMEOUT_SECONDS:.1f} Sekunden liegen."
+        )
+    normalized_backoff = float(retry_backoff_seconds)
 
     address = ipaddress.ip_address(normalized_tracker[0])
     family = socket.AF_INET6 if address.version == 6 else socket.AF_INET
@@ -398,11 +410,34 @@ async def _announce_to_endpoint(
         _require_packet(response)
         return response
 
+    async def exchange_with_retries(
+        payload: bytes,
+        validator: Callable[[bytes], object] | None = None,
+    ) -> bytes:
+        for attempt in range(exchange_attempts):
+            try:
+                response = await asyncio.wait_for(
+                    exchange(payload),
+                    timeout=normalized_timeout,
+                )
+                if validator is not None:
+                    validator(response)
+                return response
+            except (TimeoutError, OSError, TrackerProtocolError):
+                if attempt + 1 >= exchange_attempts:
+                    raise
+                if normalized_backoff:
+                    await asyncio.sleep(min(normalized_backoff * (2**attempt), normalized_timeout))
+        raise AssertionError("Tracker-Retryschleife endete ohne Ergebnis.")
+
     try:
         connect_packet = build_connect_request(connect_transaction)
-        connect_response = await asyncio.wait_for(
-            exchange(connect_packet),
-            timeout=normalized_timeout,
+        connect_response = await exchange_with_retries(
+            connect_packet,
+            lambda response: parse_connect_response(
+                response,
+                expected_transaction_id=connect_transaction,
+            ),
         )
         connection_id = parse_connect_response(
             connect_response,
@@ -420,9 +455,13 @@ async def _announce_to_endpoint(
         )
         cleanup_failed = False
         try:
-            started_response = await asyncio.wait_for(
-                exchange(started_packet),
-                timeout=normalized_timeout,
+            started_response = await exchange_with_retries(
+                started_packet,
+                lambda response: parse_announce_response(
+                    response,
+                    expected_transaction_id=started_transaction,
+                    family=family,
+                ),
             )
             peers = parse_announce_response(
                 started_response,
@@ -496,13 +535,14 @@ async def discover_tracker_peers(
     collect: bool = False,
     stats: TrackerDiscoveryStats | None = None,
 ) -> list[PeerCandidate]:
-    """Fragt UDP-Tracker ab und streamt Kandidaten in Fuenferbatches.
+    """Fragt UDP-Tracker parallel ab und streamt Kandidaten seriell.
 
     ``collect=False`` behaelt weder eine Kandidatenliste noch ein laufweites
     Peer-Deduplizierungsset im Speicher. Wiederholte Nennungen werden deshalb
     ebenfalls an den Callback weitergereicht und koennen beim persistenten
     Schreiben dedupliziert werden. Im expliziten Kompatibilitaetsmodus
     ``collect=True`` werden eindeutige Kandidaten gesammelt und zurueckgegeben.
+    Die begrenzte Parallelitaet ist nur eine Arbeitsbreite und kein Mengenlimit.
     """
     if not isinstance(target, Target):
         raise TypeError("target muss ein Target sein.")
@@ -525,32 +565,14 @@ async def discover_tracker_peers(
     candidates: list[PeerCandidate] = []
     collected_endpoints: set[Endpoint] | None = set() if collect else None
     callback_batch: list[PeerCandidate] = []
+    response_queue: asyncio.Queue[TrackerAnnounceResponse | None] = asyncio.Queue(
+        maxsize=TRACKER_DISCOVERY_CONCURRENCY * 2
+    )
+    query_semaphore = asyncio.Semaphore(TRACKER_DISCOVERY_CONCURRENCY)
+    resolver_semaphore = asyncio.Semaphore(TRACKER_DISCOVERY_CONCURRENCY)
 
-    for tracker_url in trackers:
-        endpoint_iterator = iter_resolved_tracker_endpoints(
-            tracker_url,
-            timeout=normalized_timeout,
-        )
-        try:
-            first_endpoint = await anext(endpoint_iterator)
-        except StopAsyncIteration:
-            LOGGER.warning("UDP-Tracker hat keine global erreichbare Adresse.")
-            if stats is not None:
-                stats.queries_failed += 1
-            continue
-        except (TimeoutError, socket.gaierror, OSError) as exc:
-            LOGGER.warning(
-                "UDP-Tracker-DNS-Aufloesung fehlgeschlagen (%s).",
-                type(exc).__name__,
-            )
-            if stats is not None:
-                stats.queries_failed += 1
-            continue
-
-        async for tracker_endpoint in _prepend_endpoint(
-            first_endpoint,
-            endpoint_iterator,
-        ):
+    async def query_endpoint(tracker_endpoint: Endpoint) -> None:
+        async with query_semaphore:
             if stats is not None:
                 stats.endpoints_attempted += 1
             try:
@@ -567,13 +589,62 @@ async def discover_tracker_peers(
                 )
                 if stats is not None:
                     stats.queries_failed += 1
-                continue
+                return
             if stats is not None:
                 stats.queries_completed += 1
                 if response.cleanup_failed:
-                    stats.queries_failed += 1
                     stats.stop_queries_failed += 1
+            await response_queue.put(response)
 
+    async def query_tracker(tracker_url: TrackerURL) -> None:
+        endpoint_tasks: list[asyncio.Task[None]] = []
+        resolution_failed = False
+        try:
+            try:
+                async with resolver_semaphore:
+                    async for tracker_endpoint in iter_resolved_tracker_endpoints(
+                        tracker_url,
+                        timeout=normalized_timeout,
+                    ):
+                        endpoint_tasks.append(asyncio.create_task(query_endpoint(tracker_endpoint)))
+            except (TimeoutError, socket.gaierror, OSError) as exc:
+                resolution_failed = True
+                LOGGER.warning(
+                    "UDP-Tracker-DNS-Aufloesung fehlgeschlagen (%s).",
+                    type(exc).__name__,
+                )
+                if stats is not None:
+                    stats.queries_failed += 1
+
+            if not endpoint_tasks:
+                if not resolution_failed:
+                    LOGGER.warning("UDP-Tracker hat keine global erreichbare Adresse.")
+                    if stats is not None:
+                        stats.queries_failed += 1
+                return
+            await asyncio.gather(*endpoint_tasks)
+        except BaseException:
+            for task in endpoint_tasks:
+                task.cancel()
+            await asyncio.gather(*endpoint_tasks, return_exceptions=True)
+            raise
+
+    producer_tasks = [asyncio.create_task(query_tracker(tracker)) for tracker in trackers]
+
+    async def supervise_producers() -> None:
+        outcomes = await asyncio.gather(*producer_tasks, return_exceptions=True)
+        await response_queue.put(None)
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                raise outcome
+
+    supervisor = asyncio.create_task(supervise_producers())
+    failure: BaseException | None = None
+    try:
+        while True:
+            response = await response_queue.get()
+            if response is None:
+                break
             observed_at = _utc_now_text()
             for peer_ip, peer_port in response.peers:
                 peer_endpoint = normalize_global_endpoint(peer_ip, peer_port)
@@ -603,7 +674,29 @@ async def discover_tracker_peers(
                     if len(callback_batch) == CANDIDATE_BATCH_SIZE:
                         await candidate_callback(tuple(callback_batch))
                         callback_batch.clear()
+        await supervisor
+    except BaseException as exc:
+        failure = exc
+    finally:
+        supervisor.cancel()
+        for task in producer_tasks:
+            task.cancel()
+        await asyncio.gather(supervisor, *producer_tasks, return_exceptions=True)
+        if candidate_callback is not None and callback_batch:
+            pending_batch = tuple(callback_batch)
+            try:
+                await candidate_callback(pending_batch)
+            except BaseException as flush_error:
+                if failure is None or isinstance(flush_error, asyncio.CancelledError):
+                    failure = flush_error
+                else:
+                    failure.add_note(
+                        "Der letzte Tracker-Kandidatenbatch konnte nicht persistiert werden: "
+                        f"{type(flush_error).__name__}."
+                    )
+            else:
+                callback_batch.clear()
 
-    if candidate_callback is not None and callback_batch:
-        await candidate_callback(tuple(callback_batch))
+    if failure is not None:
+        raise failure
     return candidates

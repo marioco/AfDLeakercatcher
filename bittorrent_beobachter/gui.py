@@ -17,6 +17,7 @@ from tkinter import (
     LEFT,
     RIGHT,
     BooleanVar,
+    Canvas,
     StringVar,
     Tk,
     Toplevel,
@@ -44,6 +45,47 @@ from .models import EvidenceRecord, ScanResult
 from .run_store import RunStore
 
 MAX_GUI_RESULT_ROWS = 100
+DESIRED_WINDOW_WIDTH = 1040
+DESIRED_WINDOW_HEIGHT = 700
+DESIRED_MIN_WINDOW_WIDTH = 880
+DESIRED_MIN_WINDOW_HEIGHT = 600
+MAX_SCREEN_MARGIN_X = 40
+MAX_SCREEN_MARGIN_Y = 80
+MIN_TEXT_WRAP_LENGTH = 260
+
+
+def _fit_window_to_screen(
+    screen_width: int,
+    screen_height: int,
+) -> tuple[int, int, int, int]:
+    """Berechnet eine start- und minimierbare Fenstergröße innerhalb des Bildschirms."""
+
+    if (
+        isinstance(screen_width, bool)
+        or isinstance(screen_height, bool)
+        or not isinstance(screen_width, int)
+        or not isinstance(screen_height, int)
+        or screen_width <= 0
+        or screen_height <= 0
+    ):
+        raise ValueError("Die Bildschirmabmessungen müssen positive Ganzzahlen sein.")
+    horizontal_margin = min(MAX_SCREEN_MARGIN_X, screen_width // 20)
+    vertical_margin = min(MAX_SCREEN_MARGIN_Y, screen_height // 10)
+    available_width = max(1, screen_width - horizontal_margin)
+    available_height = max(1, screen_height - vertical_margin)
+    initial_width = min(DESIRED_WINDOW_WIDTH, available_width)
+    initial_height = min(DESIRED_WINDOW_HEIGHT, available_height)
+    minimum_width = min(DESIRED_MIN_WINDOW_WIDTH, initial_width)
+    minimum_height = min(DESIRED_MIN_WINDOW_HEIGHT, initial_height)
+    return initial_width, initial_height, minimum_width, minimum_height
+
+
+def _configure_window_geometry(root: Tk) -> None:
+    initial_width, initial_height, minimum_width, minimum_height = _fit_window_to_screen(
+        root.winfo_screenwidth(), root.winfo_screenheight()
+    )
+    root.geometry(f"{initial_width}x{initial_height}")
+    root.minsize(minimum_width, minimum_height)
 
 
 class SettingsDialog(Toplevel):
@@ -157,11 +199,11 @@ class ObserverApp:
         self.cancel_event = threading.Event()
         self.close_requested = False
         self.latest_output_dir: Path | None = None
+        self._run_output_dir: Path | None = None
         self.config = self._load_initial_config()
 
         root.title(f"{APP_NAME} {VERSION}")
-        root.geometry("1040x700")
-        root.minsize(880, 600)
+        _configure_window_geometry(root)
         self._build_ui()
         self._refresh_targets()
         self.root.protocol("WM_DELETE_WINDOW", self._request_close)
@@ -207,44 +249,80 @@ class ObserverApp:
         return migrated
 
     def _build_ui(self) -> None:
-        outer = ttk.Frame(self.root, padding=16)
-        outer.pack(fill=BOTH, expand=True)
+        viewport = ttk.Frame(self.root)
+        viewport.pack(fill=BOTH, expand=True)
+        canvas = Canvas(
+            viewport,
+            background=self.root.cget("background"),
+            highlightthickness=0,
+        )
+        main_scrollbar = ttk.Scrollbar(viewport, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=main_scrollbar.set)
+        main_scrollbar.pack(side=RIGHT, fill="y")
+        canvas.pack(side=LEFT, fill=BOTH, expand=True)
+
+        outer = ttk.Frame(canvas, padding=16)
+        content_window = canvas.create_window((0, 0), window=outer, anchor="nw")
+        self._content_canvas = canvas
+        self._responsive_labels: list[ttk.Label] = []
+
+        def remember_label(label: ttk.Label) -> ttk.Label:
+            self._responsive_labels.append(label)
+            return label
+
+        def update_scroll_region(_event: Any) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def resize_content(event: Any) -> None:
+            canvas.itemconfigure(content_window, width=event.width)
+            wrap_length = max(MIN_TEXT_WRAP_LENGTH, event.width - 64)
+            for label in self._responsive_labels:
+                label.configure(wraplength=wrap_length)
+
+        outer.bind("<Configure>", update_scroll_region)
+        canvas.bind("<Configure>", resize_content)
 
         ttk.Label(outer, text=APP_NAME, font=("TkDefaultFont", 18, "bold")).pack(anchor="w")
-        ttk.Label(
-            outer,
-            text=(
-                "Inhaltsfreie Verfügbarkeitsprüfung: Es werden keine Datei- oder "
-                "Metadatenblöcke angefordert, heruntergeladen oder hochgeladen."
-            ),
-            foreground="#205493",
-            wraplength=950,
-        ).pack(anchor="w", pady=(4, 12))
+        remember_label(
+            ttk.Label(
+                outer,
+                text=(
+                    "Inhaltsfreie Verfügbarkeitsprüfung: Es werden keine Datei- oder "
+                    "Metadatenblöcke angefordert, heruntergeladen oder hochgeladen."
+                ),
+                foreground="#205493",
+                wraplength=950,
+            )
+        ).pack(anchor="w", fill=X, pady=(4, 12))
 
         notice = ttk.LabelFrame(outer, text="Wichtige Aussagegrenze", padding=10)
         notice.pack(fill=X, pady=(0, 12))
-        ttk.Label(
-            notice,
-            text=(
-                "Ein positiver Befund bedeutet: Der Endpunkt bestätigte den Infohash, "
-                "meldete verfügbare Teile und erlaubte während der einminütigen Verbindung "
-                "das Stellen von Datenanfragen. Es werden keine Datenblöcke angefordert. "
-                "Der Befund identifiziert keine Person und beweist keinen tatsächlichen "
-                "Upload oder eine Straftat. Jede Anzeige muss vor dem Versand geprüft werden."
-            ),
-            wraplength=930,
-        ).pack(anchor="w")
+        remember_label(
+            ttk.Label(
+                notice,
+                text=(
+                    "Ein positiver Befund bedeutet: Der Endpunkt bestätigte den Infohash, "
+                    "meldete verfügbare Teile und erlaubte während der einminütigen Verbindung "
+                    "das Stellen von Datenanfragen. Es werden keine Datenblöcke angefordert. "
+                    "Der Befund identifiziert keine Person und beweist keinen tatsächlichen "
+                    "Upload oder eine Straftat. Jede Anzeige muss vor dem Versand geprüft werden."
+                ),
+                wraplength=930,
+            )
+        ).pack(anchor="w", fill=X)
 
         target_box = ttk.LabelFrame(outer, text="Ziele für manuelle Prüfläufe", padding=10)
         target_box.pack(fill=X, pady=(0, 12))
-        ttk.Label(
-            target_box,
-            text=(
-                "Die beiden Voreinstellungen bestätigen keinen Inhalt. Ein Prüflauf "
-                "beginnt erst nach „Jetzt prüfen“ und Ihrer ausdrücklichen Bestätigung."
-            ),
-            foreground="#555555",
-            wraplength=930,
+        remember_label(
+            ttk.Label(
+                target_box,
+                text=(
+                    "Die beiden Voreinstellungen bestätigen keinen Inhalt. Ein Prüflauf "
+                    "beginnt erst nach „Jetzt prüfen“ und Ihrer ausdrücklichen Bestätigung."
+                ),
+                foreground="#555555",
+                wraplength=930,
+            )
         ).pack(anchor="w", fill=X, pady=(0, 8))
         self.target_tree = ttk.Treeview(
             target_box,
@@ -257,9 +335,9 @@ class ObserverApp:
         self.target_tree.heading("hash", text="Infohash")
         self.target_tree.column("label", width=340, anchor="w")
         self.target_tree.column("hash", width=430, anchor="w")
-        self.target_tree.pack(side=LEFT, fill=X, expand=True)
         target_buttons = ttk.Frame(target_box)
         target_buttons.pack(side=RIGHT, padx=(10, 0), anchor="n")
+        self.target_tree.pack(side=LEFT, fill=X, expand=True)
         self.add_target_button = ttk.Button(
             target_buttons,
             text="Magnet-Link hinzufügen",
@@ -283,49 +361,52 @@ class ObserverApp:
         self.enrichment_enabled = BooleanVar(value=self.config.enrichment.enabled)
         self.enrichment_checkbox = ttk.Checkbutton(
             privacy_box,
-            text=(
-                "Bestätigte IP-Adressen an stat.ripe.net, rdap.org und das von "
-                "rdap.org bestimmte autoritative Regionalregister senden"
-            ),
+            text="Öffentliche Netzauskunft für bestätigte IP-Adressen aktivieren",
             variable=self.enrichment_enabled,
             command=self._toggle_network_enrichment,
         )
         self.enrichment_checkbox.pack(anchor="w")
-        ttk.Label(
-            privacy_box,
-            text=(
-                "Standardmäßig aus. Bekannte VPN-IP-Bereiche werden zuerst offline "
-                "erkannt und nicht extern abgefragt. Regionalregister können z. B. "
-                "RIPE, ARIN, APNIC, LACNIC oder AFRINIC sein und Anfragen protokollieren."
-            ),
-            foreground="#555555",
-            wraplength=930,
-        ).pack(anchor="w", pady=(4, 0))
+        remember_label(
+            ttk.Label(
+                privacy_box,
+                text=(
+                    "Bestätigte IP-Adressen werden an stat.ripe.net, rdap.org und das von "
+                    "rdap.org bestimmte Regionalregister gesendet. Standardmäßig ist dies "
+                    "aus. Bekannte VPN-IP-Bereiche werden zuerst offline erkannt und nicht "
+                    "extern abgefragt. Regionalregister wie RIPE, ARIN, APNIC, LACNIC oder "
+                    "AFRINIC können Anfragen protokollieren."
+                ),
+                foreground="#555555",
+                wraplength=930,
+            )
+        ).pack(anchor="w", fill=X, pady=(4, 0))
 
         action_bar = ttk.Frame(outer)
         action_bar.pack(fill=X, pady=(0, 10))
+        action_buttons = ttk.Frame(action_bar)
+        action_buttons.pack(fill=X)
         self.scan_button = ttk.Button(
-            action_bar,
+            action_buttons,
             text="Jetzt prüfen",
             command=self._start_scan,
         )
         self.scan_button.pack(side=LEFT)
         self.cancel_button = ttk.Button(
-            action_bar,
+            action_buttons,
             text="Prüflauf abbrechen",
             command=self._cancel_scan,
             state="disabled",
         )
         self.cancel_button.pack(side=LEFT, padx=(8, 0))
         self.open_button = ttk.Button(
-            action_bar,
+            action_buttons,
             text="Letzten Ergebnisordner öffnen",
             command=self._open_output,
             state="disabled",
         )
         self.open_button.pack(side=LEFT, padx=(8, 0))
         self.progress = ttk.Progressbar(action_bar, mode="indeterminate", length=170)
-        self.progress.pack(side=RIGHT)
+        self.progress.pack(anchor="w", pady=(8, 0))
         self.config_controls = (
             self.add_target_button,
             self.remove_target_button,
@@ -334,8 +415,8 @@ class ObserverApp:
         )
 
         self.status_text = StringVar(value="Bereit. Fügen Sie einen Magnet-Link hinzu.")
-        ttk.Label(outer, textvariable=self.status_text, wraplength=930).pack(
-            anchor="w", pady=(0, 8)
+        remember_label(ttk.Label(outer, textvariable=self.status_text, wraplength=930)).pack(
+            anchor="w", fill=X, pady=(0, 8)
         )
 
         result_box = ttk.LabelFrame(outer, text="Letzter Prüflauf", padding=10)
@@ -369,14 +450,36 @@ class ObserverApp:
         self.result_tree.pack(side=LEFT, fill=BOTH, expand=True)
         scrollbar.pack(side=RIGHT, fill="y")
 
-        ttk.Label(
-            outer,
-            text=(
-                "Keine automatische Anzeige · Kein automatischer E-Mail-Versand · "
-                "Bekannte VPN-Endpunkte erscheinen nur in der gesonderten Liste"
-            ),
-            foreground="#555555",
-        ).pack(anchor="w", pady=(10, 0))
+        remember_label(
+            ttk.Label(
+                outer,
+                text=(
+                    "Keine automatische Anzeige · Kein automatischer E-Mail-Versand · "
+                    "Bekannte VPN-Endpunkte erscheinen nur in der gesonderten Liste"
+                ),
+                foreground="#555555",
+            )
+        ).pack(anchor="w", fill=X, pady=(10, 0))
+        self.root.bind("<MouseWheel>", self._scroll_main_view, add="+")
+        self.root.bind("<Button-4>", self._scroll_main_view, add="+")
+        self.root.bind("<Button-5>", self._scroll_main_view, add="+")
+
+    def _scroll_main_view(self, event: Any) -> str | None:
+        if event.widget is self.result_tree:
+            return None
+        try:
+            delta = int(getattr(event, "delta", 0))
+            button = int(getattr(event, "num", 0))
+        except (TypeError, ValueError):
+            return None
+        if button == 4 or delta > 0:
+            direction = -1
+        elif button == 5 or delta < 0:
+            direction = 1
+        else:
+            return None
+        self._content_canvas.yview_scroll(direction, "units")
+        return "break"
 
     def _refresh_targets(self) -> None:
         self.target_tree.delete(*self.target_tree.get_children())
@@ -525,6 +628,7 @@ class ObserverApp:
             messagebox.showerror("Konfiguration nicht gespeichert", str(exc), parent=self.root)
             return
 
+        self._run_output_dir = None
         self.running = True
         self.cancel_event.clear()
         config_snapshot = self.config
@@ -588,12 +692,19 @@ class ObserverApp:
                 break
             if event == "error":
                 terminal_event_seen = True
-                self._finish_running_state()
+                run_output_dir = self._run_output_dir
+                self._finish_running_state(current_run_only=True)
                 if not self.close_requested:
                     messagebox.showerror("Prüflauf fehlgeschlagen", str(payload), parent=self.root)
-                    self.status_text.set(
-                        "Der Prüflauf ist fehlgeschlagen. Details stehen im Protokoll."
-                    )
+                    if run_output_dir is not None and run_output_dir.is_dir():
+                        self.status_text.set(
+                            "Der Prüflauf endete mit einem Fehler. Bereits gespeicherte "
+                            "Teilergebnisse sind im Ergebnisordner verwendbar."
+                        )
+                    else:
+                        self.status_text.set(
+                            "Der Prüflauf ist fehlgeschlagen. Details stehen im Protokoll."
+                        )
             elif event == "done":
                 terminal_event_seen = True
                 if self.close_requested:
@@ -603,6 +714,7 @@ class ObserverApp:
             elif event == "reports_ready":
                 output_dir, result_count = payload
                 self.latest_output_dir = Path(output_dir)
+                self._run_output_dir = self.latest_output_dir
                 self.open_button.configure(state="normal")
                 if not self.close_requested:
                     self.status_text.set(
@@ -626,7 +738,7 @@ class ObserverApp:
             return
         self.root.after(150, self._poll_events)
 
-    def _finish_running_state(self) -> None:
+    def _finish_running_state(self, *, current_run_only: bool = False) -> None:
         self.running = False
         self.scan_thread = None
         self.progress.stop()
@@ -634,7 +746,8 @@ class ObserverApp:
         self.cancel_button.configure(state="disabled")
         for control in self.config_controls:
             control.configure(state="normal")
-        output_available = self.latest_output_dir is not None and self.latest_output_dir.is_dir()
+        output_dir = self._run_output_dir if current_run_only else self.latest_output_dir
+        output_available = output_dir is not None and output_dir.is_dir()
         self.open_button.configure(state="normal" if output_available else "disabled")
 
     def _cancel_scan(self) -> None:
@@ -702,6 +815,7 @@ class ObserverApp:
 
         if result.report_paths:
             self.latest_output_dir = result.report_paths[0].parent
+            self._run_output_dir = self.latest_output_dir
             self.open_button.configure(state="normal")
         notice_count = len(result.notices)
         if notice_count == 1:
@@ -768,4 +882,18 @@ def launch_gui(config_path: Path, data_dir: Path) -> int:
     root = Tk()
     ObserverApp(root, config_path, data_dir)
     root.mainloop()
+    return 0
+
+
+def verify_gui_runtime() -> int:
+    """Prüft den echten gebündelten Tk-Start ohne ein sichtbares Fenster."""
+
+    root = Tk()
+    try:
+        root.withdraw()
+        root.update_idletasks()
+        if not root.tk.call("info", "patchlevel"):
+            raise RuntimeError("Tcl/Tk meldet keine gueltige Laufzeitversion.")
+    finally:
+        root.destroy()
     return 0

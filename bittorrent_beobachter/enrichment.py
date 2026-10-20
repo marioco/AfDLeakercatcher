@@ -878,8 +878,19 @@ def _configured_values(values: Iterable[str] | str) -> tuple[str, ...]:
     return tuple(values)
 
 
+def _matches_vpn_marker(value: str, marker: str) -> bool:
+    """Akzeptiere einen Marker nur exakt oder als erstes abgegrenztes Wort."""
+
+    if value == marker:
+        return True
+    if not value.startswith(marker):
+        return False
+    boundary_category = unicodedata.category(value[len(marker)])
+    return boundary_category[0] not in {"L", "M", "N"} and boundary_category != "Pc"
+
+
 class VpnClassifier:
-    """Klassifiziere offline nur anhand expliziter Netze und exakter Marker."""
+    """Klassifiziere offline nur anhand expliziter Netze und abgegrenzter Marker."""
 
     def __init__(
         self,
@@ -980,16 +991,23 @@ class VpnClassifier:
             cleaned = _clean_text(value)
             if cleaned is None:
                 continue
-            providers = self._marker_rules.get(cleaned.casefold())
-            if providers:
+            folded_value = cleaned.casefold()
+            field_matched = False
+            for marker, providers in self._marker_rules.items():
+                if not _matches_vpn_marker(folded_value, marker):
+                    continue
                 provider_matches.update(providers)
+                field_matched = True
+            if field_matched:
                 matched_fields.add(field_name)
         if len(provider_matches) == 1:
             provider = next(iter(provider_matches))
             return VpnClassification(
                 status="known_vpn",
                 provider=provider,
-                reason="Exakter Treffer eines ausdruecklich konfigurierten Anbietermarkers.",
+                reason=(
+                    "Treffer eines ausdruecklich konfigurierten Anbietermarkers am Feldanfang."
+                ),
                 source="configured_exact_marker:" + ",".join(sorted(matched_fields)),
             )
         if len(provider_matches) > 1:

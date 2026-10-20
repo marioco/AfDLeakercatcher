@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import heapq
 import hmac
 import ipaddress
+import os
 import secrets
+import shutil
 import socket
+import sqlite3
+import tempfile
 from collections.abc import Awaitable, Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from .bencode import BencodeDecodeError, BencodeLimits, bdecode, bencode
@@ -27,8 +31,8 @@ MAX_OVERALL_TIMEOUT_SECONDS = 300.0
 MAX_CONCURRENCY = 32
 MAX_RESPONSE_BYTES = 65_507
 MAX_BOOTSTRAP_NODES = 16
-DHT_SHORTLIST_SIZE = 128
 CANDIDATE_BATCH_SIZE = 5
+DHT_MIN_FREE_SPACE_BYTES = 100_000_000
 
 BOOTSTRAP_ISSUE_DNS = "dns"
 BOOTSTRAP_ISSUE_NO_GLOBAL_ADDRESS = "no_global_address"
@@ -60,6 +64,10 @@ class DHTQueryError(OSError):
             raise ValueError("Unbekannte DHT-Fehlerkategorie.")
         super().__init__(message)
         self.category = category
+
+
+class DHTFrontierStorageError(RuntimeError):
+    """Die plattenbasierte DHT-Front kann nicht sicher fortgeführt werden."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -419,6 +427,239 @@ async def resolve_bootstrap_nodes(
     return resolved
 
 
+class _DHTNodeFrontier:
+    """Private SQLite-Warteschlange für die vollständige DHT-Knotenfront."""
+
+    _PENDING = 0
+    _IN_PROGRESS = 1
+    _QUERIED = 2
+
+    def __init__(self, parent_directory: Path | None = None) -> None:
+        self._temporary_directory = tempfile.TemporaryDirectory(
+            prefix="bittorrent-beobachter-dht-",
+            dir=parent_directory,
+        )
+        self._database_path = Path(self._temporary_directory.name) / "node-frontier.sqlite3"
+        self._connection: sqlite3.Connection | None = None
+        self._closed = False
+        try:
+            if os.name != "nt":
+                os.chmod(self._temporary_directory.name, 0o700)
+            self._enforce_storage_capacity()
+            self._database_path.touch(mode=0o600, exist_ok=False)
+            if os.name != "nt":
+                os.chmod(self._database_path, 0o600)
+            self._connection = sqlite3.connect(self._database_path, timeout=5.0)
+            self._connection.execute("PRAGMA temp_store = FILE")
+            self._connection.execute("PRAGMA journal_mode = MEMORY")
+            self._connection.execute("PRAGMA synchronous = OFF")
+            self._connection.execute("PRAGMA cache_size = -1024")
+            self._connection.executescript(
+                """
+                CREATE TABLE node_frontier (
+                    id INTEGER PRIMARY KEY,
+                    ip TEXT NOT NULL,
+                    port INTEGER NOT NULL,
+                    node_id BLOB,
+                    distance BLOB NOT NULL CHECK(length(distance) = 20),
+                    priority INTEGER NOT NULL CHECK(priority IN (0, 1)),
+                    state INTEGER NOT NULL CHECK(state IN (0, 1, 2)),
+                    UNIQUE(ip, port)
+                );
+                CREATE INDEX node_frontier_claim
+                ON node_frontier(state, priority, distance, id);
+                """
+            )
+        except BaseException:
+            self.close()
+            raise
+
+    @property
+    def database_path(self) -> Path:
+        """Pfad der nur während des Laufs vorhandenen privaten SQLite-Datei."""
+        return self._database_path
+
+    def __enter__(self) -> _DHTNodeFrontier:
+        return self
+
+    def __exit__(
+        self,
+        _exception_type: object,
+        _exception: object,
+        _traceback: object,
+    ) -> None:
+        self.close()
+
+    def _require_connection(self) -> sqlite3.Connection:
+        if self._connection is None:
+            raise RuntimeError("Die DHT-Knotenwarteschlange ist bereits geschlossen.")
+        return self._connection
+
+    def _enforce_storage_capacity(self) -> None:
+        try:
+            free_bytes = shutil.disk_usage(self._temporary_directory.name).free
+        except OSError as exc:
+            raise DHTFrontierStorageError(
+                "Freier Speicherplatz für die DHT-Knotenfront konnte nicht bestimmt werden."
+            ) from exc
+        if free_bytes < DHT_MIN_FREE_SPACE_BYTES:
+            raise DHTFrontierStorageError(
+                "Weniger als 100 MB freier Speicherplatz für die DHT-Knotenfront."
+            )
+
+    def add_bootstrap_nodes(self, endpoints: Iterable[Endpoint]) -> None:
+        """Speichert Bootstrap-Knoten dedupliziert vor allen entdeckten Knoten."""
+
+        def rows() -> Iterator[tuple[str, int, None, bytes, int, int]]:
+            for raw_endpoint in endpoints:
+                endpoint = normalize_global_endpoint(*raw_endpoint)
+                if endpoint is None:
+                    raise ValueError("Bootstrap-Endpunkt ist nicht global erreichbar.")
+                yield (
+                    endpoint[0],
+                    endpoint[1],
+                    None,
+                    bytes(20),
+                    0,
+                    self._PENDING,
+                )
+
+        connection = self._require_connection()
+        with connection:
+            connection.executemany(
+                """
+                INSERT INTO node_frontier (
+                    ip, port, node_id, distance, priority, state
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ip, port) DO NOTHING
+                """,
+                rows(),
+            )
+
+    def add_discovered_nodes(self, nodes: Iterable[DHTNode], target_id: int) -> None:
+        """Persistiert alle gültigen neuen Knoten ohne Python-seitige Frontliste."""
+
+        if isinstance(target_id, bool) or not isinstance(target_id, int):
+            raise TypeError("target_id muss eine Ganzzahl sein.")
+        if not 0 <= target_id < 2**160:
+            raise ValueError("target_id muss eine 160-Bit-Ganzzahl sein.")
+
+        self._enforce_storage_capacity()
+        connection = self._require_connection()
+        with connection:
+            for node in nodes:
+                if (
+                    not isinstance(node, DHTNode)
+                    or not isinstance(node.node_id, bytes)
+                    or len(node.node_id) != 20
+                ):
+                    continue
+                endpoint = normalize_global_endpoint(node.ip, node.port)
+                if endpoint is None:
+                    continue
+                distance = (int.from_bytes(node.node_id, "big") ^ target_id).to_bytes(20, "big")
+                connection.execute(
+                    """
+                    INSERT INTO node_frontier (
+                        ip, port, node_id, distance, priority, state
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(ip, port) DO NOTHING
+                    """,
+                    (
+                        endpoint[0],
+                        endpoint[1],
+                        node.node_id,
+                        distance,
+                        1,
+                        self._PENDING,
+                    ),
+                )
+
+    def claim(self, size: int) -> tuple[Endpoint, ...]:
+        """Reserviert einen kleinen priorisierten Batch atomar zur Abfrage."""
+
+        if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+            raise ValueError("size muss eine positive Ganzzahl sein.")
+        connection = self._require_connection()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT id, ip, port
+                FROM node_frontier
+                WHERE state = ?
+                ORDER BY priority, distance, id
+                LIMIT ?
+                """,
+                (self._PENDING, size),
+            ).fetchall()
+            connection.executemany(
+                "UPDATE node_frontier SET state = ? WHERE id = ? AND state = ?",
+                ((self._IN_PROGRESS, int(row[0]), self._PENDING) for row in rows),
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        return tuple((str(row[1]), int(row[2])) for row in rows)
+
+    def mark_queried(self, endpoint: Endpoint) -> None:
+        """Markiert eine beendete Abfrage endgültig als bearbeitet."""
+
+        normalized = normalize_global_endpoint(*endpoint)
+        if normalized is None:
+            raise ValueError("DHT-Endpunkt muss global erreichbar sein.")
+        connection = self._require_connection()
+        with connection:
+            cursor = connection.execute(
+                """
+                UPDATE node_frontier
+                SET state = ?
+                WHERE ip = ? AND port = ? AND state = ?
+                """,
+                (self._QUERIED, normalized[0], normalized[1], self._IN_PROGRESS),
+            )
+        if cursor.rowcount != 1:
+            raise RuntimeError("DHT-Endpunkt war nicht als aktive Abfrage reserviert.")
+
+    def requeue_in_progress(self) -> int:
+        """Stellt am Zeitschnitt unterbrochene Abfragen verlustfrei zurück."""
+
+        connection = self._require_connection()
+        with connection:
+            cursor = connection.execute(
+                "UPDATE node_frontier SET state = ? WHERE state = ?",
+                (self._PENDING, self._IN_PROGRESS),
+            )
+        return cursor.rowcount
+
+    def has_unfinished(self) -> bool:
+        """Meldet noch nicht endgültig bearbeitete Knoten ohne sie zu laden."""
+
+        connection = self._require_connection()
+        row = connection.execute(
+            "SELECT EXISTS(SELECT 1 FROM node_frontier WHERE state != ? LIMIT 1)",
+            (self._QUERIED,),
+        ).fetchone()
+        return bool(row and row[0])
+
+    def close(self) -> None:
+        """Schließt SQLite vor dem Windows-kompatiblen Temp-Verzeichnis-Cleanup."""
+
+        if self._closed:
+            return
+        self._closed = True
+        connection = self._connection
+        self._connection = None
+        try:
+            if connection is not None:
+                connection.close()
+        finally:
+            self._temporary_directory.cleanup()
+
+
 class DHTCrawler:
     """Iterative Suche bis zur Konvergenz des DHT-Nahbereichs."""
 
@@ -428,6 +669,7 @@ class DHTCrawler:
         *,
         node_id: bytes | None = None,
         config: DHTConfig | None = None,
+        frontier_directory: Path | None = None,
         query_hook: QueryHook | None = None,
         transaction_id_factory: Callable[[], bytes] | None = None,
         clock: Callable[[], str] = utc_now_text,
@@ -436,6 +678,11 @@ class DHTCrawler:
         self.node_id = node_id if node_id is not None else secrets.token_bytes(20)
         if not isinstance(self.node_id, bytes) or len(self.node_id) != 20:
             raise ValueError("DHT-Knoten-ID muss genau 20 Byte lang sein.")
+        if frontier_directory is not None and not isinstance(frontier_directory, Path):
+            raise TypeError("frontier_directory muss ein pathlib.Path sein.")
+        if frontier_directory is not None and not frontier_directory.is_dir():
+            raise ValueError("frontier_directory muss ein vorhandenes Verzeichnis sein.")
+        self.frontier_directory = frontier_directory
         self.bootstrap_nodes = tuple(self._validated_bootstrap(bootstrap_nodes))
         self.query_hook = query_hook
         self.transaction_id_factory = transaction_id_factory or (lambda: secrets.token_bytes(4))
@@ -445,11 +692,52 @@ class DHTCrawler:
         self.queries_started = 0
         self.queries_completed = 0
         self.queries_failed = 0
+        self._frontier: _DHTNodeFrontier | None = None
+        self._frontier_info_hash: bytes | None = None
 
     @property
     def issue_count(self) -> int:
         """Liefert die ungekürzte Zahl technischer DHT-Teilfehler."""
         return sum(self.issue_counts.values())
+
+    @property
+    def has_pending_work(self) -> bool:
+        """Meldet eine über den aktuellen Zeitschnitt hinaus offene Knotenfront."""
+
+        frontier = self._frontier
+        return frontier is not None and frontier.has_unfinished()
+
+    def _frontier_for(self, target: Target) -> _DHTNodeFrontier:
+        frontier = self._frontier
+        if frontier is not None:
+            if self._frontier_info_hash != target.info_hash:
+                raise ValueError(
+                    "Ein DHTCrawler kann eine offene Knotenfront nur für denselben "
+                    "Infohash fortsetzen."
+                )
+            return frontier
+
+        frontier = _DHTNodeFrontier(self.frontier_directory)
+        try:
+            frontier.add_bootstrap_nodes(self.bootstrap_nodes)
+        except BaseException:
+            frontier.close()
+            raise
+        self._frontier = frontier
+        self._frontier_info_hash = target.info_hash
+        return frontier
+
+    def _close_frontier(self) -> None:
+        frontier = self._frontier
+        self._frontier = None
+        self._frontier_info_hash = None
+        if frontier is not None:
+            frontier.close()
+
+    def close(self) -> None:
+        """Verwirft eine offene Suchfront und entfernt ihre temporären Dateien."""
+
+        self._close_frontier()
 
     def _record_issue(self, errors: list[str], category: str) -> None:
         if category not in _DHT_ISSUE_MESSAGES:
@@ -551,13 +839,18 @@ class DHTCrawler:
         candidate_callback: CandidateBatchHook | None = None,
         collect: bool = True,
     ) -> list[PeerCandidate]:
-        """Durchsucht den XOR-Nahbereich und liefert neue Peers in Fünferbatches.
+        """Durchsucht die vollständige entdeckte DHT-Front und streamt Peers.
 
-        Die feste Shortlist ist die Arbeitsbreite der konvergierenden Kademlia-
-        Suche und kein Peer-, Knoten- oder Anfragelimit. Im kompatiblen
-        Sammelmodus wird jeder eindeutige Peer aufgenommen. ``collect=False``
-        streamt dagegen jede gültige Peer-Nennung direkt weiter, damit weder
-        Kandidatenliste noch laufweites Deduplizierungsset im Speicher wachsen.
+        Eine private temporäre SQLite-Warteschlange dedupliziert und priorisiert
+        die unbegrenzte Knotenfront auf der Platte. Im Python-Speicher bleiben
+        nur ein kleiner Claim und höchstens ``concurrency`` aktive Anfragen.
+        ``overall_timeout_seconds`` begrenzt dabei nur einen Zeitschnitt. Eine
+        noch offene Front bleibt für den nächsten Aufruf dieses Crawlers
+        erhalten und wird nicht erneut am Bootstrap begonnen.
+        Im kompatiblen Sammelmodus wird jeder eindeutige Peer aufgenommen;
+        ``collect=False`` streamt gültige Peer-Nennungen direkt weiter, damit
+        weder Kandidatenliste noch laufweites Peer-Deduplizierungsset im Speicher
+        wachsen.
         """
         if not isinstance(target, Target):
             raise TypeError("target muss ein Target sein.")
@@ -578,29 +871,20 @@ class DHTCrawler:
         candidates: list[PeerCandidate] = []
         callback_batch: list[PeerCandidate] = []
         candidate_endpoints: set[Endpoint] | None = set() if collect else None
-        seen_node_endpoints: set[Endpoint] = set(self.bootstrap_nodes)
-        queried_nodes: set[Endpoint] = set()
-        shortlist: dict[Endpoint, int] = {}
-        queue: list[tuple[int, int, Endpoint]] = []
-        serial = 0
-        for endpoint in self.bootstrap_nodes:
-            heapq.heappush(queue, (-1, serial, endpoint))
-            serial += 1
 
         active: dict[asyncio.Task[DHTResponse], tuple[Endpoint, bytes]] = {}
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.config.overall_timeout_seconds
         target_id = int.from_bytes(target.info_hash, "big")
+        frontier = self._frontier_for(target)
 
+        failure: BaseException | None = None
+        deadline_reached = False
         try:
-            while queue or active:
-                while queue and len(active) < self.config.concurrency:
-                    distance, _serial, endpoint = heapq.heappop(queue)
-                    if endpoint in queried_nodes:
-                        continue
-                    if distance >= 0 and shortlist.get(endpoint) != distance:
-                        continue
-                    queried_nodes.add(endpoint)
+            while True:
+                available_slots = self.config.concurrency - len(active)
+                claimed = frontier.claim(available_slots) if available_slots else ()
+                for endpoint in claimed:
                     transaction_id = self._new_transaction_id()
                     task = asyncio.create_task(
                         self._query_node(endpoint, target.info_hash, transaction_id)
@@ -612,6 +896,7 @@ class DHTCrawler:
                     break
                 remaining = deadline - loop.time()
                 if remaining <= 0:
+                    deadline_reached = True
                     self._record_issue(errors, DHT_ISSUE_DEADLINE)
                     break
                 done, _pending = await asyncio.wait(
@@ -620,6 +905,7 @@ class DHTCrawler:
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if not done:
+                    deadline_reached = True
                     self._record_issue(errors, DHT_ISSUE_DEADLINE)
                     break
 
@@ -652,14 +938,17 @@ class DHTCrawler:
                     except DHTQueryError as exc:
                         self.queries_failed += 1
                         self._record_issue(errors, exc.category)
+                        frontier.mark_queried(endpoint)
                         continue
                     except DHTProtocolError:
                         self.queries_failed += 1
                         self._record_issue(errors, DHT_ISSUE_PROTOCOL)
+                        frontier.mark_queried(endpoint)
                         continue
                     except OSError:
                         self.queries_failed += 1
                         self._record_issue(errors, DHT_ISSUE_NETWORK)
+                        frontier.mark_queried(endpoint)
                         continue
                     self.queries_completed += 1
 
@@ -693,42 +982,58 @@ class DHTCrawler:
                                 await candidate_callback(tuple(callback_batch))
                                 callback_batch.clear()
 
-                    for node in response.nodes:
-                        if (
-                            not isinstance(node, DHTNode)
-                            or not isinstance(node.node_id, bytes)
-                            or len(node.node_id) != 20
-                        ):
-                            continue
-                        node_endpoint = normalize_global_endpoint(node.ip, node.port)
-                        if node_endpoint is None or node_endpoint in seen_node_endpoints:
-                            continue
-                        seen_node_endpoints.add(node_endpoint)
-                        distance = int.from_bytes(node.node_id, "big") ^ target_id
-                        if len(shortlist) >= DHT_SHORTLIST_SIZE:
-                            farthest_endpoint, farthest_distance = max(
-                                shortlist.items(),
-                                key=lambda item: (item[1], item[0]),
-                            )
-                            if (distance, node_endpoint) >= (
-                                farthest_distance,
-                                farthest_endpoint,
-                            ):
-                                continue
-                            del shortlist[farthest_endpoint]
-                        shortlist[node_endpoint] = distance
-                        heapq.heappush(queue, (distance, serial, node_endpoint))
-                        serial += 1
-
-            if candidate_callback is not None and callback_batch:
-                await candidate_callback(tuple(callback_batch))
-                callback_batch.clear()
+                    frontier.add_discovered_nodes(response.nodes, target_id)
+                    frontier.mark_queried(endpoint)
+        except BaseException as exc:
+            failure = exc
         finally:
             for task in active:
                 task.cancel()
             if active:
                 await asyncio.gather(*active, return_exceptions=True)
+
+            if deadline_reached and failure is None:
+                try:
+                    frontier.requeue_in_progress()
+                except BaseException as requeue_error:
+                    failure = requeue_error
+
+            if candidate_callback is not None and callback_batch:
+                pending_batch = tuple(callback_batch)
+                try:
+                    await candidate_callback(pending_batch)
+                except BaseException as flush_error:
+                    if failure is None or isinstance(flush_error, asyncio.CancelledError):
+                        failure = flush_error
+                    else:
+                        failure.add_note(
+                            "Der letzte DHT-Kandidatenbatch konnte nicht persistiert werden: "
+                            f"{type(flush_error).__name__}."
+                        )
+                else:
+                    callback_batch.clear()
+
+            frontier_exhausted = False
+            if failure is None:
+                try:
+                    frontier_exhausted = not frontier.has_unfinished()
+                except BaseException as state_error:
+                    failure = state_error
+            if failure is not None or frontier_exhausted:
+                try:
+                    self._close_frontier()
+                except BaseException as close_error:
+                    if failure is None:
+                        failure = close_error
+                    else:
+                        failure.add_note(
+                            "Die temporäre DHT-Knotenwarteschlange konnte nicht "
+                            f"bereinigt werden ({type(close_error).__name__})."
+                        )
             self.errors = tuple(errors)
+
+        if failure is not None:
+            raise failure
 
         return candidates
 
@@ -751,8 +1056,21 @@ async def discover_peers(
     if not resolved:
         raise DHTQueryError("Kein global erreichbarer Bootstrap-Endpunkt auflösbar.")
     crawler = DHTCrawler(resolved, node_id=node_id, config=active_config)
-    return await crawler.discover(
-        target,
-        candidate_callback=candidate_callback,
-        collect=collect,
-    )
+    candidates: list[PeerCandidate] = []
+    seen_candidates: set[Endpoint] = set()
+    try:
+        while True:
+            slice_candidates = await crawler.discover(
+                target,
+                candidate_callback=candidate_callback,
+                collect=collect,
+            )
+            for candidate in slice_candidates:
+                endpoint = (candidate.ip, candidate.port)
+                if endpoint not in seen_candidates:
+                    seen_candidates.add(endpoint)
+                    candidates.append(candidate)
+            if not crawler.has_pending_work:
+                return candidates
+    finally:
+        crawler.close()

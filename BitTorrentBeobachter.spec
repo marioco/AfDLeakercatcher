@@ -5,6 +5,7 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(SPECPATH)
+THIRD_PARTY_LICENSES_DIR = PROJECT_ROOT / "THIRD_PARTY_LICENSES"
 
 analysis = Analysis(
     [str(PROJECT_ROOT / "164_bittorrent_beobachter.py")],
@@ -14,6 +15,8 @@ analysis = Analysis(
         (str(PROJECT_ROOT / "README.md"), "."),
         (str(PROJECT_ROOT / "LICENSE"), "."),
         (str(PROJECT_ROOT / "THIRD_PARTY_NOTICES.md"), "."),
+        (str(PROJECT_ROOT / "requirements-build.lock"), "."),
+        (str(THIRD_PARTY_LICENSES_DIR), "THIRD_PARTY_LICENSES"),
     ],
     hiddenimports=[],
     hookspath=[],

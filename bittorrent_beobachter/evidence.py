@@ -34,6 +34,7 @@ GENESIS_SHA256 = "0" * 64
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 MAX_JOURNAL_LINE_BYTES = 4_000_000
 MAX_TRANSACTION_HEADER_BYTES = 4_096
+MAX_VERIFIED_BATCH_ENTRIES = 5
 
 INTEGRITY_LIMITATION = (
     "Die SHA-256-Kette macht Aenderungen am vorhandenen Journal sichtbar, "
@@ -348,6 +349,21 @@ def _read_entries(
 ) -> tuple[int, JournalEntry | None]:
     """Pruefe das Journal speicherschonend und liefere Zaehler sowie Kettenkopf."""
 
+    entries_count = 0
+    last_entry = None
+    for entry in _iter_entries(file_handle, end_offset=end_offset):
+        entries_count += 1
+        last_entry = entry
+    return entries_count, last_entry
+
+
+def _iter_entries(
+    file_handle: BinaryIO,
+    *,
+    end_offset: int | None = None,
+) -> Iterator[JournalEntry]:
+    """Validiere und durchlaufe Journalzeilen ohne anwachsende Ergebnisliste."""
+
     if end_offset is not None and (
         isinstance(end_offset, bool) or not isinstance(end_offset, int) or end_offset < 0
     ):
@@ -355,7 +371,6 @@ def _read_entries(
 
     file_handle.seek(0)
     entries_count = 0
-    last_entry = None
     previous_hash = GENESIS_SHA256
     while True:
         if end_offset is not None:
@@ -381,14 +396,14 @@ def _read_entries(
         if not line:
             raise EvidenceJournalError(f"Zeile {line_number} ist leer")
         parsed = _parse_canonical_line(line, line_number)
-        last_entry = _entry_from_mapping(
+        entry = _entry_from_mapping(
             parsed,
             expected_sequence=line_number,
             expected_previous_hash=previous_hash,
         )
         entries_count += 1
-        previous_hash = last_entry.event_sha256
-    return entries_count, last_entry
+        previous_hash = entry.event_sha256
+        yield entry
 
 
 def _pending_transaction_path(journal_path: Path) -> Path:
@@ -712,6 +727,69 @@ class EvidenceJournal:
         last_hash = last_entry.event_sha256 if last_entry is not None else GENESIS_SHA256
         self._remember_head(file_handle, entries_count, last_hash)
         return entries_count, last_hash
+
+    def iter_verified_batches(
+        self,
+        *,
+        batch_size: int = MAX_VERIFIED_BATCH_ENTRIES,
+    ) -> Iterator[tuple[JournalEntry, ...]]:
+        """Liefere ein vollstaendig validiertes Journal in kleinen Batches.
+
+        Vor der ersten Ausgabe wird ein eventuell vorbereiteter Crash-Append unter
+        exklusiver Prozesssperre wiederhergestellt und der gesamte bis dahin
+        vorhandene Journalabschnitt validiert. Danach liest der Iterator genau
+        diesen bereits geoeffneten, unveraenderlichen Praefix erneut; spaetere
+        kooperative Appends sind nicht Teil dieses Snapshots. Im Speicher liegt
+        dabei nie mehr als ein Batch mit hoechstens fuenf Eintraegen.
+        """
+
+        if (
+            isinstance(batch_size, bool)
+            or not isinstance(batch_size, int)
+            or not 1 <= batch_size <= MAX_VERIFIED_BATCH_ENTRIES
+        ):
+            raise ValueError(f"batch_size muss zwischen 1 und {MAX_VERIFIED_BATCH_ENTRIES} liegen")
+
+        pending_path = _pending_transaction_path(self.path)
+        file_handle: BinaryIO | None = None
+        try:
+            # Die exklusive Sperre ist fuer eine moegliche Recovery erforderlich.
+            # Der danach offen gehaltene Deskriptor bildet zusammen mit end_offset
+            # einen append-stabilen Snapshot, ohne Schreiber waehrend der Ausgabe
+            # aller Batches zu blockieren.
+            with _journal_process_lock(self.path, exclusive=True):
+                if not self.path.exists() and not pending_path.exists():
+                    self._head = None
+                    return
+                file_handle = _open_private_append(self.path)
+                recovered = _recover_pending_transaction(self.path, file_handle)
+                if recovered is None:
+                    entries_count, last_entry = _read_entries(file_handle)
+                else:
+                    entries_count, last_entry = recovered
+                last_hash = last_entry.event_sha256 if last_entry is not None else GENESIS_SHA256
+                snapshot_end_offset = os.fstat(file_handle.fileno()).st_size
+                self._remember_head(file_handle, entries_count, last_hash)
+
+            batch: list[JournalEntry] = []
+            for entry in _iter_entries(file_handle, end_offset=snapshot_end_offset):
+                batch.append(entry)
+                if len(batch) == batch_size:
+                    yield tuple(batch)
+                    batch.clear()
+            if batch:
+                yield tuple(batch)
+        except EvidenceJournalError:
+            self._head = None
+            raise
+        except OSError as exc:
+            self._head = None
+            raise EvidenceJournalError(
+                f"Beweisjournal konnte nicht gelesen werden: {self.path}"
+            ) from exc
+        finally:
+            if file_handle is not None:
+                file_handle.close()
 
     def append(
         self,

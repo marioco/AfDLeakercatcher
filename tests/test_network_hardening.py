@@ -268,6 +268,9 @@ def test_dht_deadline_cancels_active_query() -> None:
         assert cancelled.is_set()
         assert crawler.queries_failed == 0
         assert crawler.issue_counts == {DHT_ISSUE_DEADLINE: 1}
+        assert crawler.has_pending_work
+        crawler.close()
+        assert not crawler.has_pending_work
 
     asyncio.run(scenario())
 
@@ -348,13 +351,19 @@ def test_discovery_streams_more_than_six_hundred_for_both_hashes_without_caps(
                 *,
                 node_id: bytes,
                 config: DHTConfig,
+                frontier_directory: Path,
             ) -> None:
                 del config
+                assert frontier_directory == tmp_path
                 node_ids.append(node_id)
                 self.queries_started = 3
                 self.queries_completed = 2
                 self.queries_failed = 1
                 self.issue_count = 1
+                self.has_pending_work = False
+
+            def close(self) -> None:
+                return None
 
             async def discover(
                 self,
@@ -422,6 +431,103 @@ def test_discovery_streams_more_than_six_hundred_for_both_hashes_without_caps(
         assert "DNS-Fehler" in joined
         assert "secret-bootstrap" not in joined
         assert "9.9.9.9" not in joined
+
+    asyncio.run(scenario())
+
+
+def test_target_failure_waits_for_sibling_and_verifier_drains_persisted_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from bittorrent_beobachter.run_store import RunStore
+
+    async def scenario() -> None:
+        failing_target = Target("Fehlerziel", b"a" * 20)
+        successful_target = Target("Erfolgsziel", b"b" * 20)
+        config = AppConfig(
+            targets=(failing_target, successful_target),
+            dht=DhtSettings(bootstrap_nodes=(("bootstrap.invalid", 6881),)),
+            peer=PeerSettings(retry_attempts=1, retry_backoff_seconds=0.0),
+        )
+        store = RunStore(tmp_path / "target-failure.sqlite3")
+        runtimes = {
+            target.info_hash_hex: monitor_module._TargetRuntimeMetrics(target=target)
+            for target in config.targets
+        }
+        sibling_started = asyncio.Event()
+        sibling_may_finish = asyncio.Event()
+        sibling_finished = asyncio.Event()
+
+        async def fake_resolve(*_args: object, **_kwargs: object) -> list[tuple[str, int]]:
+            return [("9.9.9.9", 6881)]
+
+        async def fake_target_discovery(
+            _config: AppConfig,
+            target: Target,
+            _bootstrap_nodes: object,
+            _dht_node_id: bytes,
+            current_store: RunStore,
+            _runtime: object,
+            _data_dir: Path,
+            _notices: list[str],
+            _progress: object,
+        ) -> None:
+            if target == failing_target:
+                await sibling_started.wait()
+                sibling_may_finish.set()
+                raise monitor_module.MonitorError("sensitive endpoint 203.0.113.30:6881")
+
+            sibling_started.set()
+            await sibling_may_finish.wait()
+            await asyncio.sleep(0)
+            current_store.add_candidates(
+                _candidate(
+                    successful_target,
+                    ip=f"8.8.9.{index + 1}",
+                    port=7100 + index,
+                )
+                for index in range(7)
+            )
+            sibling_finished.set()
+
+        class InstantVerifier:
+            def __init__(self, **_kwargs: object) -> None:
+                pass
+
+            async def verify(
+                self,
+                candidate: PeerCandidate,
+                _info_hash: bytes,
+            ) -> HandshakeResult:
+                return _confirmed(candidate)
+
+        monkeypatch.setattr(monitor_module, "_resolve_bootstrap", fake_resolve)
+        monkeypatch.setattr(
+            monitor_module,
+            "_discover_target_until_quiet",
+            fake_target_discovery,
+        )
+        monkeypatch.setattr(monitor_module, "PeerVerifier", InstantVerifier)
+
+        with pytest.raises(monitor_module.MonitorError) as caught:
+            await monitor_module._network_phase(
+                config,
+                store,
+                tmp_path,
+                runtimes,
+                lambda _message: None,
+            )
+
+        assert sibling_finished.is_set()
+        assert "Fehlerziel (MonitorError)" in str(caught.value)
+        assert "203.0.113" not in str(caught.value)
+        metrics = store.metrics_by_hash(
+            (failing_target.info_hash_hex, successful_target.info_hash_hex)
+        )
+        assert metrics[successful_target.info_hash_hex].done == 7
+        assert metrics[successful_target.info_hash_hex].offering_observed == 7
+        assert sum(metric.pending for metric in metrics.values()) == 0
+        assert sum(metric.in_progress for metric in metrics.values()) == 0
 
     asyncio.run(scenario())
 
@@ -511,6 +617,183 @@ def test_all_six_hundred_eleven_candidates_are_checked_in_persisted_five_batches
         assert all(size == 5 for size in persisted[:-1])
         assert persisted[-1] == 1
         assert peak == monitor_module.PARALLEL_VERIFY_BATCHES * 5
+
+    asyncio.run(scenario())
+
+
+def test_verifier_refills_free_batch_slot_before_slow_sibling_finishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from bittorrent_beobachter.run_store import RunStore
+
+    async def scenario() -> None:
+        target = Target("Ziel", INFO_HASH)
+        config = AppConfig(
+            targets=(target,),
+            peer=PeerSettings(retry_attempts=1, retry_backoff_seconds=0.0),
+        )
+        store = RunStore(tmp_path / "rolling-verifier.sqlite3")
+        store.add_candidates(
+            _candidate(
+                target,
+                ip=f"8.8.20.{index + 1}",
+                port=7300 + index,
+            )
+            for index in range(50)
+        )
+        blocker = asyncio.Event()
+        replacement_started = asyncio.Event()
+        started_batches: list[int] = []
+
+        async def fake_verify_batch(
+            batch: list[PeerCandidate],
+            *_args: object,
+            **_kwargs: object,
+        ) -> tuple[HandshakeResult, ...]:
+            started_batches.append(batch[0].port)
+            if len(started_batches) >= monitor_module.PARALLEL_VERIFY_BATCHES + 1:
+                replacement_started.set()
+            if any(candidate.port == 7300 for candidate in batch):
+                await blocker.wait()
+            return tuple(_confirmed(candidate) for candidate in batch)
+
+        monkeypatch.setattr(monitor_module, "_verify_candidate_batch", fake_verify_batch)
+        verification = asyncio.create_task(
+            monitor_module._verify_all_candidates(
+                config,
+                store,
+                tmp_path,
+                {target.info_hash_hex: monitor_module._TargetRuntimeMetrics(target=target)},
+                lambda _message: None,
+            )
+        )
+        refilled_before_release = False
+        try:
+            try:
+                await asyncio.wait_for(replacement_started.wait(), timeout=1.0)
+            except TimeoutError:
+                pass
+            else:
+                refilled_before_release = True
+        finally:
+            blocker.set()
+        await verification
+
+        assert refilled_before_release
+        assert len(started_batches) == 10
+        assert len(set(started_batches)) == 10
+        metric = store.metrics_by_hash((target.info_hash_hex,))[target.info_hash_hex]
+        assert metric.done == 50
+        assert metric.pending == 0
+        assert metric.in_progress == 0
+
+    asyncio.run(scenario())
+
+
+def test_cancel_persists_every_already_completed_verification_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from bittorrent_beobachter.run_store import RunStore
+
+    async def scenario() -> None:
+        target = Target("Ziel", INFO_HASH)
+        config = AppConfig(
+            targets=(target,),
+            peer=PeerSettings(retry_attempts=1, retry_backoff_seconds=0.0),
+        )
+        store = RunStore(tmp_path / "cancel-drain.sqlite3")
+        store.add_candidates(
+            _candidate(target, ip=f"8.8.8.{index + 1}", port=7000 + index) for index in range(10)
+        )
+        runtime = monitor_module._TargetRuntimeMetrics(target=target)
+
+        class InstantVerifier:
+            def __init__(self, **_kwargs: object) -> None:
+                pass
+
+            async def verify(
+                self,
+                candidate: PeerCandidate,
+                _info_hash: bytes,
+            ) -> HandshakeResult:
+                return _confirmed(candidate)
+
+        async def cancel_after_first_persist() -> None:
+            current = asyncio.current_task()
+            assert current is not None
+            current.cancel()
+            await asyncio.sleep(0)
+
+        monkeypatch.setattr(monitor_module, "PeerVerifier", InstantVerifier)
+        with pytest.raises(asyncio.CancelledError):
+            await monitor_module._verify_all_candidates(
+                config,
+                store,
+                tmp_path,
+                {target.info_hash_hex: runtime},
+                lambda _message: None,
+                evidence_ready=cancel_after_first_persist,
+            )
+
+        metric = store.metrics_by_hash((target.info_hash_hex,))[target.info_hash_hex]
+        assert metric.done == 10
+        assert metric.in_progress == 0
+        assert metric.pending == 0
+        assert metric.offering_observed == 10
+
+    asyncio.run(scenario())
+
+
+def test_verifier_error_persists_successful_sibling_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from bittorrent_beobachter.run_store import RunStore
+
+    async def scenario() -> None:
+        target = Target("Ziel", INFO_HASH)
+        config = AppConfig(
+            targets=(target,),
+            peer=PeerSettings(retry_attempts=1, retry_backoff_seconds=0.0),
+        )
+        store = RunStore(tmp_path / "verifier-error-drain.sqlite3")
+        store.add_candidates(
+            _candidate(target, ip=f"8.8.10.{index + 1}", port=7200 + index) for index in range(10)
+        )
+        successful_batch_finished = asyncio.Event()
+
+        async def fake_verify_batch(
+            batch: list[PeerCandidate],
+            *_args: object,
+            **_kwargs: object,
+        ) -> tuple[HandshakeResult, ...]:
+            if batch[0].port == 7200:
+                await successful_batch_finished.wait()
+                raise RuntimeError("programming bug")
+            results = tuple(_confirmed(candidate) for candidate in batch)
+            successful_batch_finished.set()
+            return results
+
+        monkeypatch.setattr(monitor_module, "_verify_candidate_batch", fake_verify_batch)
+        with pytest.raises(RuntimeError, match="programming bug"):
+            await monitor_module._verify_all_candidates(
+                config,
+                store,
+                tmp_path,
+                {target.info_hash_hex: monitor_module._TargetRuntimeMetrics(target=target)},
+                lambda _message: None,
+            )
+
+        metric = store.metrics_by_hash((target.info_hash_hex,))[target.info_hash_hex]
+        assert metric.done == 5
+        assert metric.pending == 5
+        assert metric.in_progress == 0
+        assert metric.offering_observed == 5
+        assert {result.candidate.port for result in store.iter_handshake_results()} == set(
+            range(7205, 7210)
+        )
 
     asyncio.run(scenario())
 
@@ -703,6 +986,86 @@ def test_monitor_exposes_no_global_count_or_time_caps() -> None:
     assert not hasattr(DhtSettings(), "max_candidates")
 
 
+def test_pending_dht_frontier_prevents_quiet_exit_and_reuses_crawler(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from bittorrent_beobachter.run_store import RunStore
+
+    async def scenario() -> None:
+        target = Target("Ziel", INFO_HASH)
+        config = AppConfig(
+            targets=(target,),
+            dht=DhtSettings(
+                timeout_seconds=0.25,
+                overall_timeout_seconds=1.0,
+                concurrency=1,
+                quiet_seconds=1.0,
+                refresh_interval_seconds=0.1,
+                bootstrap_nodes=(("bootstrap.invalid", 6881),),
+            ),
+        )
+        store = RunStore(tmp_path / "pending-frontier.sqlite3")
+        runtime = monitor_module._TargetRuntimeMetrics(target=target)
+        clock = [0.0]
+        calls = [0]
+        instances = [0]
+        closes = [0]
+        real_sleep = asyncio.sleep
+
+        async def fake_sleep(delay: float) -> None:
+            clock[0] += delay
+            await real_sleep(0)
+
+        class FakeCrawler:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                instances[0] += 1
+                self.queries_started = 1
+                self.queries_completed = 1
+                self.queries_failed = 0
+                self.issue_count = 0
+                self.has_pending_work = True
+
+            def close(self) -> None:
+                closes[0] += 1
+
+            async def discover(
+                self,
+                _current_target: Target,
+                *,
+                candidate_callback: object,
+                collect: bool,
+            ) -> list[PeerCandidate]:
+                assert collect is False
+                assert callable(candidate_callback)
+                calls[0] += 1
+                clock[0] += 1.1
+                self.has_pending_work = calls[0] < 3
+                return []
+
+        monkeypatch.setattr(monitor_module, "DHTCrawler", FakeCrawler)
+        monkeypatch.setattr(monitor_module.time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(monitor_module.asyncio, "sleep", fake_sleep)
+
+        await monitor_module._discover_target_until_quiet(
+            config,
+            target,
+            (("9.9.9.9", 6881),),
+            b"n" * 20,
+            store,
+            runtime,
+            tmp_path,
+            [],
+            lambda _message: None,
+        )
+
+        assert calls[0] == 4
+        assert instances[0] == 1
+        assert closes[0] == 1
+
+    asyncio.run(scenario())
+
+
 def test_long_first_round_with_finding_requires_a_zero_followup_round(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -738,6 +1101,10 @@ def test_long_first_round_with_finding_requires_a_zero_followup_round(
                 self.queries_completed = 1
                 self.queries_failed = 0
                 self.issue_count = 0
+                self.has_pending_work = False
+
+            def close(self) -> None:
+                return None
 
             async def discover(
                 self,

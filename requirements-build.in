@@ -1,0 +1,12 @@
+# Direkte Laufzeit-, Test- und Build-Abhängigkeiten für reproduzierbare CI-/Windows-Builds.
+reportlab==4.5.1
+pyinstaller==6.22.3
+pytest==9.1.1
+ruff==0.17.1
+setuptools==84.2.0
+
+# pip-compile läuft auf Linux; diese Windows-Marker müssen deshalb ausdrücklich
+# als Eingaben erhalten bleiben.
+colorama==0.4.6 ; sys_platform == "win32"
+pefile==2024.8.26 ; sys_platform == "win32"
+pywin32-ctypes==0.2.3 ; sys_platform == "win32"

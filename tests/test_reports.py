@@ -928,6 +928,68 @@ class ReportGenerationTests(unittest.TestCase):
             "kein UNCHOKE empfangen: 6",
         )
 
+    def test_incremental_snapshot_preserves_clean_ips_and_removes_stale_complaint(
+        self,
+    ) -> None:
+        changed_ip = "198.51.100.70"
+        stable_ip = "198.51.100.71"
+        changed = _evidence_record(changed_ip, 6170, 20)
+        stable = _evidence_record(stable_ip, 6171, 21)
+        result = ScanResult(
+            run_id="incremental",
+            started_at_utc="2026-10-20T10:00:00Z",
+            completed_at_utc="2026-10-20T11:00:00Z",
+            records=[changed, stable],
+        )
+
+        with tempfile.TemporaryDirectory() as temp_name:
+            output = Path(temp_name)
+            generate_reports(
+                result,
+                output,
+                ReportConfig(),
+                generated_at_utc="2026-10-20T11:05:00Z",
+            )
+            stable_pdf = output / "incremental_anlage_ipv4_198_51_100_71.pdf"
+            stable_eml = output / "incremental_strafanzeige_ipv4_198_51_100_71.eml"
+            stable_pdf_bytes = stable_pdf.read_bytes()
+            stable_eml_bytes = stable_eml.read_bytes()
+
+            result.records[0] = replace(
+                changed,
+                vpn=VpnClassification(
+                    status="known_vpn",
+                    provider="Test VPN",
+                    reason="Testklassifikation",
+                    source="configured_exact_marker:holder",
+                ),
+            )
+            replaced_targets: list[str] = []
+            real_replace = os.replace
+
+            def recording_replace(source: object, target: object) -> None:
+                replaced_targets.append(Path(target).name)
+                real_replace(source, target)
+
+            with mock.patch.object(reports_module.os, "replace", side_effect=recording_replace):
+                generate_reports(
+                    result,
+                    output,
+                    ReportConfig(),
+                    generated_at_utc="2026-10-20T11:06:00Z",
+                    changed_ips={changed_ip},
+                )
+
+            self.assertFalse((output / "incremental_anlage_ipv4_198_51_100_70.pdf").exists())
+            self.assertFalse((output / "incremental_strafanzeige_ipv4_198_51_100_70.eml").exists())
+            self.assertEqual(stable_pdf.read_bytes(), stable_pdf_bytes)
+            self.assertEqual(stable_eml.read_bytes(), stable_eml_bytes)
+            self.assertTrue(replaced_targets[-1].endswith("_SHA256SUMS.txt"))
+            manifest = (output / "incremental_SHA256SUMS.txt").read_text(encoding="ascii")
+            self.assertIn(stable_pdf.name, manifest)
+            self.assertIn(stable_eml.name, manifest)
+            self.assertNotIn("anlage_ipv4_198_51_100_70", manifest)
+
     @unittest.skipIf(os.name == "nt", "POSIX-Dateimodi sind unter Windows anders")
     def test_staged_report_is_private_before_atomic_publish(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
@@ -936,6 +998,7 @@ class ReportGenerationTests(unittest.TestCase):
             source.parent.mkdir()
             source.write_bytes(b"report")
             source.chmod(0o644)
+            (source.parent / "run_SHA256SUMS.txt").write_text("manifest\n", encoding="ascii")
             output_dir = root / "output"
             output_dir.mkdir()
 
@@ -950,6 +1013,37 @@ class ReportGenerationTests(unittest.TestCase):
 
             self.assertTrue(source.exists())
             self.assertEqual(stat.S_IMODE(source.stat().st_mode), 0o600)
+
+    def test_failed_publish_never_leaves_a_stale_public_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            staging = root / "staging"
+            output = root / "output"
+            staging.mkdir()
+            output.mkdir()
+            (staging / "run_laufbericht.pdf").write_bytes(b"new")
+            (staging / "run_SHA256SUMS.txt").write_text("new manifest\n", encoding="ascii")
+            old_report = output / "run_laufbericht.pdf"
+            old_report.write_bytes(b"old")
+            old_manifest = output / "run_SHA256SUMS.txt"
+            old_manifest.write_text("old manifest\n", encoding="ascii")
+            real_replace = os.replace
+
+            def fail_payload_replace(source: object, target: object) -> None:
+                target_path = Path(target)
+                if target_path.name == "run_laufbericht.pdf":
+                    raise OSError("simulierter Abbruch nach Manifest-Invaliderung")
+                real_replace(source, target)
+
+            with (
+                mock.patch.object(reports_module.os, "replace", side_effect=fail_payload_replace),
+                self.assertRaises(OSError),
+            ):
+                _publish_staged_files(staging, output)
+
+            self.assertFalse(old_manifest.exists())
+            self.assertTrue((output / ".run_SHA256SUMS.txt.previous").is_file())
+            self.assertEqual(old_report.read_bytes(), b"old")
 
     def test_output_is_reproducible_with_fixed_input_and_timestamp(self) -> None:
         config = ReportConfig(

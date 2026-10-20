@@ -23,12 +23,29 @@ jobs:
       - name: Python einrichten
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
-          python-version: "3.12"
+          python-version: "3.12.10"
           cache: pip
-          cache-dependency-path: pyproject.toml
+          cache-dependency-path: requirements-build.lock
+
+      - name: Versionsangaben und Release-Tag pruefen
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          app_version="$(python -c 'from bittorrent_beobachter import VERSION; print(VERSION)')"
+          if [[ "$package_version" != "$app_version" ]]; then
+            echo "Paketversion $package_version und App-Version $app_version stimmen nicht ueberein." >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" == refs/tags/* && \
+                "$GITHUB_REF_NAME" != "v${package_version}" && \
+                "$GITHUB_REF_NAME" != "bittorrent-beobachter-v${package_version}" ]]; then
+            echo "Release-Tag $GITHUB_REF_NAME passt nicht zur Version $package_version." >&2
+            exit 1
+          fi
 
       - name: Abhängigkeiten installieren
-        run: python -m pip install ".[dev]"
+        run: python -m pip install --require-hashes -r requirements-build.lock
 
       - name: Tests ausführen
         run: python -m pytest
@@ -54,12 +71,12 @@ jobs:
       - name: Python einrichten
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
-          python-version: "3.12"
+          python-version: "3.12.10"
           cache: pip
-          cache-dependency-path: pyproject.toml
+          cache-dependency-path: requirements-build.lock
 
       - name: Abhängigkeiten installieren
-        run: python -m pip install ".[dev,build]"
+        run: python -m pip install --require-hashes -r requirements-build.lock
 
       - name: Tests ausführen
         run: python -m pytest
@@ -67,20 +84,43 @@ jobs:
       - name: Quellcode prüfen
         run: python -m ruff check .
 
-      - name: Tkinter-Laufzeit prüfen
+      - name: Gebündelte Laufzeitversionen prüfen
         shell: pwsh
         run: |
           $tkCheck = @'
+          import platform
+          import ssl
           import tkinter as tk
+
+          expected_python = "3.12.10"
+          expected_tcl_tk = "8.6.15"
+          expected_openssl = "OpenSSL 3.0.16 11 Feb 2025"
+          actual_python = platform.python_version()
+          actual_openssl = ssl.OPENSSL_VERSION
+          if actual_python != expected_python:
+              raise RuntimeError(
+                  f"Python {actual_python} statt {expected_python} gefunden."
+              )
+          if actual_openssl != expected_openssl:
+              raise RuntimeError(
+                  f"{actual_openssl} statt {expected_openssl} gefunden."
+              )
 
           root = tk.Tk()
           try:
               root.withdraw()
               root.update_idletasks()
-              patch_level = root.tk.call("info", "patchlevel")
-              if not tk.TkVersion or not patch_level:
-                  raise RuntimeError("Tcl/Tk meldet keine gültige Version.")
-              print(f"Tcl/Tk {patch_level} ist verfügbar.")
+              actual_tcl = str(root.tk.call("info", "patchlevel"))
+              actual_tk = str(root.tk.call("package", "provide", "Tk"))
+              if actual_tcl != expected_tcl_tk or actual_tk != expected_tcl_tk:
+                  raise RuntimeError(
+                      f"Tcl/Tk {actual_tcl}/{actual_tk} statt "
+                      f"{expected_tcl_tk}/{expected_tcl_tk} gefunden."
+                  )
+              print(
+                  f"Python {actual_python} mit Tcl/Tk "
+                  f"{actual_tcl}/{actual_tk} und {actual_openssl} ist verfügbar."
+              )
           finally:
               root.destroy()
           '@
@@ -111,6 +151,26 @@ jobs:
             )
           }
           Write-Host "EXE-Smoke-Test mit --version erfolgreich."
+
+      - name: Gebündelte GUI-Laufzeit prüfen
+        shell: pwsh
+        run: |
+          $executable = Resolve-Path -LiteralPath `
+            "dist/BitTorrent-Beobachter/BitTorrent-Beobachter.exe"
+          $process = Start-Process -FilePath $executable.Path `
+            -ArgumentList "--gui-smoke-test" -PassThru
+          if (-not $process.WaitForExit(30000)) {
+            $process.Kill()
+            $process.WaitForExit()
+            throw "Der GUI-Smoke-Test wurde nach 30 Sekunden abgebrochen."
+          }
+          if ($process.ExitCode -ne 0) {
+            throw (
+              "Der GUI-Smoke-Test ist mit Exitcode " +
+              "$($process.ExitCode) fehlgeschlagen."
+            )
+          }
+          Write-Host "Gebündelte Tkinter-GUI erfolgreich gestartet und beendet."
 
       - name: EXE optional mit Herausgeberzertifikat signieren
         if: >-
@@ -183,6 +243,69 @@ jobs:
             -Destination "dist/BitTorrent-Beobachter/LICENSE" -Force
           Copy-Item -LiteralPath "THIRD_PARTY_NOTICES.md" `
             -Destination "dist/BitTorrent-Beobachter/THIRD_PARTY_NOTICES.md" -Force
+          Copy-Item -LiteralPath "requirements-build.lock" `
+            -Destination "dist/BitTorrent-Beobachter/requirements-build.lock" -Force
+          $internalDirectory = "dist/BitTorrent-Beobachter/_internal"
+          $cryptoLibraries = @(
+            Get-ChildItem -LiteralPath $internalDirectory -File |
+              Where-Object { $_.Name -like "libcrypto-3*.dll" }
+          )
+          $sslLibraries = @(
+            Get-ChildItem -LiteralPath $internalDirectory -File |
+              Where-Object { $_.Name -like "libssl-3*.dll" }
+          )
+          if ($cryptoLibraries.Count -ne 1 -or $sslLibraries.Count -ne 1) {
+            throw "Das Paket enthält nicht genau eine OpenSSL-3-Crypto- und SSL-Bibliothek."
+          }
+          foreach ($library in @($cryptoLibraries + $sslLibraries)) {
+            if ($library.Length -le 0) {
+              throw "Das Paket enthält eine leere OpenSSL-Bibliothek: $($library.FullName)"
+            }
+          }
+          $licenseNames = @(
+            "Python-3.12.10.txt",
+            "Tcl-8.6.15.txt",
+            "Tk-8.6.15.txt",
+            "OpenSSL-3.0.16-LICENSE.txt",
+            "OpenSSL-3.0.16-ACKNOWLEDGEMENTS.md",
+            "ReportLab-4.5.1.txt",
+            "Pillow-13.0.0.txt",
+            "charset-normalizer-3.5.2.txt",
+            "PyInstaller-6.22.3.txt"
+          ) | Sort-Object
+          $licenseSource = "THIRD_PARTY_LICENSES"
+          $licenseDestination = `
+            "dist/BitTorrent-Beobachter/THIRD_PARTY_LICENSES"
+          $sourceLicenseNames = @(
+            Get-ChildItem -LiteralPath $licenseSource -File |
+              Select-Object -ExpandProperty Name |
+              Sort-Object
+          )
+          if (@(
+            Compare-Object -ReferenceObject $licenseNames `
+              -DifferenceObject $sourceLicenseNames
+          ).Count -ne 0) {
+            throw "Der Quellordner mit Drittanbieter-Lizenzen ist unvollständig."
+          }
+          foreach ($licenseName in $licenseNames) {
+            $licensePath = Join-Path $licenseSource $licenseName
+            if ((Get-Item -LiteralPath $licensePath).Length -le 0) {
+              throw "Der Drittanbieter-Lizenztext ist leer: $licensePath"
+            }
+          }
+          Copy-Item -LiteralPath $licenseSource `
+            -Destination $licenseDestination -Recurse -Force
+          $packagedLicenseNames = @(
+            Get-ChildItem -LiteralPath $licenseDestination -File |
+              Select-Object -ExpandProperty Name |
+              Sort-Object
+          )
+          if (@(
+            Compare-Object -ReferenceObject $licenseNames `
+              -DifferenceObject $packagedLicenseNames
+          ).Count -ne 0) {
+            throw "Der Paketordner mit Drittanbieter-Lizenzen ist unvollständig."
+          }
           $pdfSource = `
             "assets/Cybercrime-E-Mail-Kontakte_BKA-und-LKA_Deutschland_Stand-2026-10-20.pdf"
           $expectedPdfHash = `
@@ -209,11 +332,92 @@ jobs:
           $checksums | Set-Content -Encoding ascii `
             "dist/BitTorrent-Beobachter/SHA256SUMS.txt"
 
+      - name: Finales einmal entpackbares Release-ZIP erstellen
+        shell: pwsh
+        run: |
+          $packageDirectory = (
+            Resolve-Path -LiteralPath "dist/BitTorrent-Beobachter"
+          ).Path
+          $releaseDirectory = Join-Path $PWD "dist/release"
+          New-Item -ItemType Directory -Path $releaseDirectory -Force | Out-Null
+          $archiveName = "AfDLeakercatcher-Windows-x64.zip"
+          $archive = Join-Path $releaseDirectory $archiveName
+          if (Test-Path -LiteralPath $archive) {
+            Remove-Item -LiteralPath $archive -Force
+          }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [System.IO.Compression.ZipFile]::CreateFromDirectory(
+            $packageDirectory,
+            $archive,
+            [System.IO.Compression.CompressionLevel]::Optimal,
+            $false
+          )
+          $expectedLicenseEntries = @(
+            "Python-3.12.10.txt",
+            "Tcl-8.6.15.txt",
+            "Tk-8.6.15.txt",
+            "OpenSSL-3.0.16-LICENSE.txt",
+            "OpenSSL-3.0.16-ACKNOWLEDGEMENTS.md",
+            "ReportLab-4.5.1.txt",
+            "Pillow-13.0.0.txt",
+            "charset-normalizer-3.5.2.txt",
+            "PyInstaller-6.22.3.txt"
+          ) | ForEach-Object { "THIRD_PARTY_LICENSES/$_" } | Sort-Object
+          $zipArchive = [System.IO.Compression.ZipFile]::OpenRead($archive)
+          try {
+            $licenseEntries = @(
+              $zipArchive.Entries | Where-Object {
+                -not [string]::IsNullOrEmpty($_.Name) -and
+                $_.FullName.Replace("\", "/").StartsWith(
+                  "THIRD_PARTY_LICENSES/",
+                  [StringComparison]::Ordinal
+                )
+              }
+            )
+            $actualLicenseEntries = @(
+              $licenseEntries |
+                ForEach-Object { $_.FullName.Replace("\", "/") } |
+                Sort-Object
+            )
+            if (@(
+              Compare-Object -ReferenceObject $expectedLicenseEntries `
+                -DifferenceObject $actualLicenseEntries
+            ).Count -ne 0) {
+              throw "Das Release-ZIP enthält nicht alle Drittanbieter-Lizenztexte."
+            }
+            foreach ($licenseEntry in $licenseEntries) {
+              if ($licenseEntry.Length -le 0) {
+                throw "Leerer Lizenztext im Release-ZIP: $($licenseEntry.FullName)"
+              }
+            }
+          } finally {
+            $zipArchive.Dispose()
+          }
+          $hash = (
+            Get-FileHash -Algorithm SHA256 -LiteralPath $archive
+          ).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText(
+            "$archive.sha256",
+            "$hash  $archiveName`n",
+            [Text.Encoding]::ASCII
+          )
+          Write-Host "Finales Release-ZIP: $archive"
+          Write-Host "SHA-256: $hash"
+
       - name: Geprüften Build bereitstellen
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: AfDLeakercatcher-Windows-x64
           path: dist/BitTorrent-Beobachter
+          if-no-files-found: error
+
+      - name: Unveränderte Release-Dateien bereitstellen
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: AfDLeakercatcher-Windows-x64-release
+          path: |
+            dist/release/AfDLeakercatcher-Windows-x64.zip
+            dist/release/AfDLeakercatcher-Windows-x64.zip.sha256
           if-no-files-found: error
 
   attest-public-build:
@@ -236,13 +440,13 @@ jobs:
       - name: Geprüften Build herunterladen
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: AfDLeakercatcher-Windows-x64
+          name: AfDLeakercatcher-Windows-x64-release
           path: attest
 
       - name: Herkunftsnachweis erzeugen
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
-          subject-path: attest/BitTorrent-Beobachter.exe
+          subject-path: attest/AfDLeakercatcher-Windows-x64.zip
 
   github-release:
     if: >-
@@ -256,7 +460,11 @@ jobs:
            needs.attest-public-build.result == 'skipped') }}
     needs: [test-and-build-windows, attest-public-build]
     runs-on: ubuntu-latest
+    concurrency:
+      group: afdleakercatcher-github-release
+      cancel-in-progress: false
     permissions:
+      attestations: read
       contents: write
 
     steps:
@@ -270,11 +478,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          app_version="$(python -c 'from bittorrent_beobachter import VERSION; print(VERSION)')"
+          if [[ "$version" != "$app_version" ]]; then
+            echo "Paketversion $version und App-Version $app_version stimmen nicht ueberein." >&2
+            exit 1
+          fi
           if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
-            version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
             release_tag="bittorrent-beobachter-v${version}"
           else
             release_tag="$GITHUB_REF_NAME"
+            if [[ "$release_tag" != "v${version}" && \
+                  "$release_tag" != "bittorrent-beobachter-v${version}" ]]; then
+              echo "Release-Tag $release_tag passt nicht zur Version $version." >&2
+              exit 1
+            fi
           fi
           if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
@@ -284,20 +502,12 @@ jobs:
           fi
           echo "tag=$release_tag" >> "$GITHUB_OUTPUT"
 
-      - name: Geprüften Build herunterladen
+      - name: Unveränderte Release-Dateien herunterladen
         if: ${{ steps.release.outputs.exists != 'true' }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: AfDLeakercatcher-Windows-x64
-          path: release/package
-
-      - name: Einmal entpackbares Release-ZIP erstellen
-        if: ${{ steps.release.outputs.exists != 'true' }}
-        run: |
-          cd release/package
-          zip -r ../AfDLeakercatcher-Windows-x64.zip .
-          cd ..
-          sha256sum AfDLeakercatcher-Windows-x64.zip > AfDLeakercatcher-Windows-x64.zip.sha256
+          name: AfDLeakercatcher-Windows-x64-release
+          path: release
 
       - name: GitHub-Release erstellen
         if: ${{ steps.release.outputs.exists != 'true' }}
@@ -317,5 +527,46 @@ jobs:
             "release/AfDLeakercatcher-Windows-x64.zip" \
             "release/AfDLeakercatcher-Windows-x64.zip.sha256"
 
-          test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')" = "false"
-          test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')" = "2"
+      - name: Vorhandenes oder neu erstelltes Release vollständig prüfen
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
+        run: |
+          set -euo pipefail
+          if [[ "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+                    --json isDraft --jq '.isDraft')" != "false" ]]; then
+            echo "Release $RELEASE_TAG ist noch ein Entwurf." >&2
+            exit 1
+          fi
+
+          resolved_commit="$(gh api \
+            "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq '.sha')"
+          if [[ "$resolved_commit" != "$GITHUB_SHA" ]]; then
+            echo "Release $RELEASE_TAG zeigt auf $resolved_commit statt $GITHUB_SHA." >&2
+            exit 1
+          fi
+
+          printf -v expected_assets '%s\n%s' \
+            "AfDLeakercatcher-Windows-x64.zip" \
+            "AfDLeakercatcher-Windows-x64.zip.sha256"
+          actual_assets="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name' | LC_ALL=C sort)"
+          if [[ "$actual_assets" != "$expected_assets" ]]; then
+            echo "Release $RELEASE_TAG enthält unerwartete oder fehlende Assets:" >&2
+            printf '%s\n' "$actual_assets" >&2
+            exit 1
+          fi
+
+          verification_dir="$RUNNER_TEMP/release-verification"
+          mkdir -p "$verification_dir"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --dir "$verification_dir" \
+            --pattern "AfDLeakercatcher-Windows-x64.zip" \
+            --pattern "AfDLeakercatcher-Windows-x64.zip.sha256"
+          cd "$verification_dir"
+          sha256sum --check --strict AfDLeakercatcher-Windows-x64.zip.sha256
+          if [[ "$REPOSITORY_VISIBILITY" == "public" ]]; then
+            gh attestation verify AfDLeakercatcher-Windows-x64.zip \
+              --repo "$GITHUB_REPOSITORY"
+          fi

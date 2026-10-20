@@ -1,1 +1,5 @@
 *.pdf binary
+
+# Preserve copied upstream license texts byte-for-byte, including their
+# original line endings and whitespace.
+THIRD_PARTY_LICENSES/** -text -whitespace

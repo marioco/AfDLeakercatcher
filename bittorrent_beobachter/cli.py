@@ -101,6 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    parser.add_argument("--gui-smoke-test", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--config", type=Path, help="Pfad zur JSON-Konfiguration")
     parser.add_argument("--data-dir", type=Path, help="Ablage für Evidenz und Berichte")
     parser.add_argument("--log-file", type=Path, help="Abweichender Logpfad")
@@ -238,12 +239,28 @@ def _initialize_config(args: argparse.Namespace, config_path: Path) -> int:
     return 0
 
 
-def _scan_once(config_path: Path, data_dir: Path, logger: logging.Logger) -> int:
+def _scan_once(
+    config_path: Path,
+    data_dir: Path,
+    logger: logging.Logger,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> int:
     from .monitor import run_scan
 
     config = load_migrated_config(config_path)
     logger.info("Prüflauf für %d Ziel(e) gestartet", len(config.targets))
-    result = run_scan(config, data_dir, progress=logger.info)
+
+    def reports_ready(path: Path, count: int) -> None:
+        logger.info("Ergebnisse bereits verwendbar: %s (%d positive Befunde)", path, count)
+
+    result = run_scan(
+        config,
+        data_dir,
+        progress=logger.info,
+        cancel_event=cancel_event,
+        reports_ready=reports_ready,
+    )
     logger.info(
         "Prüflauf beendet: %d Kandidaten gefunden, %d direkt geprüft, "
         "%d bestätigte Handshakes, %d positive Verfügbarkeitsprüfungen, "
@@ -279,6 +296,43 @@ def _scan_once(config_path: Path, data_dir: Path, logger: logging.Logger) -> int
     return 0
 
 
+def _scan_once_with_signal_cancellation(
+    config_path: Path,
+    data_dir: Path,
+    logger: logging.Logger,
+) -> int:
+    """Brich einen CLI-Einzellauf nach SIGINT oder SIGTERM kontrolliert ab."""
+
+    cancel_event = threading.Event()
+    received_signal: int | None = None
+
+    def request_stop(signum: int, _frame: object) -> None:
+        nonlocal received_signal
+        if received_signal is None:
+            received_signal = signum
+        logger.info("Beendigungssignal %d empfangen", signum)
+        cancel_event.set()
+
+    installed_handlers = []
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_handler = signal.signal(signum, request_stop)
+            installed_handlers.append((signum, previous_handler))
+        exit_code = _scan_once(
+            config_path,
+            data_dir,
+            logger,
+            cancel_event=cancel_event,
+        )
+    finally:
+        for signum, previous_handler in reversed(installed_handlers):
+            signal.signal(signum, previous_handler)
+
+    if received_signal is not None:
+        return 128 + received_signal
+    return exit_code
+
+
 def _watch(config_path: Path, data_dir: Path, logger: logging.Logger) -> int:
     stop_event = threading.Event()
 
@@ -291,10 +345,17 @@ def _watch(config_path: Path, data_dir: Path, logger: logging.Logger) -> int:
     logger.info("Fortlaufende Überwachung gestartet")
     while not stop_event.is_set():
         try:
-            exit_code = _scan_once(config_path, data_dir, logger)
+            exit_code = _scan_once(
+                config_path,
+                data_dir,
+                logger,
+                cancel_event=stop_event,
+            )
         except (ConfigError, OSError):
             logger.exception("Prüflauf konnte nicht gestartet werden")
             exit_code = 1
+        if stop_event.is_set():
+            break
         try:
             interval_minutes = load_config(config_path).interval_minutes
         except (ConfigError, OSError):
@@ -327,6 +388,10 @@ def main(argv: list[str] | None = None) -> int:
     """Steuert GUI, Einzellauf, Dauerbetrieb und Journalprüfung."""
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.gui_smoke_test:
+        from .gui import verify_gui_runtime
+
+        return verify_gui_runtime()
     data_dir, config_path, log_file = _resolve_paths(args)
     logger = setup_logging(log_file)
     command = args.command or "gui"
@@ -347,7 +412,7 @@ def main(argv: list[str] | None = None) -> int:
                     "Peer-Endpunkte sehen Quell-IP und Infohash und können dies "
                     "protokollieren."
                 )
-            return _scan_once(config_path, data_dir, logger)
+            return _scan_once_with_signal_cancellation(config_path, data_dir, logger)
         if command == "watch":
             if not args.acknowledge_public_network:
                 raise ConfigError(

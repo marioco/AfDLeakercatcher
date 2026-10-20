@@ -200,7 +200,7 @@ class PeerVerifierTests(unittest.IsolatedAsyncioTestCase):
 
         observation = result.availability
         assert observation is not None
-        self.assertTrue(result.offering_observed)
+        self.assertFalse(result.offering_observed)
         self.assertTrue(observation.unchoked)
         self.assertTrue(observation.peer_choking_at_end)
         self.assertEqual(
@@ -270,7 +270,7 @@ class PeerVerifierTests(unittest.IsolatedAsyncioTestCase):
 
         observation = result.availability
         assert observation is not None
-        self.assertTrue(result.offering_observed)
+        self.assertFalse(result.offering_observed)
         self.assertFalse(observation.completed_full_window)
         self.assertEqual(observation.request_messages_sent, 0)
         self.assertEqual(observation.piece_payload_bytes_received, 0)

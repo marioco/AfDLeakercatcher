@@ -145,8 +145,10 @@ def test_journal_and_atomic_files_use_private_permissions(tmp_path: Path) -> Non
     )
     lock_path = private_dir / ".evidence.jsonl.lock"
     journal_path.chmod(0o664)
-    assert EvidenceJournal(journal_path).verify().valid
+    lock_path.chmod(0o664)
+    batches = list(EvidenceJournal(journal_path).iter_verified_batches())
 
+    assert [[entry.event for entry in batch] for batch in batches] == [[{"kind": "private"}]]
     assert stat.S_IMODE(private_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE(journal_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
@@ -175,6 +177,139 @@ def test_append_has_no_total_event_count_or_journal_size_cap(tmp_path: Path) -> 
     verification = journal.verify()
     assert verification.valid is True
     assert verification.entries_count == 65
+
+
+def test_iter_verified_batches_streams_more_than_five_entries_in_bounded_batches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "evidence.jsonl"
+    journal = EvidenceJournal(path)
+    journal.append_many(
+        ({"item": item} for item in range(12)),
+        recorded_at_utc="2026-10-20T10:01:00Z",
+    )
+    original_iter_entries = evidence_module._iter_entries
+    pass_counts: list[int] = []
+
+    def tracking_iter_entries(
+        file_handle: object,
+        *,
+        end_offset: int | None = None,
+    ) -> object:
+        pass_index = len(pass_counts)
+        pass_counts.append(0)
+        for entry in original_iter_entries(file_handle, end_offset=end_offset):
+            pass_counts[pass_index] += 1
+            yield entry
+
+    monkeypatch.setattr(evidence_module, "_iter_entries", tracking_iter_entries)
+    batches = journal.iter_verified_batches()
+
+    assert iter(batches) is batches
+    first_batch = next(batches)
+    assert len(first_batch) == 5
+    # Der erste Durchlauf validiert das komplette Journal. Der Ausgabedurchlauf
+    # stoppt dagegen nach genau einem kleinen Batch und baut keine Gesamtliste.
+    assert pass_counts == [12, 5]
+
+    remaining_batches = list(batches)
+    all_batches = [first_batch, *remaining_batches]
+    assert [len(batch) for batch in all_batches] == [5, 5, 2]
+    assert [entry.sequence for batch in all_batches for entry in batch] == list(range(1, 13))
+    assert pass_counts == [12, 12]
+
+
+@pytest.mark.parametrize("batch_size", (0, 6, True, 1.5))
+def test_iter_verified_batches_rejects_invalid_batch_size(
+    tmp_path: Path,
+    batch_size: object,
+) -> None:
+    batches = EvidenceJournal(tmp_path / "evidence.jsonl").iter_verified_batches(
+        batch_size=batch_size,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ValueError, match="batch_size muss zwischen 1 und 5 liegen"):
+        next(batches)
+
+
+def test_iter_verified_batches_uses_append_stable_snapshot(tmp_path: Path) -> None:
+    path = tmp_path / "evidence.jsonl"
+    journal = EvidenceJournal(path)
+    journal.append_many(
+        ({"item": item} for item in range(7)),
+        recorded_at_utc="2026-10-20T10:01:00Z",
+    )
+
+    snapshot_batches = journal.iter_verified_batches()
+    first_batch = next(snapshot_batches)
+    appended = journal.append(
+        {"item": 7},
+        recorded_at_utc="2026-10-20T10:02:00Z",
+    )
+    snapshot_entries = [*first_batch]
+    snapshot_entries.extend(entry for batch in snapshot_batches for entry in batch)
+
+    assert appended.sequence == 8
+    assert [entry.sequence for entry in snapshot_entries] == list(range(1, 8))
+    assert [entry.sequence for batch in journal.iter_verified_batches() for entry in batch] == list(
+        range(1, 9)
+    )
+
+
+def test_iter_verified_batches_recovers_exact_prepared_partial_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "evidence.jsonl"
+    journal = EvidenceJournal(path)
+    journal.append(
+        {"kind": "existing"},
+        recorded_at_utc="2026-10-20T09:00:00Z",
+    )
+    original_write_all = evidence_module._write_all
+    write_calls = 0
+
+    def interrupt_journal_write(file_descriptor: int, data: bytes) -> None:
+        nonlocal write_calls
+        write_calls += 1
+        if write_calls == 3:
+            original_write_all(file_descriptor, data[: max(1, len(data) // 2)])
+            raise OSError("simulierter Absturz beim Journal-Append")
+        original_write_all(file_descriptor, data)
+
+    monkeypatch.setattr(evidence_module, "_write_all", interrupt_journal_write)
+    with pytest.raises(EvidenceJournalError, match="konnte nicht erweitert"):
+        journal.append_many(
+            ({"batch": 1, "item": item} for item in range(5)),
+            recorded_at_utc="2026-10-20T10:00:00Z",
+        )
+    monkeypatch.setattr(evidence_module, "_write_all", original_write_all)
+
+    pending_path = path.with_name(f".{path.name}.pending")
+    recovered_batches = list(EvidenceJournal(path).iter_verified_batches())
+
+    assert [len(batch) for batch in recovered_batches] == [5, 1]
+    assert [entry.sequence for batch in recovered_batches for entry in batch] == list(range(1, 7))
+    assert not pending_path.exists()
+
+
+def test_iter_verified_batches_rejects_tampering_before_first_result(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "evidence.jsonl"
+    journal = EvidenceJournal(path)
+    journal.append_many(
+        ({"item": item} for item in range(7)),
+        recorded_at_utc="2026-10-20T10:01:00Z",
+    )
+    tampered = path.read_bytes().replace(b'"item":6', b'"item":9')
+    path.write_bytes(tampered)
+
+    with pytest.raises(EvidenceJournalError, match="Ereignis-Hash"):
+        next(EvidenceJournal(path).iter_verified_batches())
+
+    assert path.read_bytes() == tampered
 
 
 def test_repeated_five_event_batches_scan_existing_chain_only_once(

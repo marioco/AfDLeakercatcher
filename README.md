@@ -1,8 +1,10 @@
 # BitTorrent-Beobachter
 
-## Windows-Download – Version 0.3.1
+## Windows-Download – Version 0.3.2
 
-### [⬇ AfDLeakercatcher für Windows herunterladen](https://github.com/marioco/AfDLeakercatcher/releases/download/bittorrent-beobachter-v0.3.1/AfDLeakercatcher-Windows-x64.zip)
+### [⬇ AfDLeakercatcher für Windows herunterladen](https://github.com/marioco/AfDLeakercatcher/releases/download/bittorrent-beobachter-v0.3.2/AfDLeakercatcher-Windows-x64.zip)
+
+[SHA-256-Prüfsumme zum Download](https://github.com/marioco/AfDLeakercatcher/releases/download/bittorrent-beobachter-v0.3.2/AfDLeakercatcher-Windows-x64.zip.sha256)
 
 Keine GitHub-Kenntnisse nötig: Auf den Link klicken, die ZIP-Datei **einmal**
 entpacken und anschließend `BitTorrent-Beobachter.exe` doppelklicken. Es gibt keinen
@@ -25,8 +27,8 @@ gezielte, inhaltsfreie Prüfung durch:
 3. Nach einem gültigen Handshake für denselben Infohash meldet sie auf derselben
    Verbindung Interesse und beobachtet bis zu 60 Sekunden ausschließlich
    BitTorrent-Kontrollnachrichten.
-4. Ein positiver Verfügbarkeitsbefund erfordert mindestens ein nicht leeres `bitfield`-,
-   gültiges `have`- oder `have_all`-Signal und mindestens ein `unchoke`. Das bedeutet:
+4. Ein positiver Verfügbarkeitsbefund erfordert mindestens ein nicht leeres `bitfield`-
+   oder gültiges `have`-Signal und ein zeitgleich geltendes `unchoke`. Das bedeutet:
    Der Endpunkt meldete verfügbare Teile und teilte dem Prüfprogramm mit, dass es
    Datenblöcke anfordern dürfe.
 5. Die Anwendung sendet niemals `request`-Nachrichten und fordert weder Dateiinhalte
@@ -44,15 +46,19 @@ höchstens drei Versuche.
 
 Kandidaten und Ergebnisse werden fortlaufend in Fünferpaketen in einer privaten lokalen
 SQLite-Laufdatenbank gespeichert; die vollständige Treffermenge wird dadurch nicht im
-Arbeitsspeicher gehalten. Nach jeweils fünf positiven Befunden werden sofort fertige
-PDF-, E-Mail- und CSV-Ergebnisse im Ergebnisordner aktualisiert. Der Ordner kann bereits
-während der weiteren Suche geöffnet werden. Über **Prüflauf abbrechen** lässt sich die
-Suche kontrolliert beenden; der letzte Restblock und alle bisherigen Ergebnisse werden
-fertig gespeichert. Das letzte Paket darf weniger als fünf Einträge enthalten.
-Diese fortlaufende Speicherung ist keine automatische Wiederaufnahme: Nach einem
-Programmneustart beginnt ein neuer Prüflauf. Die private SQLite-Datenbank eines
-unterbrochenen Laufs bleibt lokal erhalten, wird derzeit aber nicht automatisch
-fortgesetzt oder in den neuen Lauf übernommen.
+Arbeitsspeicher gehalten. Nach jeweils fünf positiven Befunden wird sofort ein
+nummerierter Unterordner `zwischenstand-000001`, `zwischenstand-000002` usw. mit fertigen
+PDF-, E-Mail- und CSV-Ergebnissen angelegt. Frühere Zwischenstände werden nicht erneut
+berechnet und können bereits während der weiteren Suche geöffnet und verwendet werden.
+Über **Prüflauf abbrechen** lässt sich die Suche kontrolliert beenden; der letzte
+Restblock und alle bisherigen Ergebnisse werden anschließend im Hauptordner fertig
+gespeichert. Das letzte Paket darf weniger als fünf Einträge enthalten.
+Nach einem Programmneustart prüft die Anwendung vor jedem neuen Netzwerkzugriff das
+Evidenzjournal und die privaten SQLite-Laufdatenbanken. Bereits positiv geprüfte, aber
+noch nicht vollständig ausgegebene Befunde werden in Fünferpaketen abgeglichen und als
+eigene Wiederherstellungsberichte fertiggestellt. Die eigentliche Netzwerksuche eines
+unterbrochenen Laufs wird nicht an derselben Stelle fortgesetzt; danach beginnt ein
+neuer Prüflauf.
 Bei großen oder aktiven Schwärmen kann ein vollständiger Lauf deshalb viele Minuten
 oder Stunden dauern.
 Netzwerk-Zeitlimits begrenzen einzelne Anfragen und Verbindungsversuche, nicht die Anzahl
@@ -79,16 +85,26 @@ Lauf unter **Actions → Artifacts** verfügbar; sie sind keine veröffentlichte
 können von GitHub nach einiger Zeit gelöscht werden.
 
 1. Ganz oben auf **AfDLeakercatcher für Windows herunterladen** klicken.
-2. Die daneben veröffentlichte SHA-256-Prüfsumme vergleichen.
-3. Das ZIP genau einmal vollständig entpacken und `BitTorrent-Beobachter.exe` doppelklicken.
-4. Die beiden vorgesehenen Infohashes sind bereits sichtbar eingetragen.
-5. **Jetzt prüfen** wählen und den Hinweis zur öffentlichen Sichtbarkeit bestätigen.
-6. Nach Abschluss **Ergebnisordner öffnen** wählen.
+2. Die direkt darunter verlinkte SHA-256-Prüfsummendatei in denselben Ordner laden.
+3. In diesem Ordner PowerShell öffnen und die beiden Werte automatisch vergleichen:
 
-Es gibt kein ZIP im ZIP. Auch ein Teststand unter **Actions → Artifacts** enthält direkt
-die Programmdateien und muss nur einmal entpackt werden. Für die beiden voreingestellten
-Ziele sind weder Titel noch Beschreibung einzugeben. Ein zusätzlicher Magnet-Link lässt
-sich bei Bedarf in genau einem Eingabefenster ergänzen.
+   ```powershell
+   $Soll = (Get-Content .\AfDLeakercatcher-Windows-x64.zip.sha256).Split()[0]
+   $Ist = (Get-FileHash .\AfDLeakercatcher-Windows-x64.zip -Algorithm SHA256).Hash
+   $Ist -eq $Soll
+   ```
+
+4. Nur wenn PowerShell `True` ausgibt, das ZIP genau einmal vollständig entpacken
+   und `BitTorrent-Beobachter.exe` doppelklicken.
+5. Die beiden vorgesehenen Infohashes sind bereits sichtbar eingetragen.
+6. **Jetzt prüfen** wählen und den Hinweis zur öffentlichen Sichtbarkeit bestätigen.
+7. Nach Abschluss **Ergebnisordner öffnen** wählen.
+
+Es gibt kein ZIP im ZIP. Für einen Teststand unter **Actions → Artifacts** ist das
+Artefakt `AfDLeakercatcher-Windows-x64` ohne den Zusatz `-release` vorgesehen: Es
+enthält direkt die Programmdateien und muss nur einmal entpackt werden. Für die
+voreingestellten Ziele sind weder Titel noch Beschreibung einzugeben. Ein zusätzlicher
+Magnet-Link lässt sich bei Bedarf in genau einem Eingabefenster ergänzen.
 
 Im selben entpackten Ordner wie die EXE liegt die Datei
 `Cybercrime-E-Mail-Kontakte_BKA-und-LKA_Deutschland_Stand-2026-10-20.pdf` mit einer
@@ -103,7 +119,11 @@ eine GitHub-Herkunftsbestätigung machen den Build nachprüfbar. Eine vollständ
 zuverlässige Vermeidung von Antivirus-Fehlalarmen ist technisch nicht versprechbar; den
 stärksten Vertrauenshinweis liefert zusätzlich eine digitale Herausgebersignatur. Der
 Build-Workflow signiert automatisch, sobald die Repository-Secrets
-`WINDOWS_CERTIFICATE_BASE64` und `WINDOWS_CERTIFICATE_PASSWORD` hinterlegt sind.
+`WINDOWS_CERTIFICATE_BASE64` und `WINDOWS_CERTIFICATE_PASSWORD` hinterlegt sind. Fehlen
+diese Secrets, kann der Workflow den Build trotzdem **unsigniert** veröffentlichen.
+Windows kann dann „Unbekannter Herausgeber“ oder eine SmartScreen-Warnung anzeigen.
+SHA-256 und GitHub-Herkunftsbestätigung sichern Integrität und Build-Herkunft, ersetzen
+aber keine Windows-Herausgebersignatur.
 
 ## Verständliche Ausgabe
 
@@ -251,19 +271,22 @@ In PowerShell:
 ```
 
 Der GitHub-Workflow führt Tests und Ruff aus, baut mit PyInstaller ohne UPX und
-signiert optional. Ein normaler Build stellt den direkt einmal entpackbaren App-Ordner
-bereit; ein Versions-Tag erzeugt daraus das Release-ZIP samt SHA-256. Öffentliche
-Nicht-PR-Builds erhalten außerdem eine GitHub-Artefaktbestätigung für die EXE. Nach dem
-Entpacken lässt sie sich mit der GitHub CLI prüfen:
+signiert optional. Bereits der Windows-Job erzeugt aus dem geprüften App-Ordner das
+finale, direkt einmal entpackbare ZIP samt SHA-256-Datei. In öffentlichen
+Nicht-PR-Builds erhält genau dieses ZIP eine Attestierung. Bei einem Release werden
+dieselben ZIP-Bytes anschließend unverändert veröffentlicht.
+Vor dem Entpacken lässt sich seine Herkunft mit der GitHub CLI prüfen:
 
 ```bash
-gh attestation verify BitTorrent-Beobachter.exe -R marioco/AfDLeakercatcher
+gh attestation verify AfDLeakercatcher-Windows-x64.zip -R marioco/AfDLeakercatcher
 ```
 
-Ein Push eines passenden Versionstags wie `bittorrent-beobachter-v0.3.0` erzeugt nach
-erfolgreichem Build automatisch ein GitHub-Release mit ZIP, SHA-256-Datei und generierten
-Versionshinweisen. Andere erfolgreiche Workflow-Läufe stellen den Build nur als
-Actions-Artefakt bereit.
+Ein Push auf `main` erzeugt nach erfolgreichem Build ein GitHub-Release, sofern für die
+eingetragene Version noch keines existiert. Dasselbe gilt für einen exakt zur
+Paket- und App-Version passenden Tag wie `bittorrent-beobachter-v0.3.2`. Ein bereits
+vorhandenes Release wird nicht überschrieben, sondern auf Ziel-Commit, Entwurfsstatus,
+exakt erwartete Assets und ZIP-Prüfsumme kontrolliert. Pull Requests und manuell
+gestartete Läufe stellen nur Actions-Artefakte bereit.
 
 ## Technische Grundlagen
 
