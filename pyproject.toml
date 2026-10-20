@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools==84.2.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bittorrent-beobachter"
+version = "0.1.0"
+description = "Inhaltsfreie, nachvollziehbare Beobachtung ausdrücklich konfigurierter BitTorrent-Schwärme"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "BitTorrent-Beobachter contributors" }]
+dependencies = [
+    "reportlab==4.5.1",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+]
+
+[project.scripts]
+bittorrent-beobachter = "bittorrent_beobachter.cli:main"
+
+[project.optional-dependencies]
+build = ["pyinstaller==6.22.3"]
+dev = [
+    "pytest==9.1.1",
+    "ruff==0.17.1",
+]
+
+[tool.setuptools]
+packages = ["bittorrent_beobachter"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]

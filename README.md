@@ -187,15 +187,6 @@ erfolgreichem Build automatisch ein GitHub-Release mit ZIP, SHA-256-Datei und ge
 Versionshinweisen. Andere erfolgreiche Workflow-Läufe stellen den Build nur als
 Actions-Artefakt bereit.
 
-## Lokale Linux-Deployment-Integration
-
-Die unter `systemd/` versionierten Units sind die lokale Integration für das
-Laura-System und keine universell installierbare Linux-Konfiguration. Sie enthalten
-bewusst Laura-spezifische Benutzer- und absolute Dateipfade und müssen vor einer
-Installation auf einem anderen System angepasst und geprüft werden. Lokal führt
-`laura-bittorrent-beobachter.timer` den Dienst alle 30 Minuten als Benutzer `laura`
-ohne Linux-Capabilities und mit eng begrenzten Schreibpfaden aus.
-
 ## Technische Grundlagen
 
 - [BEP 3 – BitTorrent Protocol Specification](https://www.bittorrent.org/beps/bep_0003.html)
