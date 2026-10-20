@@ -460,7 +460,15 @@ class ReportGenerationTests(unittest.TestCase):
         self.assertEqual(section_positions, sorted(section_positions))
         self.assertIn("Die Strafanzeige richtet sich gegen Unbekannt.", paragraph_text)
         self.assertIn(
-            "bestätigte den dokumentierten Infohash, meldete verfügbare Teile und gab mit UNCHOKE",
+            "Anlass dieser Strafanzeige: Der positive technische Gesamtbefund legt nahe, "
+            "dass unter der IP-Adresse 198.51.100.83 mindestens Teile des mutmaßlich "
+            "gestohlenen, als „AfD-Datenleak“ bezeichneten Datenbestands zum Download "
+            "angeboten wurden.",
+            paragraph_text,
+        )
+        self.assertIn(
+            "bestätigte hierfür einen der veröffentlichten Infohashes, meldete verfügbare "
+            "Teile und gab mit UNCHOKE",
             paragraph_text,
         )
         self.assertIn("nannten DHT-Antworten den Endpunkt", paragraph_text)
@@ -470,6 +478,43 @@ class ReportGenerationTests(unittest.TestCase):
         self.assertNotIn("belegt keines der gesetzlichen Tatbestandsmerkmale", paragraph_text)
         self.assertNotIn("nicht gerichtlich bewiesen", paragraph_text)
         self.assertNotIn("belegt nicht für sich allein die konkrete Beobachtung", paragraph_text)
+
+    def test_custom_hash_attachment_does_not_claim_afd_case(self) -> None:
+        result = ScanResult(
+            run_id="custom-attachment",
+            started_at_utc="2026-10-20T10:00:00Z",
+            completed_at_utc="2026-10-20T11:00:00Z",
+            records=[_evidence_record("198.51.100.84", 6014, 14)],
+        )
+        aggregate = reports_module._aggregate_reportable_records(result.records)[0]
+        captured_story: list[object] = []
+
+        def capture_pdf(
+            _path: Path,
+            _title: str,
+            story: list[object],
+            *_args: object,
+        ) -> None:
+            captured_story.extend(story)
+
+        with mock.patch.object(reports_module, "_build_pdf", side_effect=capture_pdf):
+            reports_module._write_complaint_attachment_pdf(
+                Path("unused.pdf"),
+                result,
+                aggregate,
+                ReportConfig(),
+                "2026-10-20T11:05:00Z",
+                reports_module._load_reportlab(),
+            )
+
+        paragraph_text = "\n".join(
+            flowable.getPlainText()
+            for flowable in captured_story
+            if callable(getattr(flowable, "getPlainText", None))
+        )
+        self.assertIn("Technischer Kernbefund:", paragraph_text)
+        self.assertNotIn("Anlass dieser Strafanzeige:", paragraph_text)
+        self.assertNotIn("AfD-Datenleak", paragraph_text)
 
     def test_offering_claim_requires_positive_overall_gate(self) -> None:
         project_hash = "852795102149749ad91123af01ceac5da6f9eb5a"

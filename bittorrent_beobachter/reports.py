@@ -867,6 +867,24 @@ def _write_complaint_attachment_pdf(
     ):
         raise ValueError("Einzelanlagen dürfen nur positive Verfügbarkeitsbefunde enthalten.")
 
+    if project_hashes:
+        core_finding = (
+            "Anlass dieser Strafanzeige: Der positive technische Gesamtbefund "
+            f"legt nahe, dass unter der IP-Adresse {aggregate.ip} mindestens Teile "
+            "des mutmaßlich gestohlenen, als „AfD-Datenleak“ bezeichneten "
+            "Datenbestands zum Download angeboten wurden. Der unter dieser "
+            "IP-Adresse erreichbare BitTorrent-Client bestätigte hierfür einen "
+            "der veröffentlichten Infohashes, meldete verfügbare Teile und gab "
+            "mit UNCHOKE das Anfordern dieser Teile protokollseitig frei."
+        )
+    else:
+        core_finding = (
+            "Technischer Kernbefund: Der unter dieser IP-Adresse erreichbare "
+            "BitTorrent-Client bestätigte den dokumentierten Infohash, meldete "
+            "verfügbare Teile und gab mit UNCHOKE das Anfordern dieser Teile "
+            "protokollseitig frei."
+        )
+
     story: list[Any] = [
         _paragraph(
             "Technische Anlage zur Strafanzeige gegen Unbekannt",
@@ -936,10 +954,7 @@ def _write_complaint_attachment_pdf(
                 toolkit,
             ),
             _paragraph(
-                "Technischer Kernbefund: Der unter dieser IP-Adresse erreichbare "
-                "BitTorrent-Client bestätigte den dokumentierten Infohash, meldete "
-                "verfügbare Teile und gab mit UNCHOKE das Anfordern dieser Teile "
-                "protokollseitig frei.",
+                core_finding,
                 styles["EvidenceBox"],
                 toolkit,
             ),
