@@ -21,7 +21,11 @@ from .models import Target
 
 MAX_CONFIG_BYTES = 256_000
 MAX_CONFIG_TARGETS = 20
-BUNDLED_PRESET_REVISION = 2
+BUNDLED_PRESET_REVISION = 3
+DEFAULT_MAX_CHECKS = 600
+DEFAULT_OBSERVATION_WORKERS = 120
+LEGACY_MAX_CHECKS = 120
+LEGACY_OBSERVATION_WORKERS = 32
 DEFAULT_BOOTSTRAP_NODES = (
     ("router.bittorrent.com", 6881),
     ("router.utorrent.com", 6881),
@@ -60,9 +64,9 @@ class DhtSettings:
 class PeerSettings:
     timeout_seconds: float = 4.0
     observation_seconds: float = 60.0
-    max_checks: int = 120
+    max_checks: int = DEFAULT_MAX_CHECKS
     workers: int = 8
-    observation_workers: int = 32
+    observation_workers: int = DEFAULT_OBSERVATION_WORKERS
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,8 +120,10 @@ def with_bundled_presets(config: AppConfig) -> AppConfig:
         return config
 
     presets_by_hash = {target.info_hash: target for target in DEFAULT_TARGETS}
-    normalized_targets = tuple(
-        presets_by_hash.get(target.info_hash, target) for target in config.targets
+    normalized_targets = (
+        tuple(presets_by_hash.get(target.info_hash, target) for target in config.targets)
+        if config.preset_revision < 2
+        else config.targets
     )
     existing_hashes = {target.info_hash for target in normalized_targets}
     missing = (
@@ -130,9 +136,15 @@ def with_bundled_presets(config: AppConfig) -> AppConfig:
             "Die einmalige Voreinstellungs-Aktualisierung überschreitet das "
             f"Ziel-Limit von {MAX_CONFIG_TARGETS}."
         )
+    peer = config.peer
+    if peer.max_checks == LEGACY_MAX_CHECKS:
+        peer = replace(peer, max_checks=DEFAULT_MAX_CHECKS)
+    if peer.observation_workers == LEGACY_OBSERVATION_WORKERS:
+        peer = replace(peer, observation_workers=DEFAULT_OBSERVATION_WORKERS)
     return replace(
         config,
         targets=(*normalized_targets, *missing),
+        peer=peer,
         preset_revision=BUNDLED_PRESET_REVISION,
     )
 
@@ -375,10 +387,15 @@ def config_from_dict(raw: dict[str, Any]) -> AppConfig:
             60.0,
             60.0,
         ),
-        max_checks=_bounded_int(peer_raw.get("max_checks", 120), "peer.max_checks", 1, 2_000),
+        max_checks=_bounded_int(
+            peer_raw.get("max_checks", DEFAULT_MAX_CHECKS),
+            "peer.max_checks",
+            1,
+            2_000,
+        ),
         workers=_bounded_int(peer_raw.get("workers", 8), "peer.workers", 1, 32),
         observation_workers=_bounded_int(
-            peer_raw.get("observation_workers", 32),
+            peer_raw.get("observation_workers", DEFAULT_OBSERVATION_WORKERS),
             "peer.observation_workers",
             1,
             128,
@@ -582,3 +599,13 @@ def save_config(path: Path, config: AppConfig) -> None:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
         raise
+
+
+def load_migrated_config(path: Path) -> AppConfig:
+    """Lädt, migriert und speichert alte Programmvorgaben atomar."""
+
+    config = load_config(path)
+    migrated = with_bundled_presets(config)
+    if migrated != config:
+        save_config(path, migrated)
+    return migrated

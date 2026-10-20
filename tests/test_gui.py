@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from bittorrent_beobachter.config import (
+    BUNDLED_PRESET_REVISION,
     DEFAULT_TARGETS,
     AppConfig,
     ConfigError,
@@ -303,7 +304,7 @@ def test_upgrade_neutralizes_old_preset_claims_without_touching_other_targets(
 
     config = _bare_app(config_path)._load_initial_config()
 
-    assert config.preset_revision == 2
+    assert config.preset_revision == BUNDLED_PRESET_REVISION
     assert config.targets[0] == unrelated
     assert config.targets[1] == DEFAULT_TARGETS[0]
     assert len(config.targets) == 2
@@ -331,8 +332,24 @@ def test_revision_one_empty_config_stays_empty_during_neutralization_upgrade(
 
     config = _bare_app(config_path)._load_initial_config()
 
-    assert config.preset_revision == 2
+    assert config.preset_revision == BUNDLED_PRESET_REVISION
     assert config.targets == ()
+
+
+def test_gui_migrates_old_peer_limits_without_restoring_targets(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    raw = config_to_dict(AppConfig(targets=()))
+    raw["bundled_preset_revision"] = 2
+    raw["peer"]["max_checks"] = 120
+    raw["peer"]["observation_workers"] = 32
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    config = _bare_app(config_path)._load_initial_config()
+
+    assert config.targets == ()
+    assert config.peer.max_checks == 600
+    assert config.peer.observation_workers == 120
+    assert load_config(config_path) == config
 
 
 def test_refresh_targets_shows_both_presets_and_no_running_scan(tmp_path: Path) -> None:
@@ -872,6 +889,7 @@ def test_result_table_uses_plain_language_and_ipv6_endpoint(tmp_path: Path) -> N
     assert values[3] == "Teile gemeldet; Anfragen erlaubt"
     assert values[4] == "Beispielnetz"
     assert values[5] == "VPN: Beispiel-VPN"
+    assert "1 DHT-Treffer, 1 direkt geprüft" in app.status_text.value
 
 
 def test_real_partial_result_errors_still_get_one_warning(

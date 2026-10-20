@@ -23,6 +23,11 @@ Für gefundene Endpunkte führt sie eine eng begrenzte Prüfung durch:
    noch Torrent-Metadaten an. Erst bei einem positiven Verfügbarkeitsbefund werden eine
    technische Anlage und eine versandfertige Strafanzeige als `.eml` erzeugt.
 
+Bei den beiden voreingestellten Zielen werden alle gefundenen eindeutigen Endpunkte
+direkt geprüft, bis zu 300 je Ziel und damit bis zu 600 pro Lauf. Es gibt keine frühere
+Abschneidung nach 120 Endpunkten mehr. Exakte Doppelnennungen desselben Infohashes mit
+derselben IP und demselben Port werden nur einmal geprüft.
+
 Das ist ein stärkeres Protokollindiz als ein bloßer Eintrag in einer Teilnehmerliste oder
 ein Handshake. Die Kontrollsignale werden jedoch vom Gegenüber selbst erzeugt und ohne
 Inhaltsabruf nicht gegen echte Dateistücke geprüft. Der Befund belegt daher **nicht**:
@@ -189,6 +194,9 @@ Wichtige Schutzgrenzen sind fest im Programm angelegt:
 - höchstens 600 Sekunden für die gesamte DHT- und Peer-Netzphase sowie weitere
   harte Zeitlimits und Grenzen für DHT-Knoten, Anfragen, Treffer und parallele
   Peer-Prüfungen;
+- für die beiden voreingestellten Ziele bis zu 600 direkte Peer-Prüfungen pro Lauf,
+  davon bis zu 120 gleichzeitig; ältere Standardkonfigurationen werden automatisch
+  auf diese Werte aktualisiert;
 - höchstens 20 externe Netzauskünfte pro Lauf; weitere bestätigte Adressen bleiben in
   diesem Lauf ohne externe Anreicherung;
 - nur global routbare öffentliche Adressen;

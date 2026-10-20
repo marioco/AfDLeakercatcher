@@ -617,6 +617,7 @@ class ObserverApp:
         else:
             self.status_text.set(
                 f"Fertig: {len(result.candidates)} DHT-Treffer, "
+                f"{len(result.handshakes)} direkt geprüft, "
                 f"{result.confirmed_count} bestätigte Handshakes, "
                 f"{result.offering_count} positive Verfügbarkeitsprüfungen, "
                 f"{result.known_vpn_count} bekannte VPN-Endpunkte. "

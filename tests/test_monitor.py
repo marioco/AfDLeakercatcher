@@ -26,6 +26,7 @@ from bittorrent_beobachter.config import (
     config_to_dict,
     default_app_config,
     load_config,
+    load_migrated_config,
     save_config,
     with_bundled_presets,
 )
@@ -54,7 +55,8 @@ def test_default_app_config_contains_only_neutral_first_run_targets() -> None:
     assert all(target.source_note == "" for target in config.targets)
     assert config.enrichment.enabled is False
     assert config.peer.observation_seconds == 60.0
-    assert config.peer.observation_workers == 32
+    assert config.peer.max_checks == 600
+    assert config.peer.observation_workers == 120
     serialized = json.dumps(config_to_dict(config), ensure_ascii=False).casefold()
     assert "magnet:" not in serialized
     assert "tracker" not in serialized
@@ -82,7 +84,11 @@ def test_config_requires_exact_one_minute_peer_observation() -> None:
 
 def test_legacy_config_receives_presets_only_once() -> None:
     existing = Target(label="Bestehender Eintrag", info_hash=DEFAULT_TARGETS[0].info_hash)
-    legacy = AppConfig(targets=(existing,), preset_revision=0)
+    legacy = AppConfig(
+        targets=(existing,),
+        preset_revision=0,
+        peer=PeerSettings(max_checks=120, observation_workers=32),
+    )
 
     migrated = with_bundled_presets(legacy)
 
@@ -92,8 +98,46 @@ def test_legacy_config_receives_presets_only_once() -> None:
         DEFAULT_TARGETS[0].info_hash_hex,
         DEFAULT_TARGETS[1].info_hash_hex,
     ]
+    assert migrated.peer.max_checks == 600
+    assert migrated.peer.observation_workers == 120
     intentionally_reduced = replace(migrated, targets=(existing,))
     assert with_bundled_presets(intentionally_reduced) == intentionally_reduced
+
+
+def test_load_migrated_config_updates_legacy_peer_limits(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    legacy = AppConfig(
+        targets=DEFAULT_TARGETS,
+        preset_revision=2,
+        peer=PeerSettings(max_checks=120, observation_workers=32),
+    )
+    save_config(config_path, legacy)
+
+    migrated = load_migrated_config(config_path)
+
+    assert migrated.preset_revision == BUNDLED_PRESET_REVISION
+    assert migrated.peer.max_checks == 600
+    assert migrated.peer.observation_workers == 120
+    assert load_config(config_path) == migrated
+
+
+def test_limit_upgrade_preserves_revision_two_target_edits() -> None:
+    customized_target = Target(
+        label="Bewusst angepasste Bezeichnung",
+        info_hash=DEFAULT_TARGETS[0].info_hash,
+        source_note="Bewusst angepasster Hinweis",
+    )
+    existing = AppConfig(
+        targets=(customized_target,),
+        preset_revision=2,
+        peer=PeerSettings(max_checks=120, observation_workers=32),
+    )
+
+    migrated = with_bundled_presets(existing)
+
+    assert migrated.targets == (customized_target,)
+    assert migrated.peer.max_checks == 600
+    assert migrated.peer.observation_workers == 120
 
 
 def test_parse_magnet_discards_untrusted_display_name() -> None:
@@ -620,7 +664,7 @@ def test_scan_once_treats_reported_partial_problems_as_success(
         completed_at_utc="2026-10-20T10:00:01Z",
         errors=["Optionale Netzauskunft war nicht erreichbar"],
     )
-    monkeypatch.setattr(cli, "load_config", lambda _path: _config())
+    monkeypatch.setattr(cli, "load_migrated_config", lambda _path: _config())
     monkeypatch.setattr(monitor, "run_scan", lambda *_args, **_kwargs: fake_result)
 
     assert (

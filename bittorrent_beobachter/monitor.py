@@ -445,6 +445,7 @@ async def _verify_candidates(
     )
     if not selected:
         return []
+    progress(f"Direkte Peer-Prüfung gestartet: 0/{len(selected)} direkt geprüft")
 
     info_hashes = {target.info_hash_hex: target.info_hash for target in config.targets}
     verifier = PeerVerifier(
@@ -455,8 +456,10 @@ async def _verify_candidates(
     for index, candidate in enumerate(selected):
         work_queue.put_nowait((index, candidate))
     ordered: list[HandshakeResult | None] = [None] * len(selected)
+    completed_count = 0
 
     async def worker() -> None:
+        nonlocal completed_count
         while True:
             try:
                 index, candidate = work_queue.get_nowait()
@@ -472,6 +475,11 @@ async def _verify_candidates(
                     ordered[index] = _failed_handshake(candidate, exc)
             finally:
                 work_queue.task_done()
+                completed_count += 1
+                if completed_count == len(selected) or completed_count % 25 == 0:
+                    progress(
+                        f"Direkte Peer-Prüfung: {completed_count}/{len(selected)} direkt geprüft"
+                    )
 
     worker_count = min(config.peer.observation_workers, len(selected))
     await asyncio.gather(*(worker() for _ in range(worker_count)))
@@ -480,6 +488,7 @@ async def _verify_candidates(
     results = [item for item in ordered if item is not None]
     progress(
         "Direkte Peer-Pruefung abgeschlossen: "
+        f"{len(results)}/{len(selected)} direkt geprüft, "
         f"{sum(item.confirmed for item in results)} Handshake(s), "
         f"{sum(item.offering_observed for item in results)} Verfuegbarkeitsbeobachtung(en) "
         f"von {len(results)} Kandidat(en) bestaetigt"

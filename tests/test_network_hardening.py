@@ -13,7 +13,12 @@ import pytest
 import bittorrent_beobachter.dht as dht_module
 import bittorrent_beobachter.monitor as monitor_module
 import bittorrent_beobachter.peer as peer_module
-from bittorrent_beobachter.config import AppConfig, DhtSettings, EnrichmentSettings
+from bittorrent_beobachter.config import (
+    AppConfig,
+    DhtSettings,
+    EnrichmentSettings,
+    PeerSettings,
+)
 from bittorrent_beobachter.dht import (
     BOOTSTRAP_ISSUE_DNS,
     BOOTSTRAP_ISSUE_NO_GLOBAL_ADDRESS,
@@ -309,6 +314,92 @@ def test_handshake_selection_deduplicates_same_target_endpoint() -> None:
     )
 
     assert selected == [first]
+
+
+def test_all_six_hundred_discovered_candidates_are_checked() -> None:
+    async def scenario() -> None:
+        first_target = Target("Ziel 1", b"a" * 20)
+        second_target = Target("Ziel 2", b"b" * 20)
+        candidates = [
+            _candidate(
+                first_target,
+                ip=f"8.1.{index // 250}.{index % 250 + 1}",
+                port=10_000 + index,
+            )
+            for index in range(300)
+        ] + [
+            _candidate(
+                second_target,
+                ip=f"9.1.{index // 250}.{index % 250 + 1}",
+                port=20_000 + index,
+            )
+            for index in range(300)
+        ]
+        config = AppConfig(
+            targets=(first_target, second_target),
+            peer=PeerSettings(max_checks=600, observation_workers=120),
+        )
+        calls: list[tuple[str, str, int]] = []
+        progress: list[str] = []
+        active = 0
+        peak = 0
+
+        class FakeVerifier:
+            def __init__(self, **_kwargs: object) -> None:
+                pass
+
+            async def verify(
+                self,
+                candidate: PeerCandidate,
+                _info_hash: bytes,
+            ) -> HandshakeResult:
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                calls.append((candidate.info_hash_hex, candidate.ip, candidate.port))
+                await asyncio.sleep(0)
+                active -= 1
+                return _confirmed(candidate)
+
+        with patch.object(monitor_module, "PeerVerifier", new=FakeVerifier):
+            results = await monitor_module._verify_candidates(
+                config,
+                candidates,
+                progress.append,
+            )
+
+        assert len(results) == 600
+        assert len(calls) == 600
+        assert len(set(calls)) == 600
+        assert sum(key[0] == first_target.info_hash_hex for key in calls) == 300
+        assert sum(key[0] == second_target.info_hash_hex for key in calls) == 300
+        assert peak == 120
+        assert any("600/600 direkt geprüft" in message for message in progress)
+
+    asyncio.run(scenario())
+
+
+def test_default_scan_limits_fit_the_network_deadline() -> None:
+    config = AppConfig(
+        targets=(
+            Target("Ziel 1", b"a" * 20),
+            Target("Ziel 2", b"b" * 20),
+        )
+    )
+    bootstrap_seconds = config.dht.timeout_seconds
+    dht_seconds = (
+        len(config.targets)
+        * ((config.dht.max_queries + config.dht.alpha - 1) // config.dht.alpha)
+        * config.dht.timeout_seconds
+    )
+    peer_rounds = (
+        config.peer.max_checks + config.peer.observation_workers - 1
+    ) // config.peer.observation_workers
+    peer_seconds = peer_rounds * (4 * config.peer.timeout_seconds + config.peer.observation_seconds)
+
+    assert bootstrap_seconds + dht_seconds + peer_seconds < (
+        monitor_module.NETWORK_PHASE_TIMEOUT_SECONDS
+    )
 
 
 def test_monitor_caps_candidates_fairly_and_anonymizes_bootstrap_notices() -> None:

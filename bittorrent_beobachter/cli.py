@@ -21,6 +21,7 @@ from .config import (
     default_config_path,
     default_data_dir,
     load_config,
+    load_migrated_config,
     parse_magnet,
     save_config,
 )
@@ -233,13 +234,15 @@ def _initialize_config(args: argparse.Namespace, config_path: Path) -> int:
 def _scan_once(config_path: Path, data_dir: Path, logger: logging.Logger) -> int:
     from .monitor import run_scan
 
-    config = load_config(config_path)
+    config = load_migrated_config(config_path)
     logger.info("Prüflauf für %d Ziel(e) gestartet", len(config.targets))
     result = run_scan(config, data_dir, progress=logger.info)
     logger.info(
-        "Prüflauf beendet: %d DHT-Treffer, %d bestätigte Handshakes, "
-        "%d positive Verfügbarkeitsprüfungen, %d VPN-Treffer",
+        "Prüflauf beendet: %d DHT-Treffer, %d direkt geprüft, "
+        "%d bestätigte Handshakes, %d positive Verfügbarkeitsprüfungen, "
+        "%d VPN-Treffer",
         len(result.candidates),
+        len(result.handshakes),
         result.confirmed_count,
         result.offering_count,
         result.known_vpn_count,
