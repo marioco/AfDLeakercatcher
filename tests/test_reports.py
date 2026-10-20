@@ -1014,6 +1014,23 @@ class ReportGenerationTests(unittest.TestCase):
             self.assertTrue(source.exists())
             self.assertEqual(stat.S_IMODE(source.stat().st_mode), 0o600)
 
+    def test_sync_file_uses_writable_handle_for_windows_commit(self) -> None:
+        path = mock.MagicMock(spec=Path)
+        handle = mock.MagicMock()
+        handle.fileno.return_value = 23
+        context_manager = mock.MagicMock()
+        context_manager.__enter__.return_value = handle
+        path.open.return_value = context_manager
+
+        with (
+            mock.patch.object(reports_module.os, "name", "nt"),
+            mock.patch.object(reports_module.os, "fsync") as fsync,
+        ):
+            reports_module._sync_file(path)
+
+        path.open.assert_called_once_with("r+b")
+        fsync.assert_called_once_with(23)
+
     def test_failed_publish_never_leaves_a_stale_public_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
             root = Path(temp_name)

@@ -762,15 +762,16 @@ def test_low_disk_aborts_and_cleans_private_same_volume_index(
     def disk_usage(path: os.PathLike[str] | str) -> SimpleNamespace:
         checked_paths.append(Path(path))
         temporary_directories = tuple(evidence_dir.glob(".afdleakercatcher-recovery-*"))
-        if temporary_directories and os.name != "nt":
-            index_directory = temporary_directories[0]
-            index_file = index_directory / "run-bindings.sqlite3"
-            observed_modes.append(
-                (
-                    stat.S_IMODE(index_directory.stat().st_mode),
-                    stat.S_IMODE(index_file.stat().st_mode),
+        if temporary_directories:
+            if os.name != "nt":
+                index_directory = temporary_directories[0]
+                index_file = index_directory / "run-bindings.sqlite3"
+                observed_modes.append(
+                    (
+                        stat.S_IMODE(index_directory.stat().st_mode),
+                        stat.S_IMODE(index_file.stat().st_mode),
+                    )
                 )
-            )
             return SimpleNamespace(free=recovery_module.RECOVERY_MIN_FREE_SPACE_BYTES - 1)
         return SimpleNamespace(free=recovery_module.RECOVERY_MIN_FREE_SPACE_BYTES)
 

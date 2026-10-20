@@ -959,7 +959,11 @@ def _sync_directory(path: Path) -> None:
 
 
 def _sync_file(path: Path) -> None:
-    with path.open("rb") as handle:
+    # Windows implements fsync() via the CRT function _commit(), which rejects
+    # descriptors opened read-only with EBADF. A read/write handle is required
+    # there even though this function does not alter the already-written file.
+    mode = "r+b" if os.name == "nt" else "rb"
+    with path.open(mode) as handle:
         os.fsync(handle.fileno())
 
 
