@@ -193,6 +193,7 @@ class ScanResult:
     target_metrics: tuple[TargetScanMetrics, ...] = ()
     run_store_path: Path | None = None
     report_paths: list[Path] = field(default_factory=list)
+    cancelled: bool = False
     errors: list[str] = field(default_factory=list)
     notices: list[str] = field(default_factory=list)
 

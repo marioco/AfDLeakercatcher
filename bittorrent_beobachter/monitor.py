@@ -17,11 +17,12 @@ import sys
 import tempfile
 import time
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
 from typing import BinaryIO
 
 from . import APP_NAME, VERSION
@@ -54,6 +55,9 @@ from .run_store import RunStore
 from .tracker import TrackerDiscoveryStats, discover_tracker_peers
 
 ProgressCallback = Callable[[str], None]
+ReportsReadyCallback = Callable[[Path, int], None]
+EvidenceReadyCallback = Callable[[], Awaitable[None]]
+EvidenceBatchCallback = Callable[[int, int], None]
 PERSIST_BATCH_SIZE = 5
 PARALLEL_VERIFY_BATCHES = 8
 VERIFY_IDLE_POLL_SECONDS = 0.1
@@ -66,6 +70,10 @@ class MonitorError(RuntimeError):
 
 class MonitorAlreadyRunningError(MonitorError):
     """Eine andere Instanz besitzt bereits die betriebssystemweite Sperre."""
+
+
+class ScanCancelled(MonitorError):
+    """Der Benutzer hat den laufenden Prueflauf kontrolliert abgebrochen."""
 
 
 @dataclass(slots=True)
@@ -556,6 +564,7 @@ async def _verify_all_candidates(
     runtimes: dict[str, _TargetRuntimeMetrics],
     progress: ProgressCallback,
     producers_done: asyncio.Event | None = None,
+    evidence_ready: EvidenceReadyCallback | None = None,
 ) -> None:
     """Prueft alle persistierten Kandidaten fair und schreibt jeden Fuenferbatch."""
 
@@ -601,6 +610,10 @@ async def _verify_all_candidates(
                 store.store_handshake_batch(result_batch)
                 checked += len(result_batch)
                 progress(f"Direkte Peer-Pruefung: {checked} Kandidat(en) dauerhaft verarbeitet.")
+                if evidence_ready is not None and any(
+                    result.offering_observed for result in result_batch
+                ):
+                    await evidence_ready()
         except BaseException as exc:
             for task in tasks:
                 task.cancel()
@@ -635,6 +648,9 @@ async def _network_phase(
     data_dir: Path,
     runtimes: dict[str, _TargetRuntimeMetrics],
     progress: ProgressCallback,
+    *,
+    cancel_event: Event | None = None,
+    evidence_ready: EvidenceReadyCallback | None = None,
 ) -> list[str]:
     producers_done = asyncio.Event()
 
@@ -659,16 +675,35 @@ async def _network_phase(
             runtimes,
             progress,
             producers_done,
+            evidence_ready,
         )
     )
     tasks = (discovery_task, verification_task)
+    cancellation_task: asyncio.Task[None] | None = None
+    if cancel_event is not None:
+
+        async def cancel_network_when_requested() -> None:
+            while not cancel_event.is_set():
+                await asyncio.sleep(VERIFY_IDLE_POLL_SECONDS)
+            for task in tasks:
+                task.cancel()
+
+        cancellation_task = asyncio.create_task(cancel_network_when_requested())
     try:
         notices, _verification_result = await asyncio.gather(*tasks)
+    except asyncio.CancelledError as exc:
+        if cancel_event is not None and cancel_event.is_set():
+            raise ScanCancelled("Der Prueflauf wurde vom Benutzer abgebrochen.") from exc
+        raise
     except BaseException:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
+    finally:
+        if cancellation_task is not None:
+            cancellation_task.cancel()
+            await asyncio.gather(cancellation_task, return_exceptions=True)
     return notices
 
 
@@ -720,16 +755,18 @@ def _append_evidence_batch(
     )
 
 
-def _iter_offering_batches(store: RunStore) -> Iterator[tuple[HandshakeResult, ...]]:
+def _iter_offering_batches(
+    store: RunStore,
+    *,
+    full_batches_only: bool = False,
+) -> Iterator[tuple[HandshakeResult, ...]]:
     batch: list[HandshakeResult] = []
-    for handshake in store.iter_handshake_results(batch_size=PERSIST_BATCH_SIZE):
-        if not handshake.offering_observed:
-            continue
+    for handshake in store.iter_unpersisted_offering_handshakes(batch_size=PERSIST_BATCH_SIZE):
         batch.append(handshake)
         if len(batch) == PERSIST_BATCH_SIZE:
             yield tuple(batch)
             batch.clear()
-    if batch:
+    if batch and not full_batches_only:
         yield tuple(batch)
 
 
@@ -743,6 +780,8 @@ def _persist_all_evidence(
     *,
     config_sha256: str,
     software_sha256: str,
+    full_batches_only: bool = False,
+    batch_persisted: EvidenceBatchCallback | None = None,
 ) -> int:
     """Reichert jeden positiven Befund an und persistiert ihn sofort in Fuenferbatches."""
 
@@ -762,10 +801,10 @@ def _persist_all_evidence(
             max_retries=0,
         )
 
-    stored = 0
+    stored = store.evidence_count()
     known_vpn_count = 0
     enrichment_failures: Counter[str] = Counter()
-    for handshake_batch in _iter_offering_batches(store):
+    for handshake_batch in _iter_offering_batches(store, full_batches_only=full_batches_only):
         enriched_batch: list[tuple[NetworkEnrichment, VpnClassification]] = []
         for handshake in handshake_batch:
             ip = handshake.candidate.ip
@@ -796,7 +835,8 @@ def _persist_all_evidence(
                     enrichment_failures["unvollstaendig"] += 1
             enriched_batch.append((network_data, classifier.classify(network_data)))
 
-        known_vpn_count += sum(vpn.status == "known_vpn" for _network_data, vpn in enriched_batch)
+        batch_vpn_count = sum(vpn.status == "known_vpn" for _data, vpn in enriched_batch)
+        known_vpn_count += batch_vpn_count
         _enforce_storage_capacity(data_dir)
         records = _append_evidence_batch(
             journal,
@@ -809,6 +849,8 @@ def _persist_all_evidence(
         store.store_evidence_batch(records)
         stored += len(records)
         progress(f"{stored} positive Befund(e) dauerhaft als Evidenz gespeichert.")
+        if batch_persisted is not None:
+            batch_persisted(len(records), batch_vpn_count)
 
     if enrichment_failures:
         total = sum(enrichment_failures.values())
@@ -817,6 +859,23 @@ def _persist_all_evidence(
             "nicht erreichbar; die technischen Beobachtungen wurden dennoch gespeichert."
         )
     return known_vpn_count
+
+
+def _refresh_result_metrics(
+    result: ScanResult,
+    config: AppConfig,
+    store: RunStore,
+    runtimes: dict[str, _TargetRuntimeMetrics],
+) -> None:
+    result.target_metrics = _build_target_metrics(config, store, runtimes)
+    result.candidate_count = sum(item.candidates_discovered for item in result.target_metrics)
+    result.handshake_count = sum(item.candidates_checked for item in result.target_metrics)
+    result.confirmed_handshake_count = sum(
+        item.confirmed_handshakes for item in result.target_metrics
+    )
+    result.offering_observation_count = sum(
+        item.positive_findings for item in result.target_metrics
+    )
 
 
 def _build_target_metrics(
@@ -871,6 +930,9 @@ def _run_scan_locked_impl(
     data_dir: Path,
     progress: ProgressCallback,
     failure_state: list[tuple[EvidenceJournal, str, str, str, Path]],
+    *,
+    cancel_event: Event | None = None,
+    reports_ready: ReportsReadyCallback | None = None,
 ) -> ScanResult:
     _enforce_storage_capacity(data_dir)
     run_id = _new_run_id()
@@ -888,6 +950,8 @@ def _run_scan_locked_impl(
     runtimes = {
         target.info_hash_hex: _TargetRuntimeMetrics(target=target) for target in config.targets
     }
+    reports_dir = _ensure_private_directory(data_dir / "reports", app_owned=True)
+    output_dir = _ensure_private_directory(reports_dir / run_id, app_owned=True)
 
     journal_path = evidence_dir / "events.jsonl"
     journal = EvidenceJournal(journal_path)
@@ -917,8 +981,60 @@ def _run_scan_locked_impl(
     _ensure_private_file(journal_path)
     failure_state.append((journal, run_id, config_hash, software_hash, journal_path))
 
+    def publish_report_snapshot(batch_count: int, batch_vpn_count: int) -> None:
+        result.known_vpn_total += batch_vpn_count
+        _refresh_result_metrics(result, config, store, runtimes)
+        generated_paths = generate_reports(
+            result,
+            output_dir,
+            _report_config(config),
+            generated_at_utc=_utc_now_text(),
+        )
+        for path in generated_paths:
+            _ensure_private_file(path)
+        evidence_count = store.evidence_count()
+        progress(
+            f"{evidence_count} positive Befund(e) sind fertig im Ergebnisordner "
+            f"gespeichert (+{batch_count})."
+        )
+        if reports_ready is not None:
+            reports_ready(output_dir, evidence_count)
+
+    async def persist_ready_batches() -> None:
+        await asyncio.to_thread(
+            _persist_all_evidence,
+            config,
+            data_dir,
+            store,
+            journal,
+            result,
+            progress,
+            config_sha256=config_hash,
+            software_sha256=software_hash,
+            full_batches_only=True,
+            batch_persisted=publish_report_snapshot,
+        )
+
+    network_notices: list[str] = []
     try:
-        network_notices = asyncio.run(_network_phase(config, store, data_dir, runtimes, progress))
+        network_notices = asyncio.run(
+            _network_phase(
+                config,
+                store,
+                data_dir,
+                runtimes,
+                progress,
+                cancel_event=cancel_event,
+                evidence_ready=persist_ready_batches,
+            )
+        )
+    except ScanCancelled:
+        result.cancelled = True
+        result.notices.append(
+            "Der Prueflauf wurde kontrolliert abgebrochen; alle bis dahin "
+            "gefundenen positiven Befunde wurden fertig ausgegeben."
+        )
+        progress("Prueflauf wird kontrolliert beendet; Restbefunde werden gespeichert.")
     except TimeoutError as exc:
         raise MonitorError("Eine einzelne Netzwerkoperation ueberschritt ihr Zeitlimit.") from exc
     except OSError as exc:
@@ -926,7 +1042,7 @@ def _run_scan_locked_impl(
             "Die Peer-Suche oder Direktpruefung scheiterte wegen eines Netzwerkfehlers."
         ) from exc
     result.notices.extend(network_notices)
-    result.known_vpn_total = _persist_all_evidence(
+    _persist_all_evidence(
         config,
         data_dir,
         store,
@@ -935,21 +1051,14 @@ def _run_scan_locked_impl(
         progress,
         config_sha256=config_hash,
         software_sha256=software_hash,
+        batch_persisted=lambda _count, vpn_count: setattr(
+            result, "known_vpn_total", result.known_vpn_total + vpn_count
+        ),
     )
-    result.target_metrics = _build_target_metrics(config, store, runtimes)
-    result.candidate_count = sum(item.candidates_discovered for item in result.target_metrics)
-    result.handshake_count = sum(item.candidates_checked for item in result.target_metrics)
-    result.confirmed_handshake_count = sum(
-        item.confirmed_handshakes for item in result.target_metrics
-    )
-    result.offering_observation_count = sum(
-        item.positive_findings for item in result.target_metrics
-    )
+    _refresh_result_metrics(result, config, store, runtimes)
 
     result.completed_at_utc = _utc_now_text()
     _enforce_storage_capacity(data_dir)
-    reports_dir = _ensure_private_directory(data_dir / "reports", app_owned=True)
-    output_dir = _ensure_private_directory(reports_dir / run_id, app_owned=True)
     generated_paths = generate_reports(
         result,
         output_dir,
@@ -960,12 +1069,15 @@ def _run_scan_locked_impl(
         if path not in result.report_paths:
             result.report_paths.append(path)
         _ensure_private_file(path)
+    if reports_ready is not None:
+        reports_ready(output_dir, store.evidence_count())
 
     manifest_path = generated_paths[-1]
+    terminal_event = "scan_cancelled" if result.cancelled else "scan_completed"
 
     journal.append(
         {
-            "event_type": "scan_completed",
+            "event_type": terminal_event,
             "run_id": run_id,
             "config_sha256": config_hash,
             "software_sha256": software_hash,
@@ -986,7 +1098,10 @@ def _run_scan_locked_impl(
     )
     _ensure_private_file(journal_path)
     failure_state.clear()
-    progress(f"Prueflauf {run_id} abgeschlossen.")
+    if result.cancelled:
+        progress(f"Prueflauf {run_id} kontrolliert abgebrochen; vorhandene Ergebnisse sind fertig.")
+    else:
+        progress(f"Prueflauf {run_id} abgeschlossen.")
     return result
 
 
@@ -994,10 +1109,20 @@ def _run_scan_locked(
     config: AppConfig,
     data_dir: Path,
     progress: ProgressCallback,
+    *,
+    cancel_event: Event | None = None,
+    reports_ready: ReportsReadyCallback | None = None,
 ) -> ScanResult:
     failure_state: list[tuple[EvidenceJournal, str, str, str, Path]] = []
     try:
-        return _run_scan_locked_impl(config, data_dir, progress, failure_state)
+        return _run_scan_locked_impl(
+            config,
+            data_dir,
+            progress,
+            failure_state,
+            cancel_event=cancel_event,
+            reports_ready=reports_ready,
+        )
     except BaseException as exc:
         if failure_state:
             journal, run_id, config_hash, software_hash, journal_path = failure_state[0]
@@ -1029,6 +1154,8 @@ def run_scan(
     data_dir: Path,
     *,
     progress: ProgressCallback | None = None,
+    cancel_event: Event | None = None,
+    reports_ready: ReportsReadyCallback | None = None,
 ) -> ScanResult:
     """Fuehrt einen gesperrten, konvergierenden und speicherschonenden Prueflauf aus."""
 
@@ -1051,4 +1178,10 @@ def run_scan(
     _ensure_private_directory(runtime_dir, app_owned=True)
     callback = progress or (lambda _message: None)
     with single_instance_lock(runtime_dir / "monitor.lock"):
-        return _run_scan_locked(validated_config, runtime_dir, callback)
+        return _run_scan_locked(
+            validated_config,
+            runtime_dir,
+            callback,
+            cancel_event=cancel_event,
+            reports_ready=reports_ready,
+        )

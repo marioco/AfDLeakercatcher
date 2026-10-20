@@ -177,9 +177,10 @@ def test_parse_magnet_ignores_display_name_but_keeps_udp_tracker() -> None:
 
 def _install_run_fake(
     monkeypatch: pytest.MonkeyPatch,
-) -> tuple[list[str], list[int]]:
+) -> tuple[list[str], list[int], list[int]]:
     enrichment_calls: list[str] = []
     persisted_batches: list[int] = []
+    report_generations: list[int] = []
 
     async def fake_network_phase(
         config: AppConfig,
@@ -187,7 +188,11 @@ def _install_run_fake(
         _data_dir: Path,
         runtimes: dict[str, Any],
         _progress: Any,
+        *,
+        cancel_event: Any = None,
+        evidence_ready: Any = None,
     ) -> list[str]:
+        assert cancel_event is None
         candidates = [
             *(_candidate(config.targets[0], index) for index in range(4)),
             *(_candidate(config.targets[1], 100 + index) for index in range(4)),
@@ -207,6 +212,8 @@ def _install_run_fake(
             store.store_handshake_batch(results)
             for candidate in batch:
                 runtimes[candidate.info_hash_hex].verification_attempts += 1
+            if evidence_ready is not None:
+                await evidence_ready()
         return []
 
     class FakeEnricher:
@@ -231,6 +238,7 @@ def _install_run_fake(
         generated_at_utc: str,
     ) -> list[Path]:
         assert generated_at_utc.endswith("Z")
+        report_generations.append(_result.offering_count)
         output_dir.mkdir(parents=True, exist_ok=True)
         report = output_dir / "bericht.pdf"
         report.write_bytes(b"offline-test")
@@ -240,14 +248,15 @@ def _install_run_fake(
     monkeypatch.setattr(monitor, "NetworkEnricher", FakeEnricher)
     monkeypatch.setattr(monitor, "generate_reports", fake_generate_reports)
     monkeypatch.setattr(monitor, "_software_sha256", lambda: "ef" * 32)
-    return enrichment_calls, persisted_batches
+    return enrichment_calls, persisted_batches, report_generations
 
 
 def test_run_scan_persists_batches_and_keeps_large_lists_empty(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    enrichment_calls, handshake_batches = _install_run_fake(monkeypatch)
+    enrichment_calls, handshake_batches, report_generations = _install_run_fake(monkeypatch)
+    ready_events: list[tuple[Path, int]] = []
     journal_batch_sizes: list[int] = []
     original_append_many = EvidenceJournal.append_many
 
@@ -266,7 +275,11 @@ def test_run_scan_persists_batches_and_keeps_large_lists_empty(
         )
 
     monkeypatch.setattr(EvidenceJournal, "append_many", recording_append_many)
-    result = run_scan(_config(), tmp_path)
+    result = run_scan(
+        _config(),
+        tmp_path,
+        reports_ready=lambda path, count: ready_events.append((path, count)),
+    )
 
     assert result.total_candidate_count == 8
     assert result.total_handshake_count == 8
@@ -283,6 +296,8 @@ def test_run_scan_persists_batches_and_keeps_large_lists_empty(
     assert len(records) == 8
     assert store.evidence_count() == 8
     assert journal_batch_sizes == [1, 5, 3, 1]
+    assert report_generations == [5, 8]
+    assert [count for _path, count in ready_events] == [5, 8]
     assert len(enrichment_calls) == 4
     assert {item.info_hash_hex for item in result.target_metrics} == {
         HASH_A.hex(),
@@ -329,6 +344,53 @@ def test_disabled_enrichment_never_constructs_network_client(
         record.vpn.status == "known_vpn" or "deaktiviert" in (record.enrichment.error or "")
         for record in records
     )
+
+
+def test_controlled_cancel_flushes_partial_batch_and_writes_final_reports(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_run_fake(monkeypatch)
+    cancel_event = monitor.Event()
+    cancel_event.set()
+
+    async def fake_cancelled_network(
+        config: AppConfig,
+        store: RunStore,
+        _data_dir: Path,
+        runtimes: dict[str, Any],
+        _progress: Any,
+        *,
+        cancel_event: Any,
+        evidence_ready: Any,
+    ) -> list[str]:
+        assert cancel_event.is_set()
+        candidates = tuple(_candidate(config.targets[0], index) for index in range(3))
+        store.add_candidates(candidates)
+        batch = store.claim_candidate_batch((config.targets[0].info_hash_hex,), size=5)
+        results = tuple(_handshake(candidate) for candidate in batch)
+        store.store_handshake_batch(results)
+        runtimes[config.targets[0].info_hash_hex].verification_attempts += len(results)
+        await evidence_ready()
+        raise monitor.ScanCancelled("abgebrochen")
+
+    monkeypatch.setattr(monitor, "_network_phase", fake_cancelled_network)
+    result = run_scan(
+        _config(enrichment_enabled=False),
+        tmp_path,
+        cancel_event=cancel_event,
+    )
+
+    assert result.cancelled is True
+    assert result.offering_count == 3
+    assert result.run_store_path is not None
+    assert RunStore(result.run_store_path).evidence_count() == 3
+    assert result.report_paths[0].is_file()
+    events = [
+        json.loads(line)["event"]["event_type"]
+        for line in (tmp_path / "evidence" / "events.jsonl").read_text().splitlines()
+    ]
+    assert events[-1] == "scan_cancelled"
 
 
 def test_corrupt_journal_aborts_before_network(

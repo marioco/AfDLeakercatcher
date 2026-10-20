@@ -143,10 +143,12 @@ def _runtime_app(tmp_path: Path, config: AppConfig | None = None) -> Any:
     app._progress_event_lock = threading.Lock()
     app.running = False
     app.scan_thread = None
+    app.cancel_event = threading.Event()
     app.close_requested = False
     app.latest_output_dir = None
     app.config = config or AppConfig(targets=DEFAULT_TARGETS)
     app.scan_button = _WidgetDouble()
+    app.cancel_button = _WidgetDouble()
     app.open_button = _WidgetDouble()
     app.progress = _WidgetDouble()
     app.result_tree = _WidgetDouble()
@@ -679,6 +681,7 @@ def test_start_scan_is_explicit_and_disables_mutating_controls(
 
     assert app.running is True
     assert app.scan_button.options["state"] == "disabled"
+    assert app.cancel_button.options["state"] == "normal"
     assert all(control.options["state"] == "disabled" for control in app.config_controls)
     assert app.open_button.options["state"] == "disabled"
     assert app.progress.started is True
@@ -875,6 +878,7 @@ def test_finish_restores_previous_report_button_after_failed_retry(tmp_path: Pat
 
     assert app.running is False
     assert app.scan_button.options["state"] == "normal"
+    assert app.cancel_button.options["state"] == "disabled"
     assert all(control.options["state"] == "normal" for control in app.config_controls)
     assert app.open_button.options["state"] == "normal"
     assert app.progress.stopped is True
@@ -898,7 +902,28 @@ def test_window_close_is_immediate_when_idle_and_deferred_when_running(
     monkeypatch.setattr(gui.messagebox, "askyesno", lambda *_args, **_kwargs: True, raising=False)
     running._request_close()
     assert running.close_requested is True
-    assert "schließt nach dem Abschluss" in running.status_text.value
+    assert running.cancel_event.is_set()
+    assert "kontrolliert abgebrochen" in running.status_text.value
+
+
+def test_cancel_and_incremental_reports_are_visible_immediately(tmp_path: Path) -> None:
+    app = _runtime_app(tmp_path)
+    app.running = True
+
+    output_dir = tmp_path / "data" / "reports" / "lauf"
+    output_dir.mkdir(parents=True)
+    app._publish_reports_ready(output_dir, 5)
+    app._poll_events()
+
+    assert app.latest_output_dir == output_dir
+    assert app.open_button.options["state"] == "normal"
+    assert "5 positive Befund" in app.status_text.value
+    assert app.running is True
+
+    app._cancel_scan()
+    assert app.cancel_event.is_set()
+    assert app.cancel_button.options["state"] == "disabled"
+    assert "kontrolliert abgebrochen" in app.status_text.value
 
 
 def test_technical_notice_updates_status_without_warning_popup(

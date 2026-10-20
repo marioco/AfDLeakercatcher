@@ -1093,3 +1093,30 @@ class RunStore:
     def _validate_batch_size(batch_size: int) -> None:
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
             raise ValueError("batch_size muss eine positive Ganzzahl sein.")
+
+    def iter_unpersisted_offering_handshakes(
+        self,
+        *,
+        batch_size: int = 5,
+    ) -> Iterator[HandshakeResult]:
+        """Liest positive Handshakes, fuer die noch keine Evidenz gespeichert ist."""
+
+        self._validate_batch_size(batch_size)
+        connection = self._connect()
+        try:
+            cursor = connection.execute(
+                """
+                SELECT h.result_json
+                FROM handshake_results AS h
+                LEFT JOIN evidence_records AS e ON e.candidate_id = h.candidate_id
+                WHERE h.offering_observed = 1 AND e.candidate_id IS NULL
+                ORDER BY h.candidate_id
+                """
+            )
+            while rows := cursor.fetchmany(batch_size):
+                for row in rows:
+                    yield _handshake_from_mapping(
+                        _decode_json(str(row["result_json"]), "result_json")
+                    )
+        finally:
+            connection.close()

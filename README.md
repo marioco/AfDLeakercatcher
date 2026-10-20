@@ -36,7 +36,11 @@ höchstens drei Versuche.
 
 Kandidaten und Ergebnisse werden fortlaufend in Fünferpaketen in einer privaten lokalen
 SQLite-Laufdatenbank gespeichert; die vollständige Treffermenge wird dadurch nicht im
-Arbeitsspeicher gehalten. Das letzte Paket darf weniger als fünf Einträge enthalten.
+Arbeitsspeicher gehalten. Nach jeweils fünf positiven Befunden werden sofort fertige
+PDF-, E-Mail- und CSV-Ergebnisse im Ergebnisordner aktualisiert. Der Ordner kann bereits
+während der weiteren Suche geöffnet werden. Über **Prüflauf abbrechen** lässt sich die
+Suche kontrolliert beenden; der letzte Restblock und alle bisherigen Ergebnisse werden
+fertig gespeichert. Das letzte Paket darf weniger als fünf Einträge enthalten.
 Diese fortlaufende Speicherung ist keine automatische Wiederaufnahme: Nach einem
 Programmneustart beginnt ein neuer Prüflauf. Die private SQLite-Datenbank eines
 unterbrochenen Laufs bleibt lokal erhalten, wird derzeit aber nicht automatisch

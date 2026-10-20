@@ -1149,6 +1149,12 @@ def _write_summary_pdf(
         _key_value_table(
             (
                 ("Lauf-ID", result.run_id),
+                (
+                    "Laufstatus",
+                    "kontrolliert abgebrochen"
+                    if result.cancelled
+                    else ("abgeschlossen" if result.completed_at_utc else "läuft"),
+                ),
                 ("Beginn (UTC)", result.started_at_utc),
                 ("Abschluss (UTC)", result.completed_at_utc or "nicht abgeschlossen"),
                 ("Bericht erstellt (UTC)", generated_at_utc),

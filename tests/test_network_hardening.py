@@ -842,3 +842,51 @@ def test_network_phase_checks_fresh_candidate_before_discovery_finishes(
         assert metric.offering_observed == 1
 
     asyncio.run(scenario())
+
+
+def test_network_phase_cancels_discovery_and_verification_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from bittorrent_beobachter.run_store import RunStore
+
+    async def scenario() -> None:
+        target = Target("Ziel", INFO_HASH)
+        config = AppConfig(targets=(target,))
+        store = RunStore(tmp_path / "cancel.sqlite3")
+        stopped: list[str] = []
+
+        async def wait_forever(*_args: object, **_kwargs: object) -> list[str]:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.append("discovery")
+            return []
+
+        async def verify_forever(*_args: object, **_kwargs: object) -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.append("verification")
+
+        monkeypatch.setattr(monitor_module, "_discover_candidates_to_store", wait_forever)
+        monkeypatch.setattr(monitor_module, "_verify_all_candidates", verify_forever)
+        cancel_event = monitor_module.Event()
+        task = asyncio.create_task(
+            monitor_module._network_phase(
+                config,
+                store,
+                tmp_path,
+                {target.info_hash_hex: monitor_module._TargetRuntimeMetrics(target=target)},
+                lambda _message: None,
+                cancel_event=cancel_event,
+            )
+        )
+        await asyncio.sleep(0)
+        cancel_event.set()
+
+        with pytest.raises(monitor_module.ScanCancelled):
+            await asyncio.wait_for(task, timeout=1.0)
+        assert sorted(stopped) == ["discovery", "verification"]
+
+    asyncio.run(scenario())

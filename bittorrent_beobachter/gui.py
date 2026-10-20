@@ -154,6 +154,7 @@ class ObserverApp:
         self._progress_event_lock = threading.Lock()
         self.running = False
         self.scan_thread: threading.Thread | None = None
+        self.cancel_event = threading.Event()
         self.close_requested = False
         self.latest_output_dir: Path | None = None
         self.config = self._load_initial_config()
@@ -309,6 +310,13 @@ class ObserverApp:
             command=self._start_scan,
         )
         self.scan_button.pack(side=LEFT)
+        self.cancel_button = ttk.Button(
+            action_bar,
+            text="Prüflauf abbrechen",
+            command=self._cancel_scan,
+            state="disabled",
+        )
+        self.cancel_button.pack(side=LEFT, padx=(8, 0))
         self.open_button = ttk.Button(
             action_bar,
             text="Letzten Ergebnisordner öffnen",
@@ -518,8 +526,10 @@ class ObserverApp:
             return
 
         self.running = True
+        self.cancel_event.clear()
         config_snapshot = self.config
         self.scan_button.configure(state="disabled")
+        self.cancel_button.configure(state="normal")
         for control in self.config_controls:
             control.configure(state="disabled")
         self.open_button.configure(state="disabled")
@@ -543,6 +553,8 @@ class ObserverApp:
                 config_snapshot,
                 self.data_dir,
                 progress=self._publish_progress,
+                cancel_event=self.cancel_event,
+                reports_ready=self._publish_reports_ready,
             )
         except Exception as exc:
             logging.getLogger("bittorrent_beobachter").exception("GUI-Prüflauf fehlgeschlagen")
@@ -557,6 +569,9 @@ class ObserverApp:
             with suppress(queue.Empty):
                 self.progress_events.get_nowait()
             self.progress_events.put_nowait(str(message))
+
+    def _publish_reports_ready(self, output_dir: Path, result_count: int) -> None:
+        self.events.put_nowait(("reports_ready", (Path(output_dir), int(result_count))))
 
     def _discard_pending_progress(self) -> None:
         """Entfernt den aktuell vorgemerkten Fortschritt, sofern vorhanden."""
@@ -585,6 +600,15 @@ class ObserverApp:
                     self._finish_running_state()
                 else:
                     self._show_result(payload)
+            elif event == "reports_ready":
+                output_dir, result_count = payload
+                self.latest_output_dir = Path(output_dir)
+                self.open_button.configure(state="normal")
+                if not self.close_requested:
+                    self.status_text.set(
+                        f"{result_count} positive Befund(e) sind bereits fertig gespeichert. "
+                        "Der Prüflauf sucht weiter."
+                    )
 
         try:
             latest_progress = self.progress_events.get_nowait()
@@ -607,10 +631,21 @@ class ObserverApp:
         self.scan_thread = None
         self.progress.stop()
         self.scan_button.configure(state="normal")
+        self.cancel_button.configure(state="disabled")
         for control in self.config_controls:
             control.configure(state="normal")
         output_available = self.latest_output_dir is not None and self.latest_output_dir.is_dir()
         self.open_button.configure(state="normal" if output_available else "disabled")
+
+    def _cancel_scan(self) -> None:
+        if not self.running or self.cancel_event.is_set():
+            return
+        self.cancel_event.set()
+        self.cancel_button.configure(state="disabled")
+        self.status_text.set(
+            "Prüflauf wird kontrolliert abgebrochen; gefundene Ergebnisse "
+            "werden fertig gespeichert."
+        )
 
     def _request_close(self) -> None:
         if not self.running:
@@ -619,14 +654,13 @@ class ObserverApp:
         if messagebox.askyesno(
             "Prüflauf noch aktiv",
             (
-                "Der laufende Prüflauf wird kontrolliert zu Ende geführt, damit "
-                "Journal und Berichte nicht beschädigt werden. Soll das Fenster "
-                "danach geschlossen werden?"
+                "Der laufende Prüflauf wird kontrolliert abgebrochen. Bereits gefundene "
+                "Ergebnisse werden fertig gespeichert. Soll das Fenster danach schließen?"
             ),
             parent=self.root,
         ):
             self.close_requested = True
-            self.status_text.set("Prüflauf läuft weiter; das Fenster schließt nach dem Abschluss.")
+            self._cancel_scan()
 
     def _show_result(self, result: ScanResult) -> None:
         self._finish_running_state()
@@ -687,7 +721,14 @@ class ObserverApp:
         else:
             display_suffix = " Die Ergebnistabelle enthält keine positiven Befunde."
         target_suffix = _target_status_text(result)
-        if result.total_candidate_count == 0 and not result.errors:
+        if result.cancelled:
+            self.status_text.set(
+                f"Kontrolliert abgebrochen: {result.total_candidate_count} Kandidaten gefunden, "
+                f"{result.total_handshake_count} direkt geprüft und {result.offering_count} "
+                "positive Befunde fertig gespeichert."
+                f"{display_suffix}{target_suffix}{notice_suffix}"
+            )
+        elif result.total_candidate_count == 0 and not result.errors:
             self.status_text.set(
                 "Fertig. Zurzeit wurden keine antwortenden Endpunkte gefunden. "
                 f"Das ist kein Programmfehler.{display_suffix}{target_suffix}{notice_suffix}"
