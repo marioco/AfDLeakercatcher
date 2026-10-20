@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bittorrent-beobachter"
-version = "0.3.2"
+version = "0.3.3"
 description = "Inhaltsfreie Verfügbarkeitsprüfung ausdrücklich konfigurierter BitTorrent-Schwärme"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
-authors = [{ name = "BitTorrent-Beobachter contributors" }]
+authors = [{ name = "AfDLeakerCatcher contributors" }]
 dependencies = [
     "reportlab==4.5.1",
 ]
@@ -24,6 +24,7 @@ classifiers = [
 ]
 
 [project.scripts]
+afdleakercatcher = "bittorrent_beobachter.cli:main"
 bittorrent-beobachter = "bittorrent_beobachter.cli:main"
 
 [project.optional-dependencies]

@@ -1,7 +1,7 @@
 # Hinweise zu Drittkomponenten
 
 Das Windows-Paket enthält neben dem unter der MIT-Lizenz veröffentlichten
-BitTorrent-Beobachter die folgenden Laufzeit- und Build-Komponenten. Ihre
+AfDLeakerCatcher die folgenden Laufzeit- und Build-Komponenten. Ihre
 vollständigen, unveränderten Lizenz- und Hinweisdateien liegen direkt
 im Paket unter `THIRD_PARTY_LICENSES`:
 

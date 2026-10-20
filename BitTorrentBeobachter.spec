@@ -33,7 +33,7 @@ executable = EXE(
     analysis.scripts,
     [],
     exclude_binaries=True,
-    name="BitTorrent-Beobachter",
+    name="AfDLeakerCatcher",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -48,5 +48,5 @@ bundle = COLLECT(
     analysis.datas,
     strip=False,
     upx=False,
-    name="BitTorrent-Beobachter",
+    name="AfDLeakerCatcher",
 )

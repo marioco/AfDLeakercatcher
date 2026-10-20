@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Startet Oberfläche oder Kommandozeile des BitTorrent-Beobachters."""
+"""Startet Oberfläche oder Kommandozeile von AfDLeakerCatcher."""
 
 from __future__ import annotations
 

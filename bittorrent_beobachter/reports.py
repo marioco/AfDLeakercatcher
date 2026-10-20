@@ -28,6 +28,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TextIO
 
+from . import APP_NAME
 from .models import EvidenceRecord, PeerCandidate, ScanResult
 from .run_store import RunStore
 
@@ -1189,8 +1190,8 @@ def _build_pdf(
         width, height = toolkit.A4
         canvas.saveState()
         canvas.setTitle(title)
-        canvas.setCreator("BitTorrent-Beobachter")
-        canvas.setAuthor(config.reporter_name.strip() or "BitTorrent-Beobachter")
+        canvas.setCreator(APP_NAME)
+        canvas.setAuthor(config.reporter_name.strip() or APP_NAME)
         canvas.setFont("Helvetica", 7)
         canvas.setFillColor(toolkit.colors.HexColor("#5B6670"))
         canvas.drawString(margin, height - 11 * toolkit.mm, title[:88])
@@ -1789,8 +1790,8 @@ def _write_vpn_pdf(
         pageCompression=0,
     )
     canvas.setTitle(title)
-    canvas.setCreator("BitTorrent-Beobachter")
-    canvas.setAuthor(config.reporter_name.strip() or "BitTorrent-Beobachter")
+    canvas.setCreator(APP_NAME)
+    canvas.setAuthor(config.reporter_name.strip() or APP_NAME)
     page = 0
     y = 0.0
 

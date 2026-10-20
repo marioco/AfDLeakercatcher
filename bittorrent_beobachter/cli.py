@@ -90,7 +90,7 @@ def setup_logging(log_file: Path) -> logging.Logger:
 def build_parser() -> argparse.ArgumentParser:
     """Erzeugt eine Oberfläche, die ohne Argumente direkt die GUI startet."""
     parser = argparse.ArgumentParser(
-        prog="bittorrent-beobachter",
+        prog=APP_NAME,
         description=(
             "Inhaltsfreie Beobachtung ausdrücklich konfigurierter BitTorrent-Infohashes. "
             "Ohne Unterbefehl wird die Desktop-Oberfläche geöffnet. Nicht anonym: "

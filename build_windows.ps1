@@ -198,7 +198,7 @@ Invoke-CheckedPython -Arguments @(
     "-m", "PyInstaller", "--clean", "--noconfirm", "BitTorrentBeobachter.spec"
 )
 
-$PackageDirectory = Join-Path $ProjectRoot "dist/BitTorrent-Beobachter"
+$PackageDirectory = Join-Path $ProjectRoot "dist/AfDLeakerCatcher"
 if (-not (Test-Path -LiteralPath $PackageDirectory -PathType Container)) {
     throw "PyInstaller hat das erwartete Paketverzeichnis nicht erstellt: $PackageDirectory"
 }
@@ -228,7 +228,7 @@ if ($ActualPdfHash -ne $ExpectedPdfHash) {
 }
 Copy-Item -LiteralPath $PdfSource `
     -Destination (Join-Path $PackageDirectory $PdfName) -Force
-$Checksums = @("BitTorrent-Beobachter.exe", $PdfName) | ForEach-Object {
+$Checksums = @("AfDLeakerCatcher.exe", $PdfName) | ForEach-Object {
     $FilePath = Join-Path $PackageDirectory $_
     $FileHash = (
         Get-FileHash -Algorithm SHA256 -LiteralPath $FilePath
@@ -239,7 +239,7 @@ $Checksums | Set-Content -Encoding ascii (
     Join-Path $PackageDirectory "SHA256SUMS.txt"
 )
 
-$Archive = Join-Path $ProjectRoot "dist/AfDLeakercatcher-Windows-x64.zip"
+$Archive = Join-Path $ProjectRoot "dist/AfDLeakerCatcher-Windows-x64.zip"
 if (Test-Path -LiteralPath $Archive) {
     Remove-Item -LiteralPath $Archive -Force
 }
@@ -256,7 +256,7 @@ $Hash = (
 ).Hash.ToLowerInvariant()
 [IO.File]::WriteAllText(
     "$Archive.sha256",
-    "$Hash  AfDLeakercatcher-Windows-x64.zip`n",
+    "$Hash  AfDLeakerCatcher-Windows-x64.zip`n",
     [Text.Encoding]::ASCII
 )
 

@@ -8,11 +8,14 @@ import tomllib
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PRODUCT_NAME = "AfDLeakerCatcher"
+EXE_NAME = f"{PRODUCT_NAME}.exe"
+PACKAGE_DIRECTORY = f"dist/{PRODUCT_NAME}"
 PDF_NAME = "Cybercrime-E-Mail-Kontakte_BKA-und-LKA_Deutschland_Stand-2026-10-20.pdf"
 PDF_SHA256 = "75585bb562b705f5644734299f78d1b26f1bd083a4acd962d21704041feb2f12"
-ARCHIVE_NAME = "AfDLeakercatcher-Windows-x64.zip"
+ARCHIVE_NAME = f"{PRODUCT_NAME}-Windows-x64.zip"
 CHECKSUM_NAME = f"{ARCHIVE_NAME}.sha256"
-RELEASE_ARTIFACT_NAME = "AfDLeakercatcher-Windows-x64-release"
+RELEASE_ARTIFACT_NAME = f"{PRODUCT_NAME}-Windows-x64-release"
 EXPECTED_LICENSE_HASHES = {
     "Python-3.12.10.txt": "3b2f81fe21d181c499c59a256c8e1968455d6689d269aa85373bfb6af41da3bf",
     "Tcl-8.6.15.txt": "0d1e4405f6273f091732764ed89b57066be63ce64869be6c71ea337dc4f2f9b5",
@@ -41,6 +44,44 @@ def _app_version() -> str:
     match = re.search(r'^VERSION = "([^"]+)"$', init_source, flags=re.MULTILINE)
     assert match is not None
     return match.group(1)
+
+
+def test_public_product_name_is_consistent_in_program_and_release() -> None:
+    init_source = _text("bittorrent_beobachter/__init__.py")
+    cli_source = _text("bittorrent_beobachter/cli.py")
+    gui_source = _text("bittorrent_beobachter/gui.py")
+    reports_source = _text("bittorrent_beobachter/reports.py")
+    spec = _text("BitTorrentBeobachter.spec")
+    workflow = _text(".github/workflows/build.yml")
+    local_build = _text("build_windows.ps1")
+    readme = _text("README.md")
+    project = tomllib.loads(_text("pyproject.toml"))
+
+    assert f'APP_NAME = "{PRODUCT_NAME}"' in init_source
+    assert "prog=APP_NAME" in cli_source
+    assert 'root.title(f"{APP_NAME} {VERSION}")' in gui_source
+    assert 'text=APP_NAME, font=("TkDefaultFont", 18, "bold")' in gui_source
+    assert reports_source.count("canvas.setCreator(APP_NAME)") == 2
+    assert spec.count(f'name="{PRODUCT_NAME}"') == 2
+    assert f'"{PACKAGE_DIRECTORY}/{EXE_NAME}"' in workflow
+    assert f'"{EXE_NAME}"' in local_build
+    assert readme.startswith(f"# {PRODUCT_NAME}\n")
+    assert f"`{EXE_NAME}`" in readme
+    assert project["project"]["name"] == "bittorrent-beobachter"
+    assert "afdleakercatcher" in project["project"]["scripts"]
+    assert "bittorrent-beobachter" in project["project"]["scripts"]
+
+    for public_source in (
+        init_source,
+        cli_source,
+        gui_source,
+        reports_source,
+        spec,
+        workflow,
+        local_build,
+        readme,
+    ):
+        assert "BitTorrent-Beobachter" not in public_source
 
 
 def test_reference_pdf_is_the_reviewed_document() -> None:
@@ -76,7 +117,7 @@ def test_third_party_licenses_are_documented_packaged_and_zip_checked() -> None:
     assert 'THIRD_PARTY_LICENSES_DIR = PROJECT_ROOT / "THIRD_PARTY_LICENSES"' in spec
     assert '(str(THIRD_PARTY_LICENSES_DIR), "THIRD_PARTY_LICENSES")' in spec
     assert "Copy-Item -LiteralPath $licenseSource" in workflow
-    assert '"dist/BitTorrent-Beobachter/THIRD_PARTY_LICENSES"' in workflow
+    assert '"dist/AfDLeakerCatcher/THIRD_PARTY_LICENSES"' in workflow
     assert "[System.IO.Compression.ZipFile]::OpenRead($archive)" in workflow
     assert '"THIRD_PARTY_LICENSES/"' in workflow
     assert 'Join-Path $ProjectRoot "THIRD_PARTY_LICENSES"' in local_build
@@ -113,7 +154,7 @@ def test_windows_build_places_pdf_beside_executable() -> None:
 
     assert PDF_NAME in workflow
     assert PDF_NAME in local_build
-    assert "dist/BitTorrent-Beobachter/" + PDF_NAME in workflow
+    assert "dist/AfDLeakerCatcher/" + PDF_NAME in workflow
     assert PDF_SHA256 in workflow
     assert PDF_SHA256 in local_build
 
@@ -124,7 +165,7 @@ def test_package_exposes_the_exact_build_dependency_lock() -> None:
     spec = _text("BitTorrentBeobachter.spec")
 
     assert 'PROJECT_ROOT / "requirements-build.lock"' in spec
-    assert "dist/BitTorrent-Beobachter/requirements-build.lock" in workflow
+    assert "dist/AfDLeakerCatcher/requirements-build.lock" in workflow
     assert 'Join-Path $PackageDirectory "requirements-build.lock"' in local_build
 
 
@@ -132,14 +173,14 @@ def test_windows_job_builds_one_final_zip_and_preserves_raw_app_artifact() -> No
     workflow = _text(".github/workflows/build.yml")
     local_build = _text("build_windows.ps1")
 
-    assert "path: dist/BitTorrent-Beobachter\n" in workflow
+    assert "path: dist/AfDLeakerCatcher\n" in workflow
     assert "System.IO.Compression.ZipFile]::CreateFromDirectory(" in workflow
     assert "System.IO.Compression.ZipFile]::CreateFromDirectory(" in local_build
     assert f"name: {RELEASE_ARTIFACT_NAME}" in workflow
     assert f"dist/release/{ARCHIVE_NAME}" in workflow
     assert f"dist/release/{CHECKSUM_NAME}" in workflow
     assert "path: release/package" not in workflow
-    assert "zip -r ../AfDLeakercatcher-Windows-x64.zip ." not in workflow
+    assert "zip -r ../AfDLeakerCatcher-Windows-x64.zip ." not in workflow
     assert '-ArgumentList "--gui-smoke-test"' in workflow
     assert "Gebündelte Tkinter-GUI erfolgreich gestartet und beendet." in workflow
 
@@ -170,12 +211,12 @@ def test_exact_final_zip_is_attested_and_published() -> None:
     readme = _text("README.md")
 
     assert f"subject-path: attest/{ARCHIVE_NAME}" in workflow
-    assert "subject-path: attest/BitTorrent-Beobachter.exe" not in workflow
+    assert "subject-path: attest/AfDLeakerCatcher.exe" not in workflow
     assert f"gh attestation verify {ARCHIVE_NAME}" in workflow
     assert "attestations: read" in workflow
     assert workflow.count(f"name: {RELEASE_ARTIFACT_NAME}") >= 3
     assert f"gh attestation verify {ARCHIVE_NAME}" in readme
-    assert "gh attestation verify BitTorrent-Beobachter.exe" not in readme
+    assert "gh attestation verify AfDLeakerCatcher.exe" not in readme
 
 
 def test_version_sources_tag_checks_and_direct_download_are_consistent() -> None:
@@ -184,11 +225,12 @@ def test_version_sources_tag_checks_and_direct_download_are_consistent() -> None
     project = tomllib.loads(_text("pyproject.toml"))
     version = project["project"]["version"]
 
-    assert version == _app_version() == "0.3.2"
+    assert version == _app_version() == "0.3.3"
     assert f"Windows-Download \N{EN DASH} Version {version}" in readme
-    release_path = f"releases/download/bittorrent-beobachter-v{version}/"
+    release_path = f"releases/download/afdleakercatcher-v{version}/"
     assert readme.count(release_path) >= 2
     assert '"v${version}"' in workflow
+    assert '"afdleakercatcher-v${version}"' in workflow
     assert '"bittorrent-beobachter-v${version}"' in workflow
     assert "from bittorrent_beobachter import VERSION" in workflow
 
@@ -222,5 +264,5 @@ def release_url(filename: str) -> str:
     version = tomllib.loads(_text("pyproject.toml"))["project"]["version"]
     return (
         "https://github.com/marioco/AfDLeakercatcher/releases/download/"
-        f"bittorrent-beobachter-v{version}/{filename}"
+        f"afdleakercatcher-v{version}/{filename}"
     )

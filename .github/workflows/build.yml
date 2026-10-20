@@ -1,4 +1,4 @@
-name: BitTorrent-Beobachter prüfen und bauen
+name: AfDLeakerCatcher prüfen und bauen
 
 on:
   workflow_dispatch:
@@ -6,6 +6,7 @@ on:
     branches: [main]
     tags:
       - "v*"
+      - "afdleakercatcher-v*"
       - "bittorrent-beobachter-v*"
   pull_request:
 
@@ -39,6 +40,7 @@ jobs:
           fi
           if [[ "$GITHUB_REF" == refs/tags/* && \
                 "$GITHUB_REF_NAME" != "v${package_version}" && \
+                "$GITHUB_REF_NAME" != "afdleakercatcher-v${package_version}" && \
                 "$GITHUB_REF_NAME" != "bittorrent-beobachter-v${package_version}" ]]; then
             echo "Release-Tag $GITHUB_REF_NAME passt nicht zur Version $package_version." >&2
             exit 1
@@ -136,7 +138,7 @@ jobs:
         shell: pwsh
         run: |
           $executable = Resolve-Path -LiteralPath `
-            "dist/BitTorrent-Beobachter/BitTorrent-Beobachter.exe"
+            "dist/AfDLeakerCatcher/AfDLeakerCatcher.exe"
           $process = Start-Process -FilePath $executable.Path `
             -ArgumentList "--version" -PassThru
           if (-not $process.WaitForExit(30000)) {
@@ -156,7 +158,7 @@ jobs:
         shell: pwsh
         run: |
           $executable = Resolve-Path -LiteralPath `
-            "dist/BitTorrent-Beobachter/BitTorrent-Beobachter.exe"
+            "dist/AfDLeakerCatcher/AfDLeakerCatcher.exe"
           $process = Start-Process -FilePath $executable.Path `
             -ArgumentList "--gui-smoke-test" -PassThru
           if (-not $process.WaitForExit(30000)) {
@@ -178,6 +180,7 @@ jobs:
             (github.event_name == 'push' &&
              (github.ref == 'refs/heads/main' ||
               startsWith(github.ref, 'refs/tags/v') ||
+              startsWith(github.ref, 'refs/tags/afdleakercatcher-v') ||
               startsWith(github.ref, 'refs/tags/bittorrent-beobachter-v'))) ||
             (github.event_name == 'workflow_dispatch' &&
              github.ref == 'refs/heads/main')
@@ -210,12 +213,12 @@ jobs:
               & $signTool.FullName sign /fd SHA256 /td SHA256 `
                 /tr https://timestamp.digicert.com `
                 /f $certificate /p $env:WINDOWS_CERTIFICATE_PASSWORD `
-                "dist/BitTorrent-Beobachter/BitTorrent-Beobachter.exe"
+                "dist/AfDLeakerCatcher/AfDLeakerCatcher.exe"
               if ($LASTEXITCODE -ne 0) {
                 throw "signtool.exe ist mit Exitcode $LASTEXITCODE fehlgeschlagen."
               }
               & $signTool.FullName verify /pa /all `
-                "dist/BitTorrent-Beobachter/BitTorrent-Beobachter.exe"
+                "dist/AfDLeakerCatcher/AfDLeakerCatcher.exe"
               if ($LASTEXITCODE -ne 0) {
                 throw (
                   "Die Signaturprüfung ist mit Exitcode " +
@@ -238,14 +241,14 @@ jobs:
         shell: pwsh
         run: |
           Copy-Item -LiteralPath "README.md" `
-            -Destination "dist/BitTorrent-Beobachter/README.md" -Force
+            -Destination "dist/AfDLeakerCatcher/README.md" -Force
           Copy-Item -LiteralPath "LICENSE" `
-            -Destination "dist/BitTorrent-Beobachter/LICENSE" -Force
+            -Destination "dist/AfDLeakerCatcher/LICENSE" -Force
           Copy-Item -LiteralPath "THIRD_PARTY_NOTICES.md" `
-            -Destination "dist/BitTorrent-Beobachter/THIRD_PARTY_NOTICES.md" -Force
+            -Destination "dist/AfDLeakerCatcher/THIRD_PARTY_NOTICES.md" -Force
           Copy-Item -LiteralPath "requirements-build.lock" `
-            -Destination "dist/BitTorrent-Beobachter/requirements-build.lock" -Force
-          $internalDirectory = "dist/BitTorrent-Beobachter/_internal"
+            -Destination "dist/AfDLeakerCatcher/requirements-build.lock" -Force
+          $internalDirectory = "dist/AfDLeakerCatcher/_internal"
           $cryptoLibraries = @(
             Get-ChildItem -LiteralPath $internalDirectory -File |
               Where-Object { $_.Name -like "libcrypto-3*.dll" }
@@ -275,7 +278,7 @@ jobs:
           ) | Sort-Object
           $licenseSource = "THIRD_PARTY_LICENSES"
           $licenseDestination = `
-            "dist/BitTorrent-Beobachter/THIRD_PARTY_LICENSES"
+            "dist/AfDLeakerCatcher/THIRD_PARTY_LICENSES"
           $sourceLicenseNames = @(
             Get-ChildItem -LiteralPath $licenseSource -File |
               Select-Object -ExpandProperty Name |
@@ -317,30 +320,30 @@ jobs:
             throw "Die Prüfsumme der Kontakt-PDF stimmt nicht."
           }
           Copy-Item -LiteralPath $pdfSource `
-            -Destination "dist/BitTorrent-Beobachter/Cybercrime-E-Mail-Kontakte_BKA-und-LKA_Deutschland_Stand-2026-10-20.pdf" `
+            -Destination "dist/AfDLeakerCatcher/Cybercrime-E-Mail-Kontakte_BKA-und-LKA_Deutschland_Stand-2026-10-20.pdf" `
             -Force
           $checksums = @(
-            "BitTorrent-Beobachter.exe",
+            "AfDLeakerCatcher.exe",
             "Cybercrime-E-Mail-Kontakte_BKA-und-LKA_Deutschland_Stand-2026-10-20.pdf"
           ) | ForEach-Object {
-            $filePath = Join-Path "dist/BitTorrent-Beobachter" $_
+            $filePath = Join-Path "dist/AfDLeakerCatcher" $_
             $hash = (
               Get-FileHash -Algorithm SHA256 -LiteralPath $filePath
             ).Hash.ToLowerInvariant()
             "$hash  $_"
           }
           $checksums | Set-Content -Encoding ascii `
-            "dist/BitTorrent-Beobachter/SHA256SUMS.txt"
+            "dist/AfDLeakerCatcher/SHA256SUMS.txt"
 
       - name: Finales einmal entpackbares Release-ZIP erstellen
         shell: pwsh
         run: |
           $packageDirectory = (
-            Resolve-Path -LiteralPath "dist/BitTorrent-Beobachter"
+            Resolve-Path -LiteralPath "dist/AfDLeakerCatcher"
           ).Path
           $releaseDirectory = Join-Path $PWD "dist/release"
           New-Item -ItemType Directory -Path $releaseDirectory -Force | Out-Null
-          $archiveName = "AfDLeakercatcher-Windows-x64.zip"
+          $archiveName = "AfDLeakerCatcher-Windows-x64.zip"
           $archive = Join-Path $releaseDirectory $archiveName
           if (Test-Path -LiteralPath $archive) {
             Remove-Item -LiteralPath $archive -Force
@@ -407,17 +410,17 @@ jobs:
       - name: Geprüften Build bereitstellen
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: AfDLeakercatcher-Windows-x64
-          path: dist/BitTorrent-Beobachter
+          name: AfDLeakerCatcher-Windows-x64
+          path: dist/AfDLeakerCatcher
           if-no-files-found: error
 
       - name: Unveränderte Release-Dateien bereitstellen
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: AfDLeakercatcher-Windows-x64-release
+          name: AfDLeakerCatcher-Windows-x64-release
           path: |
-            dist/release/AfDLeakercatcher-Windows-x64.zip
-            dist/release/AfDLeakercatcher-Windows-x64.zip.sha256
+            dist/release/AfDLeakerCatcher-Windows-x64.zip
+            dist/release/AfDLeakerCatcher-Windows-x64.zip.sha256
           if-no-files-found: error
 
   attest-public-build:
@@ -426,6 +429,7 @@ jobs:
           ((github.event_name == 'push' &&
             (github.ref == 'refs/heads/main' ||
              startsWith(github.ref, 'refs/tags/v') ||
+             startsWith(github.ref, 'refs/tags/afdleakercatcher-v') ||
              startsWith(github.ref, 'refs/tags/bittorrent-beobachter-v'))) ||
            (github.event_name == 'workflow_dispatch' &&
             github.ref == 'refs/heads/main')) }}
@@ -440,13 +444,13 @@ jobs:
       - name: Geprüften Build herunterladen
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: AfDLeakercatcher-Windows-x64-release
+          name: AfDLeakerCatcher-Windows-x64-release
           path: attest
 
       - name: Herkunftsnachweis erzeugen
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
-          subject-path: attest/AfDLeakercatcher-Windows-x64.zip
+          subject-path: attest/AfDLeakerCatcher-Windows-x64.zip
 
   github-release:
     if: >-
@@ -454,6 +458,7 @@ jobs:
           github.event_name == 'push' &&
           (github.ref == 'refs/heads/main' ||
            startsWith(github.ref, 'refs/tags/v') ||
+           startsWith(github.ref, 'refs/tags/afdleakercatcher-v') ||
            startsWith(github.ref, 'refs/tags/bittorrent-beobachter-v')) &&
           needs.test-and-build-windows.result == 'success' &&
           (needs.attest-public-build.result == 'success' ||
@@ -485,10 +490,11 @@ jobs:
             exit 1
           fi
           if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
-            release_tag="bittorrent-beobachter-v${version}"
+            release_tag="afdleakercatcher-v${version}"
           else
             release_tag="$GITHUB_REF_NAME"
             if [[ "$release_tag" != "v${version}" && \
+                  "$release_tag" != "afdleakercatcher-v${version}" && \
                   "$release_tag" != "bittorrent-beobachter-v${version}" ]]; then
               echo "Release-Tag $release_tag passt nicht zur Version $version." >&2
               exit 1
@@ -506,7 +512,7 @@ jobs:
         if: ${{ steps.release.outputs.exists != 'true' }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: AfDLeakercatcher-Windows-x64-release
+          name: AfDLeakerCatcher-Windows-x64-release
           path: release
 
       - name: GitHub-Release erstellen
@@ -524,8 +530,8 @@ jobs:
           fi
           gh release create "$RELEASE_TAG" \
             "${release_args[@]}" \
-            "release/AfDLeakercatcher-Windows-x64.zip" \
-            "release/AfDLeakercatcher-Windows-x64.zip.sha256"
+            "release/AfDLeakerCatcher-Windows-x64.zip" \
+            "release/AfDLeakerCatcher-Windows-x64.zip.sha256"
 
       - name: Vorhandenes oder neu erstelltes Release vollständig prüfen
         env:
@@ -548,8 +554,8 @@ jobs:
           fi
 
           printf -v expected_assets '%s\n%s' \
-            "AfDLeakercatcher-Windows-x64.zip" \
-            "AfDLeakercatcher-Windows-x64.zip.sha256"
+            "AfDLeakerCatcher-Windows-x64.zip" \
+            "AfDLeakerCatcher-Windows-x64.zip.sha256"
           actual_assets="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
             --json assets --jq '.assets[].name' | LC_ALL=C sort)"
           if [[ "$actual_assets" != "$expected_assets" ]]; then
@@ -562,11 +568,11 @@ jobs:
           mkdir -p "$verification_dir"
           gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
             --dir "$verification_dir" \
-            --pattern "AfDLeakercatcher-Windows-x64.zip" \
-            --pattern "AfDLeakercatcher-Windows-x64.zip.sha256"
+            --pattern "AfDLeakerCatcher-Windows-x64.zip" \
+            --pattern "AfDLeakerCatcher-Windows-x64.zip.sha256"
           cd "$verification_dir"
-          sha256sum --check --strict AfDLeakercatcher-Windows-x64.zip.sha256
+          sha256sum --check --strict AfDLeakerCatcher-Windows-x64.zip.sha256
           if [[ "$REPOSITORY_VISIBILITY" == "public" ]]; then
-            gh attestation verify AfDLeakercatcher-Windows-x64.zip \
+            gh attestation verify AfDLeakerCatcher-Windows-x64.zip \
               --repo "$GITHUB_REPOSITORY"
           fi

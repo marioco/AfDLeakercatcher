@@ -28,13 +28,13 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
-from . import VERSION
+from . import APP_NAME, VERSION
 from .evidence import atomic_write_json, canonical_json_bytes
 from .models import NetworkEnrichment, VpnClassification
 
 RDAP_BASE_URL = "https://rdap.org/ip/"
 RIPESTAT_PREFIX_URL = "https://stat.ripe.net/data/prefix-overview/data.json"
-USER_AGENT = f"bittorrent-beobachter/{VERSION} (+public-network-evidence)"
+USER_AGENT = f"{APP_NAME}/{VERSION} (+public-network-evidence)"
 MAX_RESPONSE_BYTES = 2_000_000
 MAX_CACHE_BYTES = 100_000
 MAX_CACHE_FILES = 512

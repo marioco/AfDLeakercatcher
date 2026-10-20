@@ -1,13 +1,13 @@
-# BitTorrent-Beobachter
+# AfDLeakerCatcher
 
-## Windows-Download – Version 0.3.2
+## Windows-Download – Version 0.3.3
 
-### [⬇ AfDLeakercatcher für Windows herunterladen](https://github.com/marioco/AfDLeakercatcher/releases/download/bittorrent-beobachter-v0.3.2/AfDLeakercatcher-Windows-x64.zip)
+### [⬇ AfDLeakerCatcher für Windows herunterladen](https://github.com/marioco/AfDLeakercatcher/releases/download/afdleakercatcher-v0.3.3/AfDLeakerCatcher-Windows-x64.zip)
 
-[SHA-256-Prüfsumme zum Download](https://github.com/marioco/AfDLeakercatcher/releases/download/bittorrent-beobachter-v0.3.2/AfDLeakercatcher-Windows-x64.zip.sha256)
+[SHA-256-Prüfsumme zum Download](https://github.com/marioco/AfDLeakercatcher/releases/download/afdleakercatcher-v0.3.3/AfDLeakerCatcher-Windows-x64.zip.sha256)
 
 Keine GitHub-Kenntnisse nötig: Auf den Link klicken, die ZIP-Datei **einmal**
-entpacken und anschließend `BitTorrent-Beobachter.exe` doppelklicken. Es gibt keinen
+entpacken und anschließend `AfDLeakerCatcher.exe` doppelklicken. Es gibt keinen
 Installer und es werden keine Administratorrechte benötigt.
 
 Eine leicht bedienbare, quelloffene Python-Anwendung zur **inhaltsfreien** Prüfung
@@ -84,24 +84,24 @@ dieser Seite geladen werden. Erfolgreiche Teststände sind zusätzlich beim jewe
 Lauf unter **Actions → Artifacts** verfügbar; sie sind keine veröffentlichte Version und
 können von GitHub nach einiger Zeit gelöscht werden.
 
-1. Ganz oben auf **AfDLeakercatcher für Windows herunterladen** klicken.
+1. Ganz oben auf **AfDLeakerCatcher für Windows herunterladen** klicken.
 2. Die direkt darunter verlinkte SHA-256-Prüfsummendatei in denselben Ordner laden.
 3. In diesem Ordner PowerShell öffnen und die beiden Werte automatisch vergleichen:
 
    ```powershell
-   $Soll = (Get-Content .\AfDLeakercatcher-Windows-x64.zip.sha256).Split()[0]
-   $Ist = (Get-FileHash .\AfDLeakercatcher-Windows-x64.zip -Algorithm SHA256).Hash
+   $Soll = (Get-Content .\AfDLeakerCatcher-Windows-x64.zip.sha256).Split()[0]
+   $Ist = (Get-FileHash .\AfDLeakerCatcher-Windows-x64.zip -Algorithm SHA256).Hash
    $Ist -eq $Soll
    ```
 
 4. Nur wenn PowerShell `True` ausgibt, das ZIP genau einmal vollständig entpacken
-   und `BitTorrent-Beobachter.exe` doppelklicken.
+   und `AfDLeakerCatcher.exe` doppelklicken.
 5. Die beiden vorgesehenen Infohashes sind bereits sichtbar eingetragen.
 6. **Jetzt prüfen** wählen und den Hinweis zur öffentlichen Sichtbarkeit bestätigen.
 7. Nach Abschluss **Ergebnisordner öffnen** wählen.
 
 Es gibt kein ZIP im ZIP. Für einen Teststand unter **Actions → Artifacts** ist das
-Artefakt `AfDLeakercatcher-Windows-x64` ohne den Zusatz `-release` vorgesehen: Es
+Artefakt `AfDLeakerCatcher-Windows-x64` ohne den Zusatz `-release` vorgesehen: Es
 enthält direkt die Programmdateien und muss nur einmal entpackt werden. Für die
 voreingestellten Ziele sind weder Titel noch Beschreibung einzugeben. Ein zusätzlicher
 Magnet-Link lässt sich bei Bedarf in genau einem Eingabefenster ergänzen.
@@ -278,12 +278,12 @@ dieselben ZIP-Bytes anschließend unverändert veröffentlicht.
 Vor dem Entpacken lässt sich seine Herkunft mit der GitHub CLI prüfen:
 
 ```bash
-gh attestation verify AfDLeakercatcher-Windows-x64.zip -R marioco/AfDLeakercatcher
+gh attestation verify AfDLeakerCatcher-Windows-x64.zip -R marioco/AfDLeakercatcher
 ```
 
 Ein Push auf `main` erzeugt nach erfolgreichem Build ein GitHub-Release, sofern für die
 eingetragene Version noch keines existiert. Dasselbe gilt für einen exakt zur
-Paket- und App-Version passenden Tag wie `bittorrent-beobachter-v0.3.2`. Ein bereits
+Paket- und App-Version passenden Tag wie `afdleakercatcher-v0.3.3`. Ein bereits
 vorhandenes Release wird nicht überschrieben, sondern auf Ziel-Commit, Entwurfsstatus,
 exakt erwartete Assets und ZIP-Prüfsumme kontrolliert. Pull Requests und manuell
 gestartete Läufe stellen nur Actions-Artefakte bereit.
