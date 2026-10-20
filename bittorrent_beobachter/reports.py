@@ -623,6 +623,30 @@ def _write_summary_pdf(
             ]
         )
 
+    if result.notices:
+        story.extend(
+            [
+                _paragraph(
+                    "Technische Laufhinweise (kein Programmfehler)",
+                    styles["Heading1"],
+                    toolkit,
+                ),
+                _paragraph(
+                    "Diese Hinweise dokumentieren die Erreichbarkeit während dieses "
+                    "einzelnen Laufs. Sie sind kein Nachweis für Inhalt, Besitz, "
+                    "Übertragung, Person oder Straftat.",
+                    styles["BodyText"],
+                    toolkit,
+                ),
+                _paragraph(
+                    "<br/>".join(f"- {_escape_text(notice)}" for notice in sorted(result.notices)),
+                    styles["BodyText"],
+                    toolkit,
+                    already_escaped=True,
+                ),
+            ]
+        )
+
     if result.errors:
         story.extend(
             [

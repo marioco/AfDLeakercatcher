@@ -121,6 +121,7 @@ def _scan_result() -> ScanResult:
         candidates=[handshake.candidate for handshake in handshakes],
         handshakes=handshakes,
         records=records,
+        notices=["DHT-Suche fuer Ziel 1: 3 verwertbare Antworten, 1 Anfrage ohne Antwort."],
     )
 
 

@@ -210,7 +210,10 @@ def _initialize_config(args: argparse.Namespace, config_path: Path) -> int:
     )
     save_config(config_path, config)
     print(f"Konfiguration gespeichert: {config_path}")
-    print("Die Magnet-Tracker wurden verworfen; gespeichert sind nur Bezeichnung und Infohash.")
+    print(
+        "Magnet-Name und Tracker wurden verworfen; gespeichert sind nur eine "
+        "neutrale oder ausdrücklich angegebene Bezeichnung und der Infohash."
+    )
     print(
         "WICHTIG: Prüfläufe sind nicht anonym. DHT-Knoten und geprüfte "
         "Peer-Endpunkte sehen Ihre öffentliche Quell-IP und den abgefragten "
@@ -241,6 +244,8 @@ def _scan_once(config_path: Path, data_dir: Path, logger: logging.Logger) -> int
     )
     for path in result.report_paths:
         logger.info("Ausgabe: %s", path)
+    for notice in result.notices:
+        logger.info("Technischer Laufhinweis: %s", notice)
     for error in result.errors:
         logger.warning("Teilproblem: %s", error)
     return 0

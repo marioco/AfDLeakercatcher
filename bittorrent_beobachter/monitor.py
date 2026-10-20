@@ -320,28 +320,41 @@ async def _discover_candidates(
         raise MonitorError("Kein globaler DHT-Bootstrap-Knoten konnte aufgeloest werden.")
 
     candidates: list[PeerCandidate] = []
-    warnings: list[str] = []
+    notices: list[str] = []
+    responsive_targets = 0
     for index, target in enumerate(config.targets, start=1):
         progress(f"DHT-Suche {index}/{len(config.targets)}: {target.label}")
         crawler = DHTCrawler(resolved, config=dht_config)
         discovered = await crawler.discover(target)
         if crawler.queries_completed == 0:
-            raise MonitorError(
-                f"Alle DHT-Anfragen fuer das Ziel {target.label!r} sind fehlgeschlagen."
+            notice = (
+                f"DHT-Suche fuer {target.label}: In diesem Lauf antwortete kein "
+                "DHT-Knoten; dieses Ziel wurde uebersprungen."
             )
+            notices.append(notice)
+            progress(notice)
+            continue
+
+        responsive_targets += 1
         crawler_errors = tuple(getattr(crawler, "errors", ()))
         if crawler_errors:
-            warnings.append(
-                f"DHT-Teilprobleme bei {target.label}: {len(crawler_errors)} "
-                "Anfrage(n) sind fehlgeschlagen."
+            notice = (
+                f"DHT-Suche fuer {target.label}: {crawler.queries_completed} "
+                f"verwertbare Antwort(en); {len(crawler_errors)} technische "
+                "Teilmeldung(en) wurden protokolliert."
             )
+            notices.append(notice)
+            progress(notice)
         if any(candidate.info_hash_hex != target.info_hash_hex for candidate in discovered):
             raise MonitorError("Die DHT-Suche lieferte einen Kandidaten fuer ein falsches Ziel.")
         candidates.extend(discovered)
         progress(
             f"DHT-Suche {index}/{len(config.targets)} abgeschlossen: {len(discovered)} Kandidat(en)"
         )
-    return candidates, warnings
+
+    if responsive_targets == 0:
+        raise MonitorError("Keines der konfigurierten DHT-Ziele erhielt eine verwertbare Antwort.")
+    return candidates, notices
 
 
 def _failed_handshake(candidate: PeerCandidate, error: BaseException) -> HandshakeResult:
@@ -413,9 +426,9 @@ async def _network_phase(
     config: AppConfig,
     progress: ProgressCallback,
 ) -> tuple[list[PeerCandidate], list[HandshakeResult], list[str]]:
-    candidates, warnings = await _discover_candidates(config, progress)
+    candidates, notices = await _discover_candidates(config, progress)
     handshakes = await _verify_candidates(config, candidates, progress)
-    return candidates, handshakes, warnings
+    return candidates, handshakes, notices
 
 
 async def _bounded_network_phase(
@@ -641,10 +654,10 @@ def _run_scan_locked_impl(
     _ensure_private_file(journal_path)
     failure_state.append((journal, run_id, config_hash, software_hash, journal_path))
 
-    candidates, handshakes, dht_warnings = asyncio.run(_bounded_network_phase(config, progress))
+    candidates, handshakes, dht_notices = asyncio.run(_bounded_network_phase(config, progress))
     result.candidates.extend(candidates)
     result.handshakes.extend(handshakes)
-    result.errors.extend(dht_warnings)
+    result.notices.extend(dht_notices)
 
     enrichment_by_ip = _enrich_confirmed_handshakes(
         config,
@@ -697,6 +710,8 @@ def _run_scan_locked_impl(
             "evidence_count": len(result.records),
             "report_files": [path.name for path in result.report_paths],
             "warning_count": len(result.errors),
+            "notice_count": len(result.notices),
+            "operational_notices": list(result.notices),
         },
         recorded_at_utc=result.completed_at_utc,
     )

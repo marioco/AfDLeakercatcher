@@ -107,6 +107,7 @@ class ScanResult:
     records: list[EvidenceRecord] = field(default_factory=list)
     report_paths: list[Path] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    notices: list[str] = field(default_factory=list)
 
     @property
     def confirmed_count(self) -> int:

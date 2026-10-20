@@ -14,14 +14,18 @@ from typing import Any
 import pytest
 
 from bittorrent_beobachter.config import (
+    DEFAULT_TARGETS,
     AppConfig,
     ConfigError,
     DhtSettings,
     EnrichmentSettings,
     PeerSettings,
     ReportingSettings,
+    config_to_dict,
+    default_app_config,
     load_config,
     save_config,
+    with_bundled_presets,
 )
 from bittorrent_beobachter.evidence import EvidenceJournal
 from bittorrent_beobachter.models import (
@@ -35,6 +39,56 @@ from bittorrent_beobachter.monitor import MonitorError, run_scan
 
 HASH_A = bytes.fromhex("11" * 20)
 HASH_B = bytes.fromhex("22" * 20)
+
+
+def test_default_app_config_contains_only_neutral_first_run_targets() -> None:
+    config = default_app_config()
+
+    assert [(target.label, target.info_hash_hex) for target in config.targets] == [
+        ("Voreingestellter Infohash 1", "852795102149749ad91123af01ceac5da6f9eb5a"),
+        ("Voreingestellter Infohash 2", "db503db679f508aa31a9e07913b2aa8cf7aa6dff"),
+    ]
+    assert all(target.source_note == "" for target in config.targets)
+    assert config.enrichment.enabled is False
+    serialized = json.dumps(config_to_dict(config), ensure_ascii=False).casefold()
+    assert "magnet:" not in serialized
+    assert "tracker" not in serialized
+    assert "afd" not in serialized
+    assert "leak" not in serialized
+
+
+def test_empty_target_selection_is_persisted(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+
+    save_config(config_path, AppConfig(targets=()))
+
+    loaded = load_config(config_path)
+    assert loaded.targets == ()
+    assert config_to_dict(loaded)["targets"] == []
+
+
+def test_legacy_config_receives_presets_only_once() -> None:
+    existing = Target(label="Bestehender Eintrag", info_hash=DEFAULT_TARGETS[0].info_hash)
+    legacy = AppConfig(targets=(existing,), preset_revision=0)
+
+    migrated = with_bundled_presets(legacy)
+
+    assert migrated.preset_revision == 1
+    assert [target.info_hash_hex for target in migrated.targets] == [
+        DEFAULT_TARGETS[0].info_hash_hex,
+        DEFAULT_TARGETS[1].info_hash_hex,
+    ]
+    intentionally_reduced = replace(migrated, targets=(existing,))
+    assert with_bundled_presets(intentionally_reduced) == intentionally_reduced
+
+
+def test_parse_magnet_discards_untrusted_display_name() -> None:
+    from bittorrent_beobachter.config import parse_magnet
+
+    target = parse_magnet(f"magnet:?xt=urn:btih:{HASH_A.hex()}&dn=Ungepruefte+Behauptung")
+
+    assert target.label == f"Infohash {HASH_A.hex()[:12]}"
+    assert target.source_note == ""
 
 
 def _candidate(target: Target, ip: str, port: int) -> PeerCandidate:
@@ -113,6 +167,7 @@ def _install_successful_network_fakes(
     *,
     second_confirmed: bool = True,
     crawler_errors: tuple[str, ...] = (),
+    unresponsive_hash: bytes | None = None,
 ) -> dict[str, Any]:
     import bittorrent_beobachter.monitor as monitor
 
@@ -136,6 +191,10 @@ def _install_successful_network_fakes(
             calls["crawler_configs"].append(config)
 
         async def discover(self, target: Target) -> list[PeerCandidate]:
+            if target.info_hash == unresponsive_hash:
+                self.queries_completed = 0
+                self.errors = ("Zeitueberschreitung bei 192.0.2.55:6881",)
+                return []
             if target.info_hash == HASH_A:
                 return [
                     _candidate(target, "8.8.8.8", 6001),
@@ -238,6 +297,7 @@ def test_run_scan_integrates_fair_checks_opt_in_and_canonical_journal(
     assert result.confirmed_count == 3
     assert len(result.records) == 3
     assert result.errors == []
+    assert result.notices == []
     assert result.report_paths == [tmp_path / "reports" / result.run_id / "bericht.pdf"]
     if os.name != "nt":
         assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o700
@@ -304,6 +364,8 @@ def test_run_scan_integrates_fair_checks_opt_in_and_canonical_journal(
         assert event["run_id"] == result.run_id
         assert len(event["config_sha256"]) == 64
         assert event["software_sha256"] == "ef" * 32
+    assert events[-1]["notice_count"] == 0
+    assert events[-1]["operational_notices"] == []
 
 
 def test_peer_rejection_is_not_a_run_error(
@@ -320,7 +382,7 @@ def test_peer_rejection_is_not_a_run_error(
     assert any(not handshake.confirmed for handshake in result.handshakes)
 
 
-def test_partial_dht_failures_are_reported_as_nonfatal_warning(
+def test_partial_dht_timeouts_are_not_errors_but_remain_documented(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -332,9 +394,33 @@ def test_partial_dht_failures_are_reported_as_nonfatal_warning(
     result = run_scan(_config(), tmp_path)
 
     assert result.confirmed_count == 3
-    assert len(result.errors) == 2
-    assert all("DHT-Teilprobleme" in warning for warning in result.errors)
-    assert all("192.0.2.55" not in warning for warning in result.errors)
+    assert result.errors == []
+    assert len(result.notices) == 2
+    assert all("verwertbare Antwort" in notice for notice in result.notices)
+    assert all("technische Teilmeldung" in notice for notice in result.notices)
+    assert all("192.0.2.55" not in notice for notice in result.notices)
+
+
+def test_one_unresponsive_target_does_not_discard_successful_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_successful_network_fakes(monkeypatch, unresponsive_hash=HASH_B)
+
+    result = run_scan(_config(), tmp_path)
+
+    assert result.confirmed_count == 2
+    assert result.errors == []
+    assert len(result.notices) == 1
+    assert "Ziel B" in result.notices[0]
+    assert "192.0.2.55" not in result.notices[0]
+    assert {candidate.info_hash_hex for candidate in result.candidates} == {HASH_A.hex()}
+    events = [
+        json.loads(line)["event"]
+        for line in (tmp_path / "evidence" / "events.jsonl").read_text().splitlines()
+    ]
+    assert events[-1]["notice_count"] == 1
+    assert events[-1]["operational_notices"] == result.notices
 
 
 def test_disabled_enrichment_never_constructs_network_client(
@@ -425,7 +511,7 @@ def test_fatal_dht_failures(
     monkeypatch.setattr(monitor, "resolve_bootstrap_nodes", fake_resolve)
     monkeypatch.setattr(monitor, "DHTCrawler", FailedCrawler)
     monkeypatch.setattr(monitor, "_software_sha256", lambda: "ef" * 32)
-    with pytest.raises(MonitorError, match=r"Bootstrap|Alle DHT-Anfragen"):
+    with pytest.raises(MonitorError, match=r"Bootstrap|Keines der konfigurierten DHT-Ziele"):
         run_scan(_config(), tmp_path)
     events = [
         json.loads(line)["event"]
@@ -602,6 +688,10 @@ def test_cli_source_notes_are_bound_positionally(
     assert [target.source_note for target in config.targets] == [
         "Nur Alpha",
         "Nur Beta",
+    ]
+    assert [target.label for target in config.targets] == [
+        f"Infohash {HASH_A.hex()[:12]}",
+        f"Infohash {HASH_B.hex()[:12]}",
     ]
 
 

@@ -174,7 +174,7 @@ jobs:
             )
           }
 
-      - name: ZIP und SHA-256 erstellen
+      - name: Download-Ordner vorbereiten
         shell: pwsh
         run: |
           Copy-Item -LiteralPath "README.md" `
@@ -183,21 +183,37 @@ jobs:
             -Destination "dist/BitTorrent-Beobachter/LICENSE" -Force
           Copy-Item -LiteralPath "THIRD_PARTY_NOTICES.md" `
             -Destination "dist/BitTorrent-Beobachter/THIRD_PARTY_NOTICES.md" -Force
-          Compress-Archive -Path "dist/BitTorrent-Beobachter/*" `
-            -DestinationPath "dist/BitTorrent-Beobachter-Windows-x64.zip"
-          $hash = (Get-FileHash -Algorithm SHA256 `
-            "dist/BitTorrent-Beobachter-Windows-x64.zip").Hash.ToLowerInvariant()
-          "$hash  BitTorrent-Beobachter-Windows-x64.zip" | `
-            Set-Content -Encoding ascii `
-            "dist/BitTorrent-Beobachter-Windows-x64.zip.sha256"
+          $pdfSource = `
+            "assets/Cybercrime-E-Mail-Kontakte_BKA-und-LKA_Deutschland_Stand-2026-10-20.pdf"
+          $expectedPdfHash = `
+            "75585bb562b705f5644734299f78d1b26f1bd083a4acd962d21704041feb2f12"
+          $actualPdfHash = (
+            Get-FileHash -Algorithm SHA256 -LiteralPath $pdfSource
+          ).Hash.ToLowerInvariant()
+          if ($actualPdfHash -ne $expectedPdfHash) {
+            throw "Die Prüfsumme der Kontakt-PDF stimmt nicht."
+          }
+          Copy-Item -LiteralPath $pdfSource `
+            -Destination "dist/BitTorrent-Beobachter/Cybercrime-E-Mail-Kontakte_BKA-und-LKA_Deutschland_Stand-2026-10-20.pdf" `
+            -Force
+          $checksums = @(
+            "BitTorrent-Beobachter.exe",
+            "Cybercrime-E-Mail-Kontakte_BKA-und-LKA_Deutschland_Stand-2026-10-20.pdf"
+          ) | ForEach-Object {
+            $filePath = Join-Path "dist/BitTorrent-Beobachter" $_
+            $hash = (
+              Get-FileHash -Algorithm SHA256 -LiteralPath $filePath
+            ).Hash.ToLowerInvariant()
+            "$hash  $_"
+          }
+          $checksums | Set-Content -Encoding ascii `
+            "dist/BitTorrent-Beobachter/SHA256SUMS.txt"
 
       - name: Geprüften Build bereitstellen
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: BitTorrent-Beobachter-Windows-x64
-          path: |
-            dist/BitTorrent-Beobachter-Windows-x64.zip
-            dist/BitTorrent-Beobachter-Windows-x64.zip.sha256
+          name: AfDLeakercatcher-Windows-x64
+          path: dist/BitTorrent-Beobachter
           if-no-files-found: error
 
   attest-public-build:
@@ -220,13 +236,13 @@ jobs:
       - name: Geprüften Build herunterladen
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: BitTorrent-Beobachter-Windows-x64
+          name: AfDLeakercatcher-Windows-x64
           path: attest
 
       - name: Herkunftsnachweis erzeugen
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
-          subject-path: attest/BitTorrent-Beobachter-Windows-x64.zip
+          subject-path: attest/BitTorrent-Beobachter.exe
 
   github-release:
     if: >-
@@ -246,8 +262,15 @@ jobs:
       - name: Geprüften Build herunterladen
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: BitTorrent-Beobachter-Windows-x64
-          path: release
+          name: AfDLeakercatcher-Windows-x64
+          path: release/package
+
+      - name: Einmal entpackbares Release-ZIP erstellen
+        run: |
+          cd release/package
+          zip -r ../AfDLeakercatcher-Windows-x64.zip .
+          cd ..
+          sha256sum AfDLeakercatcher-Windows-x64.zip > AfDLeakercatcher-Windows-x64.zip.sha256
 
       - name: GitHub-Release erstellen
         env:
@@ -257,5 +280,5 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --generate-notes \
-            "release/BitTorrent-Beobachter-Windows-x64.zip" \
-            "release/BitTorrent-Beobachter-Windows-x64.zip.sha256"
+            "release/AfDLeakercatcher-Windows-x64.zip" \
+            "release/AfDLeakercatcher-Windows-x64.zip.sha256"

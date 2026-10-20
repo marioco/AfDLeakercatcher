@@ -28,9 +28,11 @@ from .config import (
     AppConfig,
     ConfigError,
     ReportingSettings,
+    default_app_config,
     load_config,
     parse_magnet,
     save_config,
+    with_bundled_presets,
 )
 from .desktop import open_directory
 from .models import ScanResult
@@ -116,12 +118,34 @@ class ObserverApp:
 
     def _load_initial_config(self) -> AppConfig:
         if not self.config_path.exists():
-            return AppConfig(targets=())
+            config = default_app_config()
+            try:
+                save_config(self.config_path, config)
+            except (ConfigError, OSError) as exc:
+                messagebox.showerror(
+                    "Voreinstellungen nicht gespeichert",
+                    str(exc),
+                    parent=self.root,
+                )
+            return config
         try:
-            return load_config(self.config_path)
+            config = load_config(self.config_path)
         except ConfigError as exc:
             messagebox.showerror("Konfiguration fehlerhaft", str(exc))
             return AppConfig(targets=())
+
+        try:
+            migrated = with_bundled_presets(config)
+            if migrated != config:
+                save_config(self.config_path, migrated)
+        except (ConfigError, OSError) as exc:
+            messagebox.showerror(
+                "Voreinstellungen nicht aktualisiert",
+                str(exc),
+                parent=self.root,
+            )
+            return config
+        return migrated
 
     def _build_ui(self) -> None:
         outer = ttk.Frame(self.root, padding=16)
@@ -151,8 +175,17 @@ class ObserverApp:
             wraplength=930,
         ).pack(anchor="w")
 
-        target_box = ttk.LabelFrame(outer, text="Überwachte Infohashes", padding=10)
+        target_box = ttk.LabelFrame(outer, text="Ziele für manuelle Prüfläufe", padding=10)
         target_box.pack(fill=X, pady=(0, 12))
+        ttk.Label(
+            target_box,
+            text=(
+                "Die beiden Voreinstellungen bestätigen keinen Inhalt. Ein Prüflauf "
+                "beginnt erst nach „Jetzt prüfen“ und Ihrer ausdrücklichen Bestätigung."
+            ),
+            foreground="#555555",
+            wraplength=930,
+        ).pack(anchor="w", fill=X, pady=(0, 8))
         self.target_tree = ttk.Treeview(
             target_box,
             columns=("label", "hash"),
@@ -286,37 +319,28 @@ class ObserverApp:
             )
         if self.config.targets:
             self.status_text.set(
-                f"Bereit. {len(self.config.targets)} Ziel(e) konfiguriert; "
-                "es wird nichts automatisch versendet."
+                f"Bereit. {len(self.config.targets)} Ziel(e) konfiguriert; es läuft kein Prüflauf."
             )
+        else:
+            self.status_text.set("Bereit. Keine Ziele eingetragen; es läuft kein Prüflauf.")
 
     def _add_target(self) -> None:
         magnet = simpledialog.askstring(
             "Magnet-Link hinzufügen",
-            "Magnet-Link einfügen. Tracker-Angaben werden nicht gespeichert oder verwendet:",
+            (
+                "Magnet-Link einfügen. Gespeichert wird ausschließlich der "
+                "BitTorrent-v1-Infohash; Name, Tracker und sonstige Angaben werden verworfen:"
+            ),
             parent=self.root,
         )
         if not magnet:
             return
-        label = simpledialog.askstring(
-            "Bezeichnung",
-            "Kurze verständliche Bezeichnung (optional):",
-            parent=self.root,
-        )
-        source_note = simpledialog.askstring(
-            "Unbestätigter Quellen-/Sachverhaltshinweis",
-            (
-                "Optional: Beschreiben Sie, warum Sie den Infohash dem behaupteten "
-                "Inhalt zuordnen. Diese unbestätigte Nutzerangabe wird klar als solche "
-                "in den Entwürfen gekennzeichnet:"
-            ),
-            parent=self.root,
-        )
         try:
-            target = parse_magnet(
-                magnet,
-                label_override=(label or "").strip() or None,
-                source_note=(source_note or "").strip(),
+            parsed_target = parse_magnet(magnet)
+            target = replace(
+                parsed_target,
+                label=f"Infohash {parsed_target.info_hash_hex[:12]}",
+                source_note="",
             )
             if any(existing.info_hash == target.info_hash for existing in self.config.targets):
                 raise ConfigError("Dieser Infohash ist bereits eingetragen.")
@@ -351,10 +375,7 @@ class ObserverApp:
         )
         try:
             updated_config = replace(self.config, targets=targets)
-            if targets:
-                save_config(self.config_path, updated_config)
-            elif self.config_path.exists():
-                self.config_path.unlink()
+            save_config(self.config_path, updated_config)
         except (ConfigError, OSError) as exc:
             messagebox.showerror("Ziel nicht entfernt", str(exc), parent=self.root)
             return
@@ -368,8 +389,7 @@ class ObserverApp:
             return
         try:
             updated_config = replace(self.config, reporting=dialog.result)
-            if updated_config.targets:
-                save_config(self.config_path, updated_config)
+            save_config(self.config_path, updated_config)
         except (ConfigError, OSError) as exc:
             messagebox.showerror("Angaben nicht gespeichert", str(exc), parent=self.root)
             return
@@ -397,8 +417,7 @@ class ObserverApp:
         updated_enrichment = replace(self.config.enrichment, enabled=requested)
         updated_config = replace(self.config, enrichment=updated_enrichment)
         try:
-            if updated_config.targets:
-                save_config(self.config_path, updated_config)
+            save_config(self.config_path, updated_config)
         except (ConfigError, OSError) as exc:
             self.enrichment_enabled.set(previous)
             messagebox.showerror("Einstellung nicht gespeichert", str(exc), parent=self.root)
@@ -555,11 +574,25 @@ class ObserverApp:
         if result.report_paths:
             self.latest_output_dir = result.report_paths[0].parent
             self.open_button.configure(state="normal")
-        self.status_text.set(
-            f"Fertig: {len(result.candidates)} DHT-Treffer, {result.confirmed_count} bestätigte "
-            f"Handshakes, {result.known_vpn_count} bekannte VPN-Endpunkte. "
-            f"{len(result.errors)} Hinweis(e)/Fehler."
-        )
+        notice_count = len(result.notices)
+        if notice_count == 1:
+            notice_suffix = " 1 technischer Laufhinweis steht im Bericht."
+        elif notice_count > 1:
+            notice_suffix = f" {notice_count} technische Laufhinweise stehen im Bericht."
+        else:
+            notice_suffix = ""
+        if not result.candidates and not result.errors:
+            self.status_text.set(
+                "Fertig. Zurzeit wurden keine antwortenden Endpunkte gefunden. "
+                f"Das ist kein Programmfehler.{notice_suffix}"
+            )
+        else:
+            self.status_text.set(
+                f"Fertig: {len(result.candidates)} DHT-Treffer, "
+                f"{result.confirmed_count} bestätigte Handshakes, "
+                f"{result.known_vpn_count} bekannte VPN-Endpunkte. "
+                f"{len(result.errors)} Hinweis(e)/Fehler.{notice_suffix}"
+            )
         if result.errors:
             messagebox.showwarning(
                 "Prüflauf mit Hinweisen",

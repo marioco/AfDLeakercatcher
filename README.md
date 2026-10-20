@@ -36,12 +36,23 @@ sie sind keine veröffentlichte Version und können von GitHub nach einiger Zeit
 werden.
 
 1. Für den normalen Einsatz unter **Releases** das ZIP
-   `BitTorrent-Beobachter-Windows-x64.zip` herunterladen.
+   `AfDLeakercatcher-Windows-x64.zip` herunterladen.
 2. Die daneben veröffentlichte SHA-256-Prüfsumme vergleichen.
-3. Das ZIP vollständig entpacken und `BitTorrent-Beobachter.exe` doppelklicken.
-4. Über **Magnet-Link hinzufügen** ein Ziel eintragen.
+3. Das ZIP genau einmal vollständig entpacken und `BitTorrent-Beobachter.exe` doppelklicken.
+4. Die beiden vorgesehenen Infohashes sind bereits sichtbar eingetragen.
 5. **Jetzt prüfen** wählen und den Hinweis zur öffentlichen Sichtbarkeit bestätigen.
 6. Nach Abschluss **Ergebnisordner öffnen** wählen.
+
+Es gibt kein ZIP im ZIP. Auch ein Teststand unter **Actions → Artifacts** enthält direkt
+die Programmdateien und muss nur einmal entpackt werden. Für die beiden voreingestellten
+Ziele sind weder Titel noch Beschreibung einzugeben. Ein zusätzlicher Magnet-Link lässt
+sich bei Bedarf in genau einem Eingabefenster ergänzen.
+
+Im selben entpackten Ordner wie die EXE liegt die Datei
+`Cybercrime-E-Mail-Kontakte_BKA-und-LKA_Deutschland_Stand-2026-10-20.pdf` mit einer
+Kontaktübersicht. Sie ist eine separate Arbeitshilfe: Das Programm wählt daraus keine
+Empfänger automatisch aus, versendet keine E-Mail und macht aus einer Beobachtung keinen
+Beweis für Inhalt, Person oder Straftat.
 
 Ein Installer und Administratorrechte sind nicht nötig. Das bewusst verwendete
 `onedir`-Paket ist transparenter als eine selbstentpackende Ein-Datei-EXE und wird ohne
@@ -147,10 +158,16 @@ Die Hash-Kette des Journals wird geprüft mit:
 
 ## Konfiguration
 
-Die Oberfläche speichert aus einem Magnet-Link ausschließlich Bezeichnung und v1-btih.
-Tracker-URLs werden verworfen und nicht kontaktiert. Eine Konfiguration kann auch über
-`init --magnet ...` angelegt werden. Live-Ziele sind absichtlich nicht im öffentlichen
-Quellcode enthalten.
+Beim ersten Start legt die Oberfläche die beiden für dieses Projekt vorgesehenen
+Infohashes als sichtbare Voreinstellungen an. Beim ersten Start der Version 0.1.1
+werden fehlende Voreinstellungen auch in einer vorhandenen älteren Konfiguration
+einmalig ergänzt; vorhandene eigene Einträge bleiben unverändert und spätere bewusste
+Löschungen bleiben erhalten. Das bestätigt weder einen behaupteten Inhalt noch
+Echtheit, Rechtmäßigkeit, Besitz oder Übertragung und startet keinen Netzlauf. Bei
+einem zusätzlich eingefügten Magnet-Link speichert die Oberfläche
+ausschließlich den v1-btih-Infohash; Name, Tracker und sonstige Angaben werden verworfen
+und nicht kontaktiert. Eine Konfiguration kann auch über `init --magnet ...` angelegt
+werden.
 
 Wichtige Schutzgrenzen sind fest im Programm angelegt:
 
@@ -174,15 +191,17 @@ In PowerShell:
 ./build_windows.ps1
 ```
 
-Der GitHub-Workflow führt Tests und Ruff aus, baut mit PyInstaller ohne UPX, signiert
-optional, erstellt das ZIP samt SHA-256 und versieht öffentliche Nicht-PR-Builds mit
-einer GitHub-Artefaktbestätigung. Eine Bestätigung lässt sich mit der GitHub CLI prüfen:
+Der GitHub-Workflow führt Tests und Ruff aus, baut mit PyInstaller ohne UPX und
+signiert optional. Ein normaler Build stellt den direkt einmal entpackbaren App-Ordner
+bereit; ein Versions-Tag erzeugt daraus das Release-ZIP samt SHA-256. Öffentliche
+Nicht-PR-Builds erhalten außerdem eine GitHub-Artefaktbestätigung für die EXE. Nach dem
+Entpacken lässt sie sich mit der GitHub CLI prüfen:
 
 ```bash
-gh attestation verify BitTorrent-Beobachter-Windows-x64.zip -R marioco/AfDLeakercatcher
+gh attestation verify BitTorrent-Beobachter.exe -R marioco/AfDLeakercatcher
 ```
 
-Ein Push eines passenden Versionstags wie `bittorrent-beobachter-v0.1.0` erzeugt nach
+Ein Push eines passenden Versionstags wie `bittorrent-beobachter-v0.1.1` erzeugt nach
 erfolgreichem Build automatisch ein GitHub-Release mit ZIP, SHA-256-Datei und generierten
 Versionshinweisen. Andere erfolgreiche Workflow-Läufe stellen den Build nur als
 Actions-Artefakt bereit.

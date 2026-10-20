@@ -10,16 +10,18 @@ import stat
 import sys
 import tempfile
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from email.headerregistry import Address
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from .dht import MAX_BOOTSTRAP_NODES
 from .models import Target
 
 MAX_CONFIG_BYTES = 256_000
+MAX_CONFIG_TARGETS = 20
+BUNDLED_PRESET_REVISION = 1
 DEFAULT_BOOTSTRAP_NODES = (
     ("router.bittorrent.com", 6881),
     ("router.utorrent.com", 6881),
@@ -81,11 +83,48 @@ class ReportingSettings:
 @dataclass(frozen=True, slots=True)
 class AppConfig:
     targets: tuple[Target, ...]
+    preset_revision: int = BUNDLED_PRESET_REVISION
     interval_minutes: int = 30
     dht: DhtSettings = DhtSettings()
     peer: PeerSettings = PeerSettings()
     enrichment: EnrichmentSettings = EnrichmentSettings()
     reporting: ReportingSettings = ReportingSettings()
+
+
+DEFAULT_TARGETS = (
+    Target(
+        label="Voreingestellter Infohash 1",
+        info_hash=bytes.fromhex("852795102149749ad91123af01ceac5da6f9eb5a"),
+    ),
+    Target(
+        label="Voreingestellter Infohash 2",
+        info_hash=bytes.fromhex("db503db679f508aa31a9e07913b2aa8cf7aa6dff"),
+    ),
+)
+
+
+def default_app_config() -> AppConfig:
+    """Liefert die sichtbaren Erststart-Ziele, ohne einen Netzlauf zu beginnen."""
+    return AppConfig(targets=DEFAULT_TARGETS)
+
+
+def with_bundled_presets(config: AppConfig) -> AppConfig:
+    """Ergänzt Projektvorgaben einmalig und respektiert spätere Löschungen."""
+    if config.preset_revision >= BUNDLED_PRESET_REVISION:
+        return config
+
+    existing_hashes = {target.info_hash for target in config.targets}
+    missing = tuple(target for target in DEFAULT_TARGETS if target.info_hash not in existing_hashes)
+    if len(config.targets) + len(missing) > MAX_CONFIG_TARGETS:
+        raise ConfigError(
+            "Die einmalige Voreinstellungs-Aktualisierung überschreitet das "
+            f"Ziel-Limit von {MAX_CONFIG_TARGETS}."
+        )
+    return replace(
+        config,
+        targets=(*config.targets, *missing),
+        preset_revision=BUNDLED_PRESET_REVISION,
+    )
 
 
 def default_data_dir() -> Path:
@@ -138,7 +177,7 @@ def parse_magnet(
     label_override: str | None = None,
     source_note: str = "",
 ) -> Target:
-    """Extrahiert nur Name und v1-Infohash; Tracker werden absichtlich ignoriert."""
+    """Extrahiert nur den v1-Infohash; fremde Namen und Tracker werden ignoriert."""
     if len(magnet) > 32_000:
         raise ConfigError("Der Magnet-Link ist ungewöhnlich lang.")
     parts = urlsplit(magnet.strip())
@@ -151,9 +190,8 @@ def parse_magnet(
         raise ConfigError("Der Magnet-Link muss genau einen urn:btih-Infohash enthalten.")
 
     info_hash = _decode_btih(hashes[0])
-    display_name = unquote(query.get("dn", [""])[0]).strip()
     label = _clean_optional_text(
-        label_override or display_name or f"Infohash {info_hash.hex()[:12]}",
+        label_override or f"Infohash {info_hash.hex()[:12]}",
         "Bezeichnung",
         120,
     )
@@ -222,12 +260,18 @@ def config_from_dict(raw: dict[str, Any]) -> AppConfig:
     """Validiert die JSON-Struktur vollständig und baut eine AppConfig."""
     if raw.get("schema_version", 1) != 1:
         raise ConfigError("Diese Konfigurationsversion wird nicht unterstützt.")
+    preset_revision = _bounded_int(
+        raw.get("bundled_preset_revision", 0),
+        "bundled_preset_revision",
+        0,
+        BUNDLED_PRESET_REVISION,
+    )
 
     target_items = raw.get("targets")
-    if not isinstance(target_items, list) or not target_items:
-        raise ConfigError("Mindestens ein Ziel muss unter targets eingetragen sein.")
-    if len(target_items) > 20:
-        raise ConfigError("Höchstens 20 Ziele pro Installation sind erlaubt.")
+    if not isinstance(target_items, list):
+        raise ConfigError("targets muss eine Liste sein.")
+    if len(target_items) > MAX_CONFIG_TARGETS:
+        raise ConfigError(f"Höchstens {MAX_CONFIG_TARGETS} Ziele pro Installation sind erlaubt.")
 
     targets: list[Target] = []
     seen_hashes: set[bytes] = set()
@@ -384,6 +428,7 @@ def config_from_dict(raw: dict[str, Any]) -> AppConfig:
     )
     return AppConfig(
         targets=tuple(targets),
+        preset_revision=preset_revision,
         interval_minutes=_bounded_int(
             raw.get("interval_minutes", 30), "interval_minutes", 5, 1_440
         ),
@@ -421,6 +466,7 @@ def config_to_dict(config: AppConfig) -> dict[str, Any]:
     """Serialisiert ohne Magnet-Tracker oder andere nicht benötigte Daten."""
     return {
         "schema_version": 1,
+        "bundled_preset_revision": config.preset_revision,
         "interval_minutes": config.interval_minutes,
         "targets": [
             {
