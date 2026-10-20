@@ -1,5 +1,13 @@
 # BitTorrent-Beobachter
 
+## Windows-Download – Version 0.3.1
+
+### [⬇ AfDLeakercatcher für Windows herunterladen](https://github.com/marioco/AfDLeakercatcher/releases/download/bittorrent-beobachter-v0.3.1/AfDLeakercatcher-Windows-x64.zip)
+
+Keine GitHub-Kenntnisse nötig: Auf den Link klicken, die ZIP-Datei **einmal**
+entpacken und anschließend `BitTorrent-Beobachter.exe` doppelklicken. Es gibt keinen
+Installer und es werden keine Administratorrechte benötigt.
+
 Eine leicht bedienbare, quelloffene Python-Anwendung zur **inhaltsfreien** Prüfung
 ausdrücklich konfigurierter BitTorrent-v1-Infohashes. Die Anwendung fordert keine Datei-
 oder Torrent-Metadatenblöcke an, lädt keine davon hoch und verschickt keine Meldung
@@ -65,13 +73,12 @@ einem Anschluss kann nur der Provider im rechtlich vorgesehenen Verfahren leiste
 
 ## Einfacher Start unter Windows
 
-Veröffentlichte Versionen stehen in GitHub unter **Releases** bereit. Erfolgreiche
-Teststände sind zusätzlich beim jeweiligen Lauf unter **Actions → Artifacts** verfügbar;
-sie sind keine veröffentlichte Version und können von GitHub nach einiger Zeit gelöscht
-werden.
+Die aktuelle Windows-Version kann direkt über den großen Downloadlink ganz oben auf
+dieser Seite geladen werden. Erfolgreiche Teststände sind zusätzlich beim jeweiligen
+Lauf unter **Actions → Artifacts** verfügbar; sie sind keine veröffentlichte Version und
+können von GitHub nach einiger Zeit gelöscht werden.
 
-1. Für den normalen Einsatz unter **Releases** das ZIP
-   `AfDLeakercatcher-Windows-x64.zip` herunterladen.
+1. Ganz oben auf **AfDLeakercatcher für Windows herunterladen** klicken.
 2. Die daneben veröffentlichte SHA-256-Prüfsumme vergleichen.
 3. Das ZIP genau einmal vollständig entpacken und `BitTorrent-Beobachter.exe` doppelklicken.
 4. Die beiden vorgesehenen Infohashes sind bereits sichtbar eingetragen.

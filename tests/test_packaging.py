@@ -40,6 +40,18 @@ def test_actions_artifact_contains_the_raw_app_folder() -> None:
     assert "subject-path: attest/BitTorrent-Beobachter.exe" in workflow
 
 
+def test_main_build_publishes_versioned_direct_download_once() -> None:
+    workflow = (PROJECT_ROOT / ".github/workflows/build.yml").read_text(encoding="utf-8")
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert "github.ref == 'refs/heads/main'" in workflow
+    assert 'release_tag="bittorrent-beobachter-v${version}"' in workflow
+    assert "steps.release.outputs.exists != 'true'" in workflow
+    assert '--target "$GITHUB_SHA"' in workflow
+    assert "releases/download/bittorrent-beobachter-v0.3.1/" in readme
+    assert "AfDLeakercatcher-Windows-x64.zip" in readme
+
+
 def test_readme_verifies_the_attested_executable() -> None:
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
 

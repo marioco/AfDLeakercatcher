@@ -248,7 +248,8 @@ jobs:
     if: >-
       ${{ always() &&
           github.event_name == 'push' &&
-          (startsWith(github.ref, 'refs/tags/v') ||
+          (github.ref == 'refs/heads/main' ||
+           startsWith(github.ref, 'refs/tags/v') ||
            startsWith(github.ref, 'refs/tags/bittorrent-beobachter-v')) &&
           needs.test-and-build-windows.result == 'success' &&
           (needs.attest-public-build.result == 'success' ||
@@ -259,13 +260,39 @@ jobs:
       contents: write
 
     steps:
+      - name: Quellcode auschecken
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Release-Ziel bestimmen
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
+            version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+            release_tag="bittorrent-beobachter-v${version}"
+          else
+            release_tag="$GITHUB_REF_NAME"
+          fi
+          if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release $release_tag existiert bereits."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=$release_tag" >> "$GITHUB_OUTPUT"
+
       - name: Geprüften Build herunterladen
+        if: ${{ steps.release.outputs.exists != 'true' }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: AfDLeakercatcher-Windows-x64
           path: release/package
 
       - name: Einmal entpackbares Release-ZIP erstellen
+        if: ${{ steps.release.outputs.exists != 'true' }}
         run: |
           cd release/package
           zip -r ../AfDLeakercatcher-Windows-x64.zip .
@@ -273,12 +300,22 @@ jobs:
           sha256sum AfDLeakercatcher-Windows-x64.zip > AfDLeakercatcher-Windows-x64.zip.sha256
 
       - name: GitHub-Release erstellen
+        if: ${{ steps.release.outputs.exists != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --generate-notes \
+          set -euo pipefail
+          release_args=(--repo "$GITHUB_REPOSITORY" --generate-notes)
+          if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
+            release_args+=(--target "$GITHUB_SHA")
+          else
+            release_args+=(--verify-tag)
+          fi
+          gh release create "$RELEASE_TAG" \
+            "${release_args[@]}" \
             "release/AfDLeakercatcher-Windows-x64.zip" \
             "release/AfDLeakercatcher-Windows-x64.zip.sha256"
+
+          test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')" = "false"
+          test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')" = "2"
