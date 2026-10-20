@@ -171,8 +171,8 @@ class ObserverApp:
         ttk.Label(
             outer,
             text=(
-                "Inhaltsfreie Beobachtung: Es werden weder Dateien noch Torrent-Metadaten "
-                "heruntergeladen, angefordert oder hochgeladen."
+                "Inhaltsfreie Verfügbarkeitsprüfung: Es werden keine Datei- oder "
+                "Metadatenblöcke angefordert, heruntergeladen oder hochgeladen."
             ),
             foreground="#205493",
             wraplength=950,
@@ -183,10 +183,11 @@ class ObserverApp:
         ttk.Label(
             notice,
             text=(
-                "Ein bestätigter Handshake belegt nur, dass ein Netzwerkendpunkt zu diesem "
-                "Zeitpunkt für den Infohash antwortete. Er identifiziert keine Person und "
-                "beweist weder Dateibesitz noch Upload oder Strafbarkeit. Jeder Entwurf muss "
-                "vor Verwendung von einem Menschen geprüft werden."
+                "Ein positiver Befund bedeutet: Der Endpunkt bestätigte den Infohash, "
+                "meldete verfügbare Teile und erlaubte während der einminütigen Verbindung "
+                "das Stellen von Datenanfragen. Es werden keine Datenblöcke angefordert. "
+                "Der Befund identifiziert keine Person und beweist keinen tatsächlichen "
+                "Upload oder eine Straftat. Jede Anzeige muss vor dem Versand geprüft werden."
             ),
             wraplength=930,
         ).pack(anchor="w")
@@ -298,7 +299,7 @@ class ObserverApp:
             "time": "Zeit (UTC)",
             "target": "Ziel",
             "endpoint": "Endpunkt",
-            "status": "Handshake",
+            "status": "Verfügbarkeitsprüfung",
             "network": "Netzbetreiber",
             "class": "Einordnung",
         }
@@ -306,7 +307,7 @@ class ObserverApp:
             "time": 145,
             "target": 150,
             "endpoint": 180,
-            "status": 100,
+            "status": 205,
             "network": 190,
             "class": 120,
         }
@@ -455,9 +456,11 @@ class ObserverApp:
             (
                 "Dieser Prüflauf ist nicht anonym: DHT-Knoten und geprüfte "
                 "Peer-Endpunkte sehen Ihre öffentliche Quell-IP und den abgefragten "
-                "Infohash und können dies protokollieren. Das Programm führt kein "
-                "announce durch und lädt weder Inhalte noch Metadaten herunter oder "
-                "hoch. Möchten Sie den Prüflauf trotzdem starten?"
+                "Infohash und können dies protokollieren. Nach einem passenden Handshake "
+                "bleibt die direkte Verbindung bis zu einer Minute offen und das Programm "
+                "meldet Interesse, fordert aber keine Datei- oder Metadatenblöcke an. Es "
+                "führt kein announce durch und lädt nichts hoch. Möchten Sie den Prüflauf "
+                "trotzdem starten?"
             ),
             parent=self.root,
         ):
@@ -585,7 +588,13 @@ class ObserverApp:
                     handshake.completed_at_utc or handshake.attempted_at_utc,
                     candidate.target_label,
                     endpoint,
-                    "bestätigt" if handshake.confirmed else "nicht bestätigt",
+                    (
+                        "Teile gemeldet; Anfragen erlaubt"
+                        if handshake.offering_observed
+                        else "nur Handshake"
+                        if handshake.confirmed
+                        else "nicht bestätigt"
+                    ),
                     network,
                     classification,
                 ),
@@ -609,6 +618,7 @@ class ObserverApp:
             self.status_text.set(
                 f"Fertig: {len(result.candidates)} DHT-Treffer, "
                 f"{result.confirmed_count} bestätigte Handshakes, "
+                f"{result.offering_count} positive Verfügbarkeitsprüfungen, "
                 f"{result.known_vpn_count} bekannte VPN-Endpunkte. "
                 f"{len(result.errors)} Hinweis(e)/Fehler.{notice_suffix}"
             )

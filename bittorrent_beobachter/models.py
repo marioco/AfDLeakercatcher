@@ -40,8 +40,48 @@ class PeerCandidate:
 
 
 @dataclass(frozen=True, slots=True)
+class PeerControlEvent:
+    """Ein inhaltsfreies, zeitlich eingeordnetes Ereignis des Peer-Protokolls."""
+
+    observed_at_utc: str
+    elapsed_seconds: float
+    kind: str
+    payload_length: int
+    piece_index: int | None = None
+    non_empty: bool | None = None
+    payload_sha256: str | None = None
+    set_bits: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PeerAvailabilityObservation:
+    """Inhaltsfreie Beobachtung gemeldeter Verfügbarkeit und Freigabe."""
+
+    started_at_utc: str
+    ended_at_utc: str
+    requested_duration_seconds: float
+    duration_seconds: float
+    completed_full_window: bool
+    interested_sent: bool
+    non_empty_bitfield: bool
+    have_announced: bool
+    piece_availability_announced: bool
+    unchoked: bool
+    peer_choking_at_end: bool
+    unchoked_duration_seconds: float
+    messages_received: int
+    bytes_received: int
+    request_messages_sent: int
+    piece_payload_bytes_received: int
+    metadata_requests_sent: int
+    termination_reason: str
+    control_events: tuple[PeerControlEvent, ...]
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class HandshakeResult:
-    """Resultat der auf genau einen BitTorrent-Handshake begrenzten Prüfung."""
+    """Resultat von Handshake und optionaler inhaltsfreier Verfügbarkeitsprüfung."""
 
     candidate: PeerCandidate
     attempted_at_utc: str
@@ -54,6 +94,21 @@ class HandshakeResult:
     bytes_sent: int
     bytes_received: int
     error: str | None
+    availability: PeerAvailabilityObservation | None = None
+
+    @property
+    def offering_observed(self) -> bool:
+        """Nur der vollständig und fehlerfrei beobachtete positive Gesamtbefund."""
+        observation = self.availability
+        return bool(
+            self.confirmed
+            and observation is not None
+            and observation.completed_full_window
+            and observation.interested_sent
+            and observation.piece_availability_announced
+            and observation.unchoked
+            and observation.error is None
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +167,10 @@ class ScanResult:
     @property
     def confirmed_count(self) -> int:
         return sum(result.confirmed for result in self.handshakes)
+
+    @property
+    def offering_count(self) -> int:
+        return sum(result.offering_observed for result in self.handshakes)
 
     @property
     def known_vpn_count(self) -> int:

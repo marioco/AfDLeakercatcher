@@ -31,6 +31,7 @@ from bittorrent_beobachter.dht import (
 from bittorrent_beobachter.models import (
     HandshakeResult,
     NetworkEnrichment,
+    PeerAvailabilityObservation,
     PeerCandidate,
     ScanResult,
     Target,
@@ -63,6 +64,27 @@ def _candidate(
 
 
 def _confirmed(candidate: PeerCandidate) -> HandshakeResult:
+    availability = PeerAvailabilityObservation(
+        started_at_utc="2026-10-20T12:00:01.100Z",
+        ended_at_utc="2026-10-20T12:01:01.100Z",
+        requested_duration_seconds=60.0,
+        duration_seconds=60.0,
+        completed_full_window=True,
+        interested_sent=True,
+        non_empty_bitfield=True,
+        have_announced=False,
+        piece_availability_announced=True,
+        unchoked=True,
+        peer_choking_at_end=False,
+        unchoked_duration_seconds=59.0,
+        messages_received=2,
+        bytes_received=8,
+        request_messages_sent=0,
+        piece_payload_bytes_received=0,
+        metadata_requests_sent=0,
+        termination_reason="duration_elapsed",
+        control_events=(),
+    )
     return HandshakeResult(
         candidate=candidate,
         attempted_at_utc="2026-10-20T12:00:01.000Z",
@@ -75,6 +97,7 @@ def _confirmed(candidate: PeerCandidate) -> HandshakeResult:
         bytes_sent=68,
         bytes_received=68,
         error=None,
+        availability=availability,
     )
 
 

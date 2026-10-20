@@ -27,6 +27,7 @@ from bittorrent_beobachter.models import (
     EvidenceRecord,
     HandshakeResult,
     NetworkEnrichment,
+    PeerAvailabilityObservation,
     PeerCandidate,
     ScanResult,
     VpnClassification,
@@ -165,6 +166,31 @@ def _candidate(*, ipv6: bool = False) -> PeerCandidate:
 
 
 def _handshake(*, confirmed: bool = True, ipv6: bool = False) -> HandshakeResult:
+    availability = (
+        PeerAvailabilityObservation(
+            started_at_utc="2026-10-20T10:00:02Z",
+            ended_at_utc="2026-10-20T10:01:02Z",
+            requested_duration_seconds=60.0,
+            duration_seconds=60.0,
+            completed_full_window=True,
+            interested_sent=True,
+            non_empty_bitfield=True,
+            have_announced=False,
+            piece_availability_announced=True,
+            unchoked=True,
+            peer_choking_at_end=False,
+            unchoked_duration_seconds=58.0,
+            messages_received=2,
+            bytes_received=8,
+            request_messages_sent=0,
+            piece_payload_bytes_received=0,
+            metadata_requests_sent=0,
+            termination_reason="duration_elapsed",
+            control_events=(),
+        )
+        if confirmed
+        else None
+    )
     return HandshakeResult(
         candidate=_candidate(ipv6=ipv6),
         attempted_at_utc="2026-10-20T10:00:01Z",
@@ -177,6 +203,7 @@ def _handshake(*, confirmed: bool = True, ipv6: bool = False) -> HandshakeResult
         bytes_sent=68 if confirmed else 0,
         bytes_received=68 if confirmed else 0,
         error=None if confirmed else "Zeitüberschreitung",
+        availability=availability,
     )
 
 
@@ -842,7 +869,7 @@ def test_result_table_uses_plain_language_and_ipv6_endpoint(tmp_path: Path) -> N
 
     values = app.result_tree.inserted[0][1]["values"]
     assert values[2] == "[2001:4860:4860::8888]:51413"
-    assert values[3] == "bestätigt"
+    assert values[3] == "Teile gemeldet; Anfragen erlaubt"
     assert values[4] == "Beispielnetz"
     assert values[5] == "VPN: Beispiel-VPN"
 

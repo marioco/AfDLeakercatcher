@@ -1,25 +1,56 @@
-"""Minimale TCP-Verifikation mit genau einem Standard-BitTorrent-Handshake."""
+"""Inhaltsfreie TCP-Prüfung eines BitTorrent-Peers ohne Datenanforderungen."""
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import ipaddress
 import secrets
 import socket
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from .dht import MAX_TIMEOUT_SECONDS, normalize_global_endpoint
-from .models import HandshakeResult, PeerCandidate
+from .models import (
+    HandshakeResult,
+    PeerAvailabilityObservation,
+    PeerCandidate,
+    PeerControlEvent,
+)
 
 PROTOCOL_NAME = b"BitTorrent protocol"
 HANDSHAKE_LENGTH = 68
 RESERVED_BITS = b"\x00" * 8
+INTERESTED_MESSAGE = b"\x00\x00\x00\x01\x02"
+
+DEFAULT_OBSERVATION_SECONDS = 60.0
+MIN_OBSERVATION_SECONDS = 0.01
+MAX_OBSERVATION_SECONDS = 300.0
+MAX_PEER_MESSAGE_LENGTH = 1_048_576
+MAX_BITFIELD_BYTES = MAX_PEER_MESSAGE_LENGTH - 1
+MAX_OBSERVATION_BYTES = 4_194_304
+MAX_CONTROL_EVENTS = 512
+RECEIVE_CHUNK_BYTES = 16_384
+
+MESSAGE_CHOKE = 0
+MESSAGE_UNCHOKE = 1
+MESSAGE_INTERESTED = 2
+MESSAGE_NOT_INTERESTED = 3
+MESSAGE_HAVE = 4
+MESSAGE_BITFIELD = 5
+MESSAGE_REQUEST = 6
+MESSAGE_PIECE = 7
+MESSAGE_EXTENSION = 20
 
 
 class PeerHandshakeError(OSError):
     """Der TCP-Peer lieferte keinen vollständigen Standard-Handshake."""
+
+
+class PeerProtocolError(OSError):
+    """Der Peer lieferte nach dem Handshake eine unzulässige Kontrollnachricht."""
 
 
 @dataclass(slots=True)
@@ -28,6 +59,28 @@ class _ExchangeState:
     bytes_received: int = 0
     local_ip: str | None = None
     local_port: int | None = None
+
+
+@dataclass(slots=True)
+class _ObservationState:
+    started_at_utc: str
+    started_monotonic: float
+    events: list[PeerControlEvent] = field(default_factory=list)
+    messages_received: int = 0
+    bytes_received: int = 0
+    non_empty_bitfield: bool = False
+    have_announced: bool = False
+    unchoked: bool = False
+    peer_choking: bool = True
+    unchoked_since: float | None = None
+    completed_unchoked_seconds: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class _PeerExchange:
+    handshake: bytes
+    handshake_completed_at_utc: str
+    availability: PeerAvailabilityObservation
 
 
 def _utc_now_text() -> str:
@@ -87,14 +140,386 @@ def _safe_error(error: BaseException) -> str:
     return f"{label}: {text}"[:500] if text else label
 
 
+def _elapsed_seconds(started_monotonic: float, ended_monotonic: float | None = None) -> float:
+    end = time.monotonic() if ended_monotonic is None else ended_monotonic
+    return round(max(0.0, end - started_monotonic), 6)
+
+
+def _record_event(
+    state: _ObservationState,
+    kind: str,
+    *,
+    payload_length: int,
+    piece_index: int | None = None,
+    non_empty: bool | None = None,
+    payload_sha256: str | None = None,
+    set_bits: int | None = None,
+) -> float:
+    observed_monotonic = time.monotonic()
+    state.events.append(
+        PeerControlEvent(
+            observed_at_utc=_utc_now_text(),
+            elapsed_seconds=_elapsed_seconds(state.started_monotonic, observed_monotonic),
+            kind=kind,
+            payload_length=payload_length,
+            piece_index=piece_index,
+            non_empty=non_empty,
+            payload_sha256=payload_sha256,
+            set_bits=set_bits,
+        )
+    )
+    return observed_monotonic
+
+
+async def _receive_exact(
+    loop: asyncio.AbstractEventLoop,
+    peer_socket: socket.socket,
+    size: int,
+    *,
+    deadline: float,
+    exchange_state: _ExchangeState,
+    observation_state: _ObservationState | None = None,
+    allow_clean_eof: bool = False,
+) -> bytes | None:
+    """Liest exakt eine kleine Protokollstruktur innerhalb einer festen Frist."""
+    if size < 0:
+        raise ValueError("Empfangsgröße darf nicht negativ sein.")
+    received = bytearray()
+    while len(received) < size:
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            if received:
+                raise PeerProtocolError("Peer-Nachricht blieb bis zum Fristende unvollständig.")
+            raise TimeoutError
+        maximum = min(size - len(received), RECEIVE_CHUNK_BYTES)
+        try:
+            chunk = await asyncio.wait_for(
+                loop.sock_recv(peer_socket, maximum),
+                timeout=remaining_seconds,
+            )
+        except TimeoutError:
+            if received:
+                raise PeerProtocolError(
+                    "Peer-Nachricht blieb bis zum Fristende unvollständig."
+                ) from None
+            raise
+        if not chunk:
+            if allow_clean_eof and not received:
+                return None
+            raise PeerProtocolError("TCP-Verbindung endete mitten in einer Peer-Nachricht.")
+        received.extend(chunk)
+        exchange_state.bytes_received += len(chunk)
+        if observation_state is not None:
+            observation_state.bytes_received += len(chunk)
+    return bytes(received)
+
+
+async def _read_bitfield(
+    loop: asyncio.AbstractEventLoop,
+    peer_socket: socket.socket,
+    payload_length: int,
+    *,
+    deadline: float,
+    exchange_state: _ExchangeState,
+    observation_state: _ObservationState,
+) -> tuple[str, int]:
+    """Hasht das begrenzte Bitfield blockweise, ohne dessen Bytes aufzubewahren."""
+    digest = hashlib.sha256()
+    set_bits = 0
+    remaining = payload_length
+    while remaining:
+        chunk_size = min(remaining, RECEIVE_CHUNK_BYTES)
+        chunk = await _receive_exact(
+            loop,
+            peer_socket,
+            chunk_size,
+            deadline=deadline,
+            exchange_state=exchange_state,
+            observation_state=observation_state,
+        )
+        if chunk is None:
+            raise AssertionError("Bitfield-Empfang darf kein sauberes EOF liefern.")
+        digest.update(chunk)
+        set_bits += sum(value.bit_count() for value in chunk)
+        remaining -= len(chunk)
+    return digest.hexdigest(), set_bits
+
+
+def _availability_result(
+    state: _ObservationState,
+    *,
+    requested_duration_seconds: float,
+    interested_sent: bool,
+    termination_reason: str,
+    completed_full_window: bool,
+    error: str | None = None,
+) -> PeerAvailabilityObservation:
+    ended_monotonic = time.monotonic()
+    unchoked_seconds = state.completed_unchoked_seconds
+    if not state.peer_choking and state.unchoked_since is not None:
+        unchoked_seconds += max(0.0, ended_monotonic - state.unchoked_since)
+    return PeerAvailabilityObservation(
+        started_at_utc=state.started_at_utc,
+        ended_at_utc=_utc_now_text(),
+        requested_duration_seconds=requested_duration_seconds,
+        duration_seconds=_elapsed_seconds(state.started_monotonic, ended_monotonic),
+        completed_full_window=completed_full_window,
+        interested_sent=interested_sent,
+        non_empty_bitfield=state.non_empty_bitfield,
+        have_announced=state.have_announced,
+        piece_availability_announced=(state.non_empty_bitfield or state.have_announced),
+        unchoked=state.unchoked,
+        peer_choking_at_end=state.peer_choking,
+        unchoked_duration_seconds=round(unchoked_seconds, 6),
+        messages_received=state.messages_received,
+        bytes_received=state.bytes_received,
+        request_messages_sent=0,
+        piece_payload_bytes_received=0,
+        metadata_requests_sent=0,
+        termination_reason=termination_reason,
+        control_events=tuple(state.events),
+        error=error,
+    )
+
+
+async def _observe_control_messages(
+    loop: asyncio.AbstractEventLoop,
+    peer_socket: socket.socket,
+    exchange_state: _ExchangeState,
+    *,
+    observation_seconds: float,
+) -> PeerAvailabilityObservation:
+    started_monotonic = time.monotonic()
+    state = _ObservationState(
+        started_at_utc=_utc_now_text(),
+        started_monotonic=started_monotonic,
+    )
+    deadline = started_monotonic + observation_seconds
+
+    while True:
+        if len(state.events) >= MAX_CONTROL_EVENTS:
+            error = PeerProtocolError(
+                f"Kontrollereignis-Limit von {MAX_CONTROL_EVENTS} wurde erreicht."
+            )
+            return _availability_result(
+                state,
+                requested_duration_seconds=observation_seconds,
+                interested_sent=True,
+                termination_reason="control_event_limit",
+                completed_full_window=False,
+                error=_safe_error(error),
+            )
+        if MAX_OBSERVATION_BYTES - state.bytes_received < 4:
+            error = PeerProtocolError(
+                f"Beobachtungs-Limit von {MAX_OBSERVATION_BYTES} Byte wurde erreicht."
+            )
+            return _availability_result(
+                state,
+                requested_duration_seconds=observation_seconds,
+                interested_sent=True,
+                termination_reason="byte_limit",
+                completed_full_window=False,
+                error=_safe_error(error),
+            )
+
+        try:
+            length_prefix = await _receive_exact(
+                loop,
+                peer_socket,
+                4,
+                deadline=deadline,
+                exchange_state=exchange_state,
+                observation_state=state,
+                allow_clean_eof=True,
+            )
+        except TimeoutError:
+            return _availability_result(
+                state,
+                requested_duration_seconds=observation_seconds,
+                interested_sent=True,
+                termination_reason="duration_elapsed",
+                completed_full_window=True,
+            )
+        except (OSError, PeerProtocolError) as exc:
+            return _availability_result(
+                state,
+                requested_duration_seconds=observation_seconds,
+                interested_sent=True,
+                termination_reason="protocol_or_network_error",
+                completed_full_window=time.monotonic() >= deadline,
+                error=_safe_error(exc),
+            )
+
+        if length_prefix is None:
+            return _availability_result(
+                state,
+                requested_duration_seconds=observation_seconds,
+                interested_sent=True,
+                termination_reason="peer_closed",
+                completed_full_window=False,
+            )
+
+        message_length = int.from_bytes(length_prefix, "big")
+        state.messages_received += 1
+        if message_length == 0:
+            _record_event(state, "keepalive", payload_length=0)
+            continue
+        if message_length > MAX_PEER_MESSAGE_LENGTH:
+            error = PeerProtocolError(
+                f"Peer-Nachricht überschreitet {MAX_PEER_MESSAGE_LENGTH} Byte."
+            )
+            return _availability_result(
+                state,
+                requested_duration_seconds=observation_seconds,
+                interested_sent=True,
+                termination_reason="oversized_message",
+                completed_full_window=False,
+                error=_safe_error(error),
+            )
+        if state.bytes_received + message_length > MAX_OBSERVATION_BYTES:
+            error = PeerProtocolError(
+                f"Peer-Nachricht überschreitet das Beobachtungs-Limit von "
+                f"{MAX_OBSERVATION_BYTES} Byte."
+            )
+            return _availability_result(
+                state,
+                requested_duration_seconds=observation_seconds,
+                interested_sent=True,
+                termination_reason="byte_limit",
+                completed_full_window=False,
+                error=_safe_error(error),
+            )
+
+        try:
+            message_id_bytes = await _receive_exact(
+                loop,
+                peer_socket,
+                1,
+                deadline=deadline,
+                exchange_state=exchange_state,
+                observation_state=state,
+            )
+            if message_id_bytes is None:
+                raise AssertionError("Nachrichten-ID darf kein sauberes EOF liefern.")
+            message_id = message_id_bytes[0]
+            payload_length = message_length - 1
+
+            if message_id in {
+                MESSAGE_CHOKE,
+                MESSAGE_UNCHOKE,
+                MESSAGE_INTERESTED,
+                MESSAGE_NOT_INTERESTED,
+            }:
+                if payload_length != 0:
+                    raise PeerProtocolError(
+                        f"Kontrollnachricht {message_id} hat eine ungültige Länge."
+                    )
+                event_kind = {
+                    MESSAGE_CHOKE: "choke",
+                    MESSAGE_UNCHOKE: "unchoke",
+                    MESSAGE_INTERESTED: "peer_interested",
+                    MESSAGE_NOT_INTERESTED: "peer_not_interested",
+                }[message_id]
+                event_monotonic = _record_event(state, event_kind, payload_length=0)
+                if message_id == MESSAGE_UNCHOKE:
+                    state.unchoked = True
+                    if state.peer_choking:
+                        state.peer_choking = False
+                        state.unchoked_since = event_monotonic
+                elif message_id == MESSAGE_CHOKE and not state.peer_choking:
+                    if state.unchoked_since is not None:
+                        state.completed_unchoked_seconds += max(
+                            0.0, event_monotonic - state.unchoked_since
+                        )
+                    state.peer_choking = True
+                    state.unchoked_since = None
+                continue
+
+            if message_id == MESSAGE_HAVE:
+                if payload_length != 4:
+                    raise PeerProtocolError("HAVE-Nachricht muss genau 5 Byte lang sein.")
+                piece_bytes = await _receive_exact(
+                    loop,
+                    peer_socket,
+                    4,
+                    deadline=deadline,
+                    exchange_state=exchange_state,
+                    observation_state=state,
+                )
+                if piece_bytes is None:
+                    raise AssertionError("HAVE-Nutzlast darf kein sauberes EOF liefern.")
+                piece_index = int.from_bytes(piece_bytes, "big")
+                state.have_announced = True
+                _record_event(
+                    state,
+                    "have",
+                    payload_length=4,
+                    piece_index=piece_index,
+                )
+                continue
+
+            if message_id == MESSAGE_BITFIELD:
+                if not 1 <= payload_length <= MAX_BITFIELD_BYTES:
+                    raise PeerProtocolError("BITFIELD-Nachricht hat eine ungültige Länge.")
+                payload_sha256, set_bits = await _read_bitfield(
+                    loop,
+                    peer_socket,
+                    payload_length,
+                    deadline=deadline,
+                    exchange_state=exchange_state,
+                    observation_state=state,
+                )
+                non_empty = set_bits > 0
+                state.non_empty_bitfield = state.non_empty_bitfield or non_empty
+                _record_event(
+                    state,
+                    "bitfield",
+                    payload_length=payload_length,
+                    non_empty=non_empty,
+                    payload_sha256=payload_sha256,
+                    set_bits=set_bits,
+                )
+                continue
+
+            rejected_kind = {
+                MESSAGE_REQUEST: "request_rejected",
+                MESSAGE_PIECE: "piece_rejected",
+                MESSAGE_EXTENSION: "extension_rejected",
+            }.get(message_id, "unknown_message_rejected")
+            _record_event(state, rejected_kind, payload_length=payload_length)
+            raise PeerProtocolError(
+                f"Peer-Nachricht {message_id} wird ohne Einlesen der Nutzlast abgelehnt."
+            )
+        except TimeoutError:
+            error = PeerProtocolError("Peer-Nachricht blieb bis zum Fristende unvollständig.")
+            return _availability_result(
+                state,
+                requested_duration_seconds=observation_seconds,
+                interested_sent=True,
+                termination_reason="incomplete_message",
+                completed_full_window=True,
+                error=_safe_error(error),
+            )
+        except (OSError, PeerProtocolError) as exc:
+            return _availability_result(
+                state,
+                requested_duration_seconds=observation_seconds,
+                interested_sent=True,
+                termination_reason="protocol_or_network_error",
+                completed_full_window=time.monotonic() >= deadline,
+                error=_safe_error(exc),
+            )
+
+
 class PeerVerifier:
-    """Verifiziert einen Kandidaten ohne Bitfield, Requests oder Inhaltsabruf."""
+    """Prüft Handshake und Kontrollmeldungen, ohne Inhaltsblöcke anzufordern."""
 
     def __init__(
         self,
         *,
         peer_id: bytes | None = None,
         timeout: float = 5.0,
+        observation_seconds: float = DEFAULT_OBSERVATION_SECONDS,
     ) -> None:
         self.peer_id = peer_id if peer_id is not None else _default_peer_id()
         if not isinstance(self.peer_id, bytes) or len(self.peer_id) != 20:
@@ -107,14 +532,24 @@ class PeerVerifier:
             raise ValueError(
                 f"timeout muss zwischen 0.1 und {MAX_TIMEOUT_SECONDS} Sekunden liegen."
             )
+        if (
+            isinstance(observation_seconds, bool)
+            or not isinstance(observation_seconds, (int, float))
+            or not MIN_OBSERVATION_SECONDS <= float(observation_seconds) <= MAX_OBSERVATION_SECONDS
+        ):
+            raise ValueError(
+                "observation_seconds muss zwischen "
+                f"{MIN_OBSERVATION_SECONDS} und {MAX_OBSERVATION_SECONDS} Sekunden liegen."
+            )
         self.timeout = float(timeout)
+        self.observation_seconds = float(observation_seconds)
 
     async def _exchange(
         self,
         endpoint: tuple[str, int],
         outgoing_handshake: bytes,
         state: _ExchangeState,
-    ) -> bytes:
+    ) -> _PeerExchange:
         if (
             len(outgoing_handshake) != HANDSHAKE_LENGTH
             or outgoing_handshake[20:28] != RESERVED_BITS
@@ -129,22 +564,64 @@ class PeerVerifier:
         peer_socket = socket.socket(family, socket.SOCK_STREAM)
         try:
             peer_socket.setblocking(False)
-            response = bytearray()
-            await loop.sock_connect(peer_socket, sockaddr)
+            await asyncio.wait_for(
+                loop.sock_connect(peer_socket, sockaddr),
+                timeout=self.timeout,
+            )
             state.local_ip, state.local_port = _normalize_local_address(peer_socket.getsockname())
-            await loop.sock_sendall(peer_socket, outgoing_handshake)
+            await asyncio.wait_for(
+                loop.sock_sendall(peer_socket, outgoing_handshake),
+                timeout=self.timeout,
+            )
             state.bytes_sent = len(outgoing_handshake)
 
-            while len(response) < HANDSHAKE_LENGTH:
-                remaining = HANDSHAKE_LENGTH - len(response)
-                chunk = await loop.sock_recv(peer_socket, remaining)
-                if not chunk:
-                    raise PeerHandshakeError(
-                        "TCP-Verbindung endete vor dem vollständigen Peer-Handshake."
-                    )
-                response.extend(chunk)
-                state.bytes_received = len(response)
-            return bytes(response)
+            response = await _receive_exact(
+                loop,
+                peer_socket,
+                HANDSHAKE_LENGTH,
+                deadline=time.monotonic() + self.timeout,
+                exchange_state=state,
+            )
+            if response is None:
+                raise AssertionError("Handshake-Empfang darf kein sauberes EOF liefern.")
+            parse_handshake_response(
+                response,
+                expected_info_hash=outgoing_handshake[28:48],
+            )
+            handshake_completed_at = _utc_now_text()
+
+            try:
+                await asyncio.wait_for(
+                    loop.sock_sendall(peer_socket, INTERESTED_MESSAGE),
+                    timeout=self.timeout,
+                )
+                state.bytes_sent += len(INTERESTED_MESSAGE)
+            except OSError as exc:
+                now_monotonic = time.monotonic()
+                failed_state = _ObservationState(
+                    started_at_utc=_utc_now_text(),
+                    started_monotonic=now_monotonic,
+                )
+                availability = _availability_result(
+                    failed_state,
+                    requested_duration_seconds=self.observation_seconds,
+                    interested_sent=False,
+                    termination_reason="interested_send_error",
+                    completed_full_window=False,
+                    error=_safe_error(exc),
+                )
+            else:
+                availability = await _observe_control_messages(
+                    loop,
+                    peer_socket,
+                    state,
+                    observation_seconds=self.observation_seconds,
+                )
+            return _PeerExchange(
+                handshake=response,
+                handshake_completed_at_utc=handshake_completed_at,
+                availability=availability,
+            )
         finally:
             peer_socket.close()
 
@@ -153,7 +630,7 @@ class PeerVerifier:
         candidate: PeerCandidate,
         info_hash: bytes,
     ) -> HandshakeResult:
-        """Sendet einmal 68 Byte, liest höchstens 68 Byte und schließt sofort."""
+        """Beobachtet einen passenden Peer zeitlich begrenzt und vollständig inhaltsfrei."""
         if not isinstance(candidate, PeerCandidate):
             raise TypeError("candidate muss ein PeerCandidate sein.")
         if not isinstance(info_hash, bytes) or len(info_hash) != 20:
@@ -188,28 +665,24 @@ class PeerVerifier:
             )
 
         outgoing = build_handshake(info_hash, self.peer_id)
-        completed_at: str | None = None
         try:
-            response = await asyncio.wait_for(
-                self._exchange(endpoint, outgoing, state), timeout=self.timeout
-            )
-            completed_at = _utc_now_text()
+            exchange = await self._exchange(endpoint, outgoing, state)
             reserved_bits, remote_peer_id = parse_handshake_response(
-                response, expected_info_hash=info_hash
+                exchange.handshake,
+                expected_info_hash=info_hash,
             )
         except OSError as exc:
             return self._result(
                 candidate,
                 attempted_at,
                 state,
-                completed_at=completed_at,
                 error=_safe_error(exc),
             )
 
         return HandshakeResult(
             candidate=candidate,
             attempted_at_utc=attempted_at,
-            completed_at_utc=completed_at,
+            completed_at_utc=exchange.handshake_completed_at_utc,
             confirmed=True,
             remote_peer_id_hex=remote_peer_id.hex(),
             reserved_bits_hex=reserved_bits.hex(),
@@ -218,6 +691,7 @@ class PeerVerifier:
             bytes_sent=state.bytes_sent,
             bytes_received=state.bytes_received,
             error=None,
+            availability=exchange.availability,
         )
 
     @staticmethod
@@ -226,13 +700,12 @@ class PeerVerifier:
         attempted_at: str,
         state: _ExchangeState,
         *,
-        completed_at: str | None = None,
         error: str,
     ) -> HandshakeResult:
         return HandshakeResult(
             candidate=candidate,
             attempted_at_utc=attempted_at,
-            completed_at_utc=completed_at,
+            completed_at_utc=None,
             confirmed=False,
             remote_peer_id_hex=None,
             reserved_bits_hex=None,
@@ -250,7 +723,12 @@ async def verify_peer(
     *,
     peer_id: bytes | None = None,
     timeout: float = 5.0,
+    observation_seconds: float = DEFAULT_OBSERVATION_SECONDS,
 ) -> HandshakeResult:
-    """Komfortfunktion für eine einzelne, minimalinvasive Peer-Verifikation."""
-    verifier = PeerVerifier(peer_id=peer_id, timeout=timeout)
+    """Komfortfunktion für eine einzelne inhaltsfreie Peer-Verfügbarkeitsprüfung."""
+    verifier = PeerVerifier(
+        peer_id=peer_id,
+        timeout=timeout,
+        observation_seconds=observation_seconds,
+    )
     return await verifier.verify(candidate, info_hash)

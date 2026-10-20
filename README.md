@@ -1,8 +1,8 @@
 # BitTorrent-Beobachter
 
-Eine leicht bedienbare, quelloffene Python-Anwendung zur **inhaltsfreien** Beobachtung
-ausdrücklich konfigurierter BitTorrent-v1-Infohashes. Die Anwendung lädt keine Dateien
-oder Torrent-Metadaten herunter, stellt nichts bereit und verschickt keine Meldung
+Eine leicht bedienbare, quelloffene Python-Anwendung zur **inhaltsfreien** Prüfung
+ausdrücklich konfigurierter BitTorrent-v1-Infohashes. Die Anwendung fordert keine Datei-
+oder Torrent-Metadatenblöcke an, stellt nichts bereit und verschickt keine Meldung
 automatisch.
 
 ## Was die Anwendung belastbar sagen kann
@@ -11,16 +11,23 @@ Die Anwendung fragt das öffentliche BitTorrent-DHT ausschließlich mit `get_pee
 Für gefundene Endpunkte führt sie eine eng begrenzte Prüfung durch:
 
 1. Ein DHT-Knoten nennt `IP:Port` für den konfigurierten Infohash.
-2. Die Anwendung sendet genau den standardisierten 68-Byte-BitTorrent-Handshake.
-3. Nur wenn der Endpunkt mit einem gültigen Handshake für denselben Infohash antwortet,
-   werden eine prüfbare technische Anlage und eine versandfertige Strafanzeige als
-   `.eml`-Datei erzeugt.
-4. Danach wird die Verbindung sofort geschlossen. Es folgen keine Protokollnachrichten.
+2. Die Anwendung sendet den standardisierten 68-Byte-BitTorrent-Handshake.
+3. Nach einem gültigen Handshake für denselben Infohash meldet sie auf derselben
+   Verbindung Interesse und beobachtet bis zu 60 Sekunden ausschließlich
+   BitTorrent-Kontrollnachrichten.
+4. Ein positiver Verfügbarkeitsbefund erfordert das vollständige Beobachtungsfenster,
+   mindestens ein nicht leeres `bitfield`- oder gültiges `have`-Signal und mindestens
+   ein `unchoke`. Das bedeutet: Der Endpunkt meldete verfügbare Teile und teilte dem
+   Prüfprogramm mit, dass es Datenblöcke anfordern dürfe.
+5. Die Anwendung sendet niemals `request`-Nachrichten und fordert weder Dateiinhalte
+   noch Torrent-Metadaten an. Erst bei einem positiven Verfügbarkeitsbefund werden eine
+   technische Anlage und eine versandfertige Strafanzeige als `.eml` erzeugt.
 
-Das belegt ausschließlich, dass der angesprochene Netzwerkendpunkt zum protokollierten
-Zeitpunkt für diesen Infohash antwortete. Es belegt **nicht**:
+Das ist ein stärkeres Protokollindiz als ein bloßer Eintrag in einer Teilnehmerliste oder
+ein Handshake. Die Kontrollsignale werden jedoch vom Gegenüber selbst erzeugt und ohne
+Inhaltsabruf nicht gegen echte Dateistücke geprüft. Der Befund belegt daher **nicht**:
 
-- Besitz, Download oder Upload eines Dateiteils,
+- tatsächlichen Besitz, Download oder Upload eines Dateiteils,
 - Inhalt oder Echtheit des bezeichneten Archivs,
 - Identität oder Handlung des Anschlussinhabers,
 - Vorsatz, Rechtswidrigkeit oder eine Straftat.
@@ -71,7 +78,8 @@ jeweiligen Lauf-ID und erzeugen:
 
 - `<Lauf-ID>_laufbericht.pdf`: Umfang, Ergebnisse, Fehler und Aussagegrenzen;
 - `<Lauf-ID>_beobachtungen.csv`: tabellarische technische Beobachtungen;
-- pro bestätigter, nicht als bekannter VPN-Endpunkt eingestufter IP eine
+- pro positiver, nicht als bekannter VPN-Endpunkt eingestufter
+  Verfügbarkeitsprüfung eine
   `<Lauf-ID>_anlage_<IP>.pdf` und
   `<Lauf-ID>_strafanzeige_<IP>.eml`;
 - `<Lauf-ID>_vpn_liste.pdf` und `<Lauf-ID>_vpn_liste.csv`: bekannte
@@ -99,7 +107,8 @@ Löschkonzept zu klären. Die Anwendung versucht keine Person zu deanonymisieren
 verarbeitet nur:
 
 - öffentlich im DHT genannte Endpunkte,
-- den minimalen BitTorrent-Handshake,
+- den BitTorrent-Handshake sowie streng begrenzte `interested`-, `bitfield`-,
+  `have`-, `choke`- und `unchoke`-Kontrollnachrichten,
 - öffentliche RDAP- und RIPEstat-Netzbetreiberangaben.
 
 Ein Prüflauf ist **nicht anonym**. Die kontaktierten DHT-Knoten und geprüften
@@ -177,15 +186,16 @@ werden.
 Wichtige Schutzgrenzen sind fest im Programm angelegt:
 
 - höchstens 20 Ziele;
-- höchstens 600 Sekunden für die gesamte DHT- und Handshake-Netzphase sowie weitere
+- höchstens 600 Sekunden für die gesamte DHT- und Peer-Netzphase sowie weitere
   harte Zeitlimits und Grenzen für DHT-Knoten, Anfragen, Treffer und parallele
-  Handshakes;
+  Peer-Prüfungen;
 - höchstens 20 externe Netzauskünfte pro Lauf; weitere bestätigte Adressen bleiben in
   diesem Lauf ohne externe Anreicherung;
 - nur global routbare öffentliche Adressen;
 - zufällige Knoten- und Peer-ID pro Lauf;
-- niemals `announce_peer`, Tracker-Announce, `interested`, `request`, `piece`,
-  `ut_metadata` oder Peer Exchange;
+- niemals `announce_peer`, Tracker-Announce, `request`, `piece`,
+  `ut_metadata`-Anforderung oder Peer Exchange; `interested` wird ausschließlich
+  innerhalb der beschriebenen Kontrollnachrichtenprüfung gesendet;
 - Single-Instance-Sperre gegen überlappende Läufe.
 
 ## Windows-Build selbst prüfen
@@ -206,7 +216,7 @@ Entpacken lässt sie sich mit der GitHub CLI prüfen:
 gh attestation verify BitTorrent-Beobachter.exe -R marioco/AfDLeakercatcher
 ```
 
-Ein Push eines passenden Versionstags wie `bittorrent-beobachter-v0.1.1` erzeugt nach
+Ein Push eines passenden Versionstags wie `bittorrent-beobachter-v0.2.0` erzeugt nach
 erfolgreichem Build automatisch ein GitHub-Release mit ZIP, SHA-256-Datei und generierten
 Versionshinweisen. Andere erfolgreiche Workflow-Läufe stellen den Build nur als
 Actions-Artefakt bereit.

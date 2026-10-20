@@ -1,14 +1,18 @@
-"""Offline-Tests für den auf einen Handshake begrenzten TCP-Prüfer."""
+"""Offline-Tests für die inhaltsfreie Peer-Verfügbarkeitsprüfung."""
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import unittest
 from unittest.mock import patch
 
 import bittorrent_beobachter.peer as peer_module
-from bittorrent_beobachter.models import PeerCandidate
+from bittorrent_beobachter.models import PeerCandidate, ScanResult
 from bittorrent_beobachter.peer import (
     HANDSHAKE_LENGTH,
+    INTERESTED_MESSAGE,
+    MAX_PEER_MESSAGE_LENGTH,
     PROTOCOL_NAME,
     PeerHandshakeError,
     PeerVerifier,
@@ -33,6 +37,80 @@ def candidate(ip: str = "8.8.8.8", info_hash_hex: str = INFO_HASH.hex()) -> Peer
         transaction_id_hex="0102",
         response_sha256="a" * 64,
     )
+
+
+def peer_message(message_id: int, payload: bytes = b"") -> bytes:
+    length = 1 + len(payload)
+    return length.to_bytes(4, "big") + bytes((message_id,)) + payload
+
+
+class FakeSocket:
+    def __init__(self) -> None:
+        self.closed = False
+        self.blocking: bool | None = None
+
+    def setblocking(self, value: bool) -> None:
+        self.blocking = value
+
+    def getsockname(self) -> tuple[str, int]:
+        return "192.0.2.5", 40_000
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeLoop:
+    def __init__(self, incoming: bytes, *, close_when_empty: bool) -> None:
+        self.incoming = bytearray(incoming)
+        self.close_when_empty = close_when_empty
+        self.sent: list[bytes] = []
+        self.receive_sizes: list[int] = []
+        self.connected_to: tuple[object, ...] | None = None
+
+    async def sock_connect(
+        self,
+        _socket: object,
+        address: tuple[object, ...],
+    ) -> None:
+        self.connected_to = address
+
+    async def sock_sendall(self, _socket: object, payload: bytes) -> None:
+        self.sent.append(payload)
+
+    async def sock_recv(self, _socket: object, maximum: int) -> bytes:
+        self.receive_sizes.append(maximum)
+        if self.incoming:
+            size = min(maximum, len(self.incoming))
+            chunk = bytes(self.incoming[:size])
+            del self.incoming[:size]
+            return chunk
+        if self.close_when_empty:
+            return b""
+        await asyncio.sleep(3_600)
+        raise AssertionError("Blockierter Testempfang wurde unerwartet fortgesetzt.")
+
+
+async def run_verifier(
+    incoming_after_handshake: bytes,
+    *,
+    close_when_empty: bool,
+    remote_info_hash: bytes = INFO_HASH,
+    observation_seconds: float = 0.01,
+) -> tuple[object, FakeSocket, FakeLoop]:
+    incoming = build_handshake(remote_info_hash, REMOTE_PEER_ID) + incoming_after_handshake
+    fake_socket = FakeSocket()
+    fake_loop = FakeLoop(incoming, close_when_empty=close_when_empty)
+    verifier = PeerVerifier(
+        peer_id=LOCAL_PEER_ID,
+        timeout=1.0,
+        observation_seconds=observation_seconds,
+    )
+    with (
+        patch.object(peer_module.socket, "socket", return_value=fake_socket),
+        patch.object(peer_module.asyncio, "get_running_loop", return_value=fake_loop),
+    ):
+        result = await verifier.verify(candidate(), INFO_HASH)
+    return result, fake_socket, fake_loop
 
 
 class PeerHandshakeTests(unittest.TestCase):
@@ -60,32 +138,159 @@ class PeerHandshakeTests(unittest.TestCase):
 
 
 class PeerVerifierTests(unittest.IsolatedAsyncioTestCase):
-    async def test_verifier_reports_a_matching_68_byte_exchange(self) -> None:
-        verifier = PeerVerifier(peer_id=LOCAL_PEER_ID, timeout=1.0)
-        sent: list[bytes] = []
+    async def test_full_window_records_availability_and_never_requests_data(self) -> None:
+        bitfield = b"\xa0\x01"
+        wire = (
+            peer_message(1) + peer_message(5, bitfield) + peer_message(4, (23).to_bytes(4, "big"))
+        )
 
-        async def exchange(endpoint, outgoing, state):  # type: ignore[no-untyped-def]
-            self.assertEqual(endpoint, ("8.8.8.8", 6881))
-            sent.append(outgoing)
-            state.local_ip = "192.0.2.5"
-            state.local_port = 40000
-            state.bytes_sent = len(outgoing)
-            state.bytes_received = HANDSHAKE_LENGTH
-            return build_handshake(INFO_HASH, REMOTE_PEER_ID)
-
-        verifier._exchange = exchange  # type: ignore[method-assign]
-
-        result = await verifier.verify(candidate(), INFO_HASH)
+        result, fake_socket, fake_loop = await run_verifier(
+            wire,
+            close_when_empty=False,
+        )
 
         self.assertTrue(result.confirmed)
-        self.assertEqual(sent, [build_handshake(INFO_HASH, LOCAL_PEER_ID)])
-        self.assertEqual(result.bytes_sent, 68)
-        self.assertEqual(result.bytes_received, 68)
+        self.assertTrue(result.offering_observed)
+        self.assertEqual(
+            fake_loop.sent,
+            [build_handshake(INFO_HASH, LOCAL_PEER_ID), INTERESTED_MESSAGE],
+        )
+        self.assertEqual(result.bytes_sent, 73)
         self.assertEqual(result.remote_peer_id_hex, REMOTE_PEER_ID.hex())
         self.assertEqual(result.local_ip, "192.0.2.5")
+        self.assertIsNotNone(result.availability)
+        observation = result.availability
+        assert observation is not None
+        self.assertTrue(observation.completed_full_window)
+        self.assertTrue(observation.interested_sent)
+        self.assertTrue(observation.non_empty_bitfield)
+        self.assertTrue(observation.have_announced)
+        self.assertTrue(observation.piece_availability_announced)
+        self.assertTrue(observation.unchoked)
+        self.assertFalse(observation.peer_choking_at_end)
+        self.assertGreater(observation.unchoked_duration_seconds, 0.0)
+        self.assertEqual(observation.request_messages_sent, 0)
+        self.assertEqual(observation.piece_payload_bytes_received, 0)
+        self.assertEqual(observation.metadata_requests_sent, 0)
+        self.assertEqual(observation.termination_reason, "duration_elapsed")
+        bitfield_event = next(
+            event for event in observation.control_events if event.kind == "bitfield"
+        )
+        self.assertEqual(bitfield_event.payload_sha256, hashlib.sha256(bitfield).hexdigest())
+        self.assertEqual(bitfield_event.set_bits, 3)
+        have_event = next(event for event in observation.control_events if event.kind == "have")
+        self.assertEqual(have_event.piece_index, 23)
+        scan_result = ScanResult(
+            run_id="test-run",
+            started_at_utc="2026-10-20T12:00:00Z",
+            handshakes=[result],
+        )
+        self.assertEqual(scan_result.offering_count, 1)
+        self.assertFalse(fake_socket.blocking)
+        self.assertTrue(fake_socket.closed)
+
+    async def test_choke_timeline_records_end_state(self) -> None:
+        wire = peer_message(1) + peer_message(0) + peer_message(5, b"\x80")
+
+        result, _fake_socket, _fake_loop = await run_verifier(
+            wire,
+            close_when_empty=False,
+        )
+
+        observation = result.availability
+        assert observation is not None
+        self.assertTrue(result.offering_observed)
+        self.assertTrue(observation.unchoked)
+        self.assertTrue(observation.peer_choking_at_end)
+        self.assertEqual(
+            [event.kind for event in observation.control_events],
+            ["unchoke", "choke", "bitfield"],
+        )
+
+    async def test_early_disconnect_never_counts_as_full_observation(self) -> None:
+        wire = peer_message(1) + peer_message(5, b"\x80")
+
+        result, _fake_socket, _fake_loop = await run_verifier(
+            wire,
+            close_when_empty=True,
+        )
+
+        observation = result.availability
+        assert observation is not None
+        self.assertTrue(result.confirmed)
+        self.assertFalse(result.offering_observed)
+        self.assertFalse(observation.completed_full_window)
+        self.assertTrue(observation.piece_availability_announced)
+        self.assertTrue(observation.unchoked)
+        self.assertEqual(observation.termination_reason, "peer_closed")
+
+    async def test_forbidden_messages_are_rejected_without_reading_payload(self) -> None:
+        forbidden = ((6, "request_rejected"), (7, "piece_rejected"), (20, "extension_rejected"))
+        for message_id, event_kind in forbidden:
+            with self.subTest(message_id=message_id):
+                payload = b"must-not-be-read"
+                wire = peer_message(1) + peer_message(5, b"\x80")
+                header_and_id = (1 + len(payload)).to_bytes(4, "big") + bytes((message_id,))
+                result, _fake_socket, fake_loop = await run_verifier(
+                    wire + header_and_id + payload,
+                    close_when_empty=False,
+                )
+
+                observation = result.availability
+                assert observation is not None
+                self.assertFalse(result.offering_observed)
+                self.assertIsNotNone(observation.error)
+                self.assertEqual(observation.piece_payload_bytes_received, 0)
+                self.assertEqual(fake_loop.incoming, bytearray(payload))
+                self.assertEqual(observation.control_events[-1].kind, event_kind)
+
+    async def test_unknown_message_and_oversized_frame_stop_before_payload(self) -> None:
+        unknown_payload = b"not-read"
+        unknown_wire = (1 + len(unknown_payload)).to_bytes(4, "big") + b"\x63" + unknown_payload
+        unknown_result, _socket, unknown_loop = await run_verifier(
+            unknown_wire,
+            close_when_empty=False,
+        )
+        unknown_observation = unknown_result.availability
+        assert unknown_observation is not None
+        self.assertFalse(unknown_result.offering_observed)
+        self.assertEqual(unknown_loop.incoming, bytearray(unknown_payload))
+        self.assertEqual(
+            unknown_observation.control_events[-1].kind,
+            "unknown_message_rejected",
+        )
+
+        oversized_prefix = (MAX_PEER_MESSAGE_LENGTH + 1).to_bytes(4, "big")
+        oversized_result, _socket, oversized_loop = await run_verifier(
+            oversized_prefix,
+            close_when_empty=False,
+        )
+        oversized_observation = oversized_result.availability
+        assert oversized_observation is not None
+        self.assertFalse(oversized_result.offering_observed)
+        self.assertEqual(oversized_observation.termination_reason, "oversized_message")
+        self.assertEqual(oversized_loop.incoming, bytearray())
+
+    async def test_malformed_fixed_control_message_is_not_positive(self) -> None:
+        payload = b"not-read"
+        malformed = (1 + len(payload)).to_bytes(4, "big") + b"\x01" + payload
+
+        result, _fake_socket, fake_loop = await run_verifier(
+            malformed,
+            close_when_empty=False,
+        )
+
+        observation = result.availability
+        assert observation is not None
+        self.assertFalse(result.offering_observed)
+        self.assertIsNotNone(observation.error)
+        self.assertEqual(fake_loop.incoming, bytearray(payload))
 
     async def test_verifier_refuses_non_global_or_mismatched_candidates(self) -> None:
-        verifier = PeerVerifier(peer_id=LOCAL_PEER_ID)
+        verifier = PeerVerifier(
+            peer_id=LOCAL_PEER_ID,
+            observation_seconds=0.01,
+        )
 
         private_result = await verifier.verify(candidate(ip="127.0.0.1"), INFO_HASH)
         mismatch_result = await verifier.verify(
@@ -93,90 +298,61 @@ class PeerVerifierTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertFalse(private_result.confirmed)
+        self.assertFalse(private_result.offering_observed)
         self.assertEqual(private_result.bytes_sent, 0)
         self.assertIn("Nichtglobaler", private_result.error or "")
         self.assertFalse(mismatch_result.confirmed)
         self.assertEqual(mismatch_result.bytes_sent, 0)
         self.assertIn("Infohash", mismatch_result.error or "")
 
-    async def test_wrong_response_hash_is_not_confirmed(self) -> None:
-        verifier = PeerVerifier(peer_id=LOCAL_PEER_ID, timeout=1.0)
-
-        async def exchange(_endpoint, outgoing, state):  # type: ignore[no-untyped-def]
-            state.bytes_sent = len(outgoing)
-            state.bytes_received = HANDSHAKE_LENGTH
-            return build_handshake(b"x" * 20, REMOTE_PEER_ID)
-
-        verifier._exchange = exchange  # type: ignore[method-assign]
-
-        result = await verifier.verify(candidate(), INFO_HASH)
+    async def test_wrong_response_hash_is_not_confirmed_or_observed(self) -> None:
+        result, _fake_socket, fake_loop = await run_verifier(
+            b"",
+            close_when_empty=True,
+            remote_info_hash=b"x" * 20,
+        )
 
         self.assertFalse(result.confirmed)
+        self.assertFalse(result.offering_observed)
         self.assertEqual(result.bytes_received, 68)
+        self.assertIsNone(result.availability)
         self.assertIn("anderen Infohash", result.error or "")
+        self.assertEqual(fake_loop.sent, [build_handshake(INFO_HASH, LOCAL_PEER_ID)])
 
-    async def test_transport_sends_once_reads_at_most_68_and_closes(self) -> None:
-        outgoing = build_handshake(INFO_HASH, LOCAL_PEER_ID)
-        incoming = build_handshake(INFO_HASH, REMOTE_PEER_ID)
-
-        class FakeSocket:
-            def __init__(self) -> None:
-                self.closed = False
-                self.blocking: bool | None = None
-
-            def setblocking(self, value: bool) -> None:
-                self.blocking = value
-
-            def getsockname(self) -> tuple[str, int]:
-                return "192.0.2.5", 40_000
-
-            def close(self) -> None:
-                self.closed = True
-
-        class FakeLoop:
-            def __init__(self) -> None:
-                self.sent: list[bytes] = []
-                self.receive_sizes: list[int] = []
-                self.chunks = [incoming[:17], incoming[17:]]
-
-            async def sock_connect(
-                self,
-                _socket: object,
-                address: tuple[object, ...],
-            ) -> None:
-                self.test_address = address
-
-            async def sock_sendall(self, _socket: object, payload: bytes) -> None:
-                self.sent.append(payload)
-
-            async def sock_recv(self, _socket: object, maximum: int) -> bytes:
-                self.receive_sizes.append(maximum)
-                chunk = self.chunks.pop(0)
-                if len(chunk) > maximum:
-                    raise AssertionError("Test-Chunk überschreitet angeforderte Größe.")
-                return chunk
-
+    async def test_cancellation_closes_socket_without_suppressing_cancel(self) -> None:
         fake_socket = FakeSocket()
-        fake_loop = FakeLoop()
-        verifier = PeerVerifier(peer_id=LOCAL_PEER_ID, timeout=1.0)
-        state = peer_module._ExchangeState()
+        fake_loop = FakeLoop(
+            build_handshake(INFO_HASH, REMOTE_PEER_ID),
+            close_when_empty=False,
+        )
+        verifier = PeerVerifier(
+            peer_id=LOCAL_PEER_ID,
+            timeout=1.0,
+            observation_seconds=60.0,
+        )
         with (
             patch.object(peer_module.socket, "socket", return_value=fake_socket),
-            patch.object(
-                peer_module.asyncio,
-                "get_running_loop",
-                return_value=fake_loop,
-            ),
+            patch.object(peer_module.asyncio, "get_running_loop", return_value=fake_loop),
         ):
-            received = await verifier._exchange(("8.8.8.8", 6881), outgoing, state)
+            task = asyncio.create_task(verifier.verify(candidate(), INFO_HASH))
+            for _ in range(100):
+                if len(fake_loop.sent) == 2:
+                    break
+                await asyncio.sleep(0)
+            self.assertEqual(len(fake_loop.sent), 2)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
 
-        self.assertEqual(received, incoming)
-        self.assertEqual(fake_loop.sent, [outgoing])
-        self.assertEqual(fake_loop.receive_sizes, [68, 51])
-        self.assertEqual(state.bytes_sent, 68)
-        self.assertEqual(state.bytes_received, 68)
-        self.assertFalse(fake_socket.blocking)
         self.assertTrue(fake_socket.closed)
+
+    def test_observation_duration_is_validated(self) -> None:
+        with self.assertRaises(ValueError):
+            PeerVerifier(peer_id=LOCAL_PEER_ID, observation_seconds=0.0)
+        with self.assertRaises(ValueError):
+            PeerVerifier(peer_id=LOCAL_PEER_ID, observation_seconds=True)
+        with self.assertRaises(ValueError):
+            PeerVerifier(peer_id=LOCAL_PEER_ID, observation_seconds=301.0)
 
 
 if __name__ == "__main__":

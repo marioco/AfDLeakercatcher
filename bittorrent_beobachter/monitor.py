@@ -447,7 +447,10 @@ async def _verify_candidates(
         return []
 
     info_hashes = {target.info_hash_hex: target.info_hash for target in config.targets}
-    verifier = PeerVerifier(timeout=config.peer.timeout_seconds)
+    verifier = PeerVerifier(
+        timeout=config.peer.timeout_seconds,
+        observation_seconds=config.peer.observation_seconds,
+    )
     work_queue: asyncio.Queue[tuple[int, PeerCandidate]] = asyncio.Queue()
     for index, candidate in enumerate(selected):
         work_queue.put_nowait((index, candidate))
@@ -470,14 +473,16 @@ async def _verify_candidates(
             finally:
                 work_queue.task_done()
 
-    worker_count = min(config.peer.workers, len(selected))
+    worker_count = min(config.peer.observation_workers, len(selected))
     await asyncio.gather(*(worker() for _ in range(worker_count)))
     if any(item is None for item in ordered):
         raise MonitorError("Interner Fehler: Nicht alle Handshake-Aufgaben wurden abgeschlossen.")
     results = [item for item in ordered if item is not None]
     progress(
-        f"Handshake-Pruefung abgeschlossen: {sum(item.confirmed for item in results)} "
-        f"von {len(results)} bestaetigt"
+        "Direkte Peer-Pruefung abgeschlossen: "
+        f"{sum(item.confirmed for item in results)} Handshake(s), "
+        f"{sum(item.offering_observed for item in results)} Verfuegbarkeitsbeobachtung(en) "
+        f"von {len(results)} Kandidat(en) bestaetigt"
     )
     return results
 
@@ -510,21 +515,21 @@ async def _bounded_network_phase(
         network_task.cancel()
         await asyncio.gather(network_task, return_exceptions=True)
         raise MonitorError(
-            "Die gesamte DHT- und Handshake-Netzwerkphase hat die harte "
+            "Die gesamte DHT- und Peer-Netzwerkphase hat die harte "
             f"Zeitgrenze von {int(NETWORK_PHASE_TIMEOUT_SECONDS)} Sekunden erreicht."
         )
     if network_task.cancelled():
-        raise MonitorError("Die DHT- und Handshake-Netzwerkphase wurde unerwartet abgebrochen.")
+        raise MonitorError("Die DHT- und Peer-Netzwerkphase wurde unerwartet abgebrochen.")
 
     try:
         return network_task.result()
     except TimeoutError as exc:
         raise MonitorError(
-            "Eine einzelne Operation der DHT- oder Handshake-Phase überschritt ihr Zeitlimit."
+            "Eine einzelne Operation der DHT- oder Peer-Phase überschritt ihr Zeitlimit."
         ) from exc
     except OSError as exc:
         raise MonitorError(
-            "Die DHT- oder Handshake-Phase scheiterte wegen eines Netzwerkfehlers."
+            "Die DHT- oder Peer-Phase scheiterte wegen eines Netzwerkfehlers."
         ) from exc
 
 
@@ -561,7 +566,9 @@ def _enrich_confirmed_handshakes(
         vpn_provider_markers=_group_marker_rules(config.enrichment.vpn_provider_markers),
     )
     confirmed_ips = tuple(
-        dict.fromkeys(handshake.candidate.ip for handshake in handshakes if handshake.confirmed)
+        dict.fromkeys(
+            handshake.candidate.ip for handshake in handshakes if handshake.offering_observed
+        )
     )
     enriched: dict[str, tuple[NetworkEnrichment, VpnClassification]] = {}
     enricher: NetworkEnricher | None = None
@@ -651,13 +658,13 @@ def _append_evidence_records(
     config_sha256: str,
     software_sha256: str,
 ) -> list[EvidenceRecord]:
-    confirmed = [handshake for handshake in handshakes if handshake.confirmed]
+    confirmed = [handshake for handshake in handshakes if handshake.offering_observed]
     events = []
     for handshake in confirmed:
         enrichment, vpn = enrichment_by_ip[handshake.candidate.ip]
         events.append(
             {
-                "event_type": "confirmed_bittorrent_handshake",
+                "event_type": "observed_bittorrent_piece_availability",
                 "run_id": run_id,
                 "config_sha256": config_sha256,
                 "software_sha256": software_sha256,

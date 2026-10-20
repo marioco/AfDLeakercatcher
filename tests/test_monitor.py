@@ -22,6 +22,7 @@ from bittorrent_beobachter.config import (
     EnrichmentSettings,
     PeerSettings,
     ReportingSettings,
+    config_from_dict,
     config_to_dict,
     default_app_config,
     load_config,
@@ -32,6 +33,7 @@ from bittorrent_beobachter.evidence import EvidenceJournal
 from bittorrent_beobachter.models import (
     HandshakeResult,
     NetworkEnrichment,
+    PeerAvailabilityObservation,
     PeerCandidate,
     ScanResult,
     Target,
@@ -51,6 +53,8 @@ def test_default_app_config_contains_only_neutral_first_run_targets() -> None:
     ]
     assert all(target.source_note == "" for target in config.targets)
     assert config.enrichment.enabled is False
+    assert config.peer.observation_seconds == 60.0
+    assert config.peer.observation_workers == 32
     serialized = json.dumps(config_to_dict(config), ensure_ascii=False).casefold()
     assert "magnet:" not in serialized
     assert "tracker" not in serialized
@@ -66,6 +70,14 @@ def test_empty_target_selection_is_persisted(tmp_path: Path) -> None:
     loaded = load_config(config_path)
     assert loaded.targets == ()
     assert config_to_dict(loaded)["targets"] == []
+
+
+def test_config_requires_exact_one_minute_peer_observation() -> None:
+    raw = config_to_dict(default_app_config())
+    raw["peer"]["observation_seconds"] = 59.0
+
+    with pytest.raises(ConfigError, match=r"peer\.observation_seconds"):
+        config_from_dict(raw)
 
 
 def test_legacy_config_receives_presets_only_once() -> None:
@@ -109,6 +121,31 @@ def _candidate(target: Target, ip: str, port: int) -> PeerCandidate:
 
 
 def _handshake(candidate: PeerCandidate, *, confirmed: bool = True) -> HandshakeResult:
+    availability = (
+        PeerAvailabilityObservation(
+            started_at_utc="2026-10-20T10:00:01.100Z",
+            ended_at_utc="2026-10-20T10:01:01.100Z",
+            requested_duration_seconds=60.0,
+            duration_seconds=60.0,
+            completed_full_window=True,
+            interested_sent=True,
+            non_empty_bitfield=True,
+            have_announced=False,
+            piece_availability_announced=True,
+            unchoked=True,
+            peer_choking_at_end=False,
+            unchoked_duration_seconds=59.0,
+            messages_received=2,
+            bytes_received=8,
+            request_messages_sent=0,
+            piece_payload_bytes_received=0,
+            metadata_requests_sent=0,
+            termination_reason="duration_elapsed",
+            control_events=(),
+        )
+        if confirmed
+        else None
+    )
     return HandshakeResult(
         candidate=candidate,
         attempted_at_utc="2026-10-20T10:00:01.000Z",
@@ -121,6 +158,7 @@ def _handshake(candidate: PeerCandidate, *, confirmed: bool = True) -> Handshake
         bytes_sent=68 if confirmed else 0,
         bytes_received=68 if confirmed else 0,
         error=None if confirmed else "ConnectionRefusedError: abgelehnt",
+        availability=availability,
     )
 
 
@@ -208,8 +246,9 @@ def _install_successful_network_fakes(
             ]
 
     class FakeVerifier:
-        def __init__(self, *, timeout: float) -> None:
+        def __init__(self, *, timeout: float, observation_seconds: float) -> None:
             calls["verifier_timeout"] = timeout
+            calls["verifier_observation_seconds"] = observation_seconds
 
         async def verify(self, candidate: PeerCandidate, _info_hash: bytes) -> HandshakeResult:
             calls["verified"].append((candidate.info_hash_hex, candidate.ip))
@@ -320,6 +359,7 @@ def test_run_scan_integrates_fair_checks_opt_in_and_canonical_journal(
     assert dht_config.max_nodes == 80
     assert dht_config.max_candidates == 10
     assert calls["verifier_timeout"] == 2.0
+    assert calls["verifier_observation_seconds"] == 60.0
 
     # Der konfigurierte VPN-CIDR wird offline erkannt und niemals extern abgefragt.
     assert calls["enriched"] == ["1.1.1.1", "1.0.0.1"]
@@ -348,17 +388,17 @@ def test_run_scan_integrates_fair_checks_opt_in_and_canonical_journal(
     events = [json.loads(line)["event"] for line in journal_path.read_text().splitlines()]
     assert [event["event_type"] for event in events] == [
         "scan_started",
-        "confirmed_bittorrent_handshake",
-        "confirmed_bittorrent_handshake",
-        "confirmed_bittorrent_handshake",
+        "observed_bittorrent_piece_availability",
+        "observed_bittorrent_piece_availability",
+        "observed_bittorrent_piece_availability",
         "scan_completed",
     ]
     assert batches == [
         ("scan_started",),
         (
-            "confirmed_bittorrent_handshake",
-            "confirmed_bittorrent_handshake",
-            "confirmed_bittorrent_handshake",
+            "observed_bittorrent_piece_availability",
+            "observed_bittorrent_piece_availability",
+            "observed_bittorrent_piece_availability",
         ),
         ("scan_completed",),
     ]

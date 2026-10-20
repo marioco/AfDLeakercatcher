@@ -59,8 +59,10 @@ class DhtSettings:
 @dataclass(frozen=True, slots=True)
 class PeerSettings:
     timeout_seconds: float = 4.0
+    observation_seconds: float = 60.0
     max_checks: int = 120
     workers: int = 8
+    observation_workers: int = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,8 +369,20 @@ def config_from_dict(raw: dict[str, Any]) -> AppConfig:
         timeout_seconds=_bounded_float(
             peer_raw.get("timeout_seconds", 4.0), "peer.timeout_seconds", 0.25, 30.0
         ),
+        observation_seconds=_bounded_float(
+            peer_raw.get("observation_seconds", 60.0),
+            "peer.observation_seconds",
+            60.0,
+            60.0,
+        ),
         max_checks=_bounded_int(peer_raw.get("max_checks", 120), "peer.max_checks", 1, 2_000),
         workers=_bounded_int(peer_raw.get("workers", 8), "peer.workers", 1, 32),
+        observation_workers=_bounded_int(
+            peer_raw.get("observation_workers", 32),
+            "peer.observation_workers",
+            1,
+            128,
+        ),
     )
 
     enrichment_raw = _require_mapping(raw.get("enrichment", {}), "enrichment")
@@ -510,8 +524,10 @@ def config_to_dict(config: AppConfig) -> dict[str, Any]:
         },
         "peer": {
             "timeout_seconds": config.peer.timeout_seconds,
+            "observation_seconds": config.peer.observation_seconds,
             "max_checks": config.peer.max_checks,
             "workers": config.peer.workers,
+            "observation_workers": config.peer.observation_workers,
         },
         "enrichment": {
             "enabled": config.enrichment.enabled,

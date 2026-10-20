@@ -19,6 +19,7 @@ from bittorrent_beobachter.models import (
     EvidenceRecord,
     HandshakeResult,
     NetworkEnrichment,
+    PeerAvailabilityObservation,
     PeerCandidate,
     ScanResult,
     VpnClassification,
@@ -45,6 +46,8 @@ def _evidence_record(
     confirmed: bool = True,
     source_note: str = "",
     info_hash_hex: str | None = None,
+    availability: PeerAvailabilityObservation | None = None,
+    reportable: bool = True,
 ) -> EvidenceRecord:
     minute = f"{sequence:02d}"
     candidate = PeerCandidate(
@@ -71,6 +74,13 @@ def _evidence_record(
         bytes_sent=68,
         bytes_received=68 if confirmed else 0,
         error=None if confirmed else "Verbindung abgelehnt",
+        availability=(
+            availability
+            if availability is not None
+            else _availability_observation()
+            if confirmed and reportable
+            else None
+        ),
     )
     enrichment = NetworkEnrichment(
         ip=ip,
@@ -100,6 +110,30 @@ def _evidence_record(
         enrichment=enrichment,
         vpn=vpn,
         evidence_event_sha256=f"{sequence + 100:064x}",
+    )
+
+
+def _availability_observation() -> PeerAvailabilityObservation:
+    return PeerAvailabilityObservation(
+        started_at_utc="2026-10-20T10:09:02Z",
+        ended_at_utc="2026-10-20T10:10:02Z",
+        requested_duration_seconds=60.0,
+        duration_seconds=60.0,
+        completed_full_window=True,
+        interested_sent=True,
+        non_empty_bitfield=True,
+        have_announced=False,
+        piece_availability_announced=True,
+        unchoked=True,
+        peer_choking_at_end=False,
+        unchoked_duration_seconds=59.5,
+        messages_received=4,
+        bytes_received=128,
+        request_messages_sent=0,
+        piece_payload_bytes_received=0,
+        metadata_requests_sent=0,
+        termination_reason="Beobachtungszeit vollständig erreicht",
+        control_events=(),
     )
 
 
@@ -207,10 +241,17 @@ class ReportGenerationTests(unittest.TestCase):
                 "Strafanzeige gegen Unbekannt - BitTorrent-Endpunkt 198.51.100.10",
             )
             plain_body = message.get_body(preferencelist=("plain",)).get_content()
-            self.assertIn("hiermit erstatte ich Strafanzeige gegen Unbekannt", plain_body)
-            self.assertIn("Vorgangsnummer oder des Aktenzeichens", plain_body)
-            self.assertIn("weder einen vollständigen Download oder Upload", plain_body)
+            self.assertIn("Hiermit erstatte ich Strafanzeige gegen Unbekannt", plain_body)
+            self.assertIn("Vorgangsnummer oder das Aktenzeichen", plain_body)
+            self.assertIn("1. Mögliche Tat", plain_body)
+            self.assertIn("2. Fund der IP-Adresse", plain_body)
+            self.assertIn("3. Direkte Verfügbarkeitsprüfung", plain_body)
+            self.assertIn("4. Technischer Beleg und Nachprüfbarkeit", plain_body)
+            self.assertIn("meldete, dass bei ihm Teile verfügbar seien", plain_body)
+            self.assertIn("technische Nachricht: UNCHOKE", plain_body)
+            self.assertIn("forderte diese Teile nicht an", plain_body)
             self.assertIn("https://github.com/marioco/AfDLeakercatcher", plain_body)
+            self.assertNotIn("AfD-Datenleak", plain_body)
             self.assertNotIn("Entwurf", plain_body)
             self.assertNotIn("Quellenspezifische Abrufzeitpunkte", plain_body)
             attachments = list(message.iter_attachments())
@@ -256,12 +297,27 @@ class ReportGenerationTests(unittest.TestCase):
             by_name = {path.name: path for path in paths}
             email_path = by_name["project-case_strafanzeige_ipv4_198_51_100_80.eml"]
             message = BytesParser(policy=policy.default).parsebytes(email_path.read_bytes())
-            self.assertIn("Strafanzeige gegen Unbekannt", message["Subject"])
-            self.assertIn("AfD-Datenleak", message["Subject"])
+            self.assertEqual(
+                message["Subject"],
+                "Strafanzeige gegen Unbekannt - Verdacht der Verbreitung von 281 GB "
+                "mutmaßlich unbefugt kopierter AfD-Daten - IP 198.51.100.80",
+            )
             body = message.get_body(preferencelist=("plain",)).get_content()
-            self.assertIn("hiermit erstatte ich Strafanzeige gegen Unbekannt", body)
-            self.assertIn("Mindestens einer", body)
-            self.assertIn("Vorgangsnummer oder des Aktenzeichens", body)
+            self.assertIn("Hiermit erstatte ich Strafanzeige gegen Unbekannt", body)
+            self.assertIn("ohne Berechtigung von Servern", body)
+            self.assertIn("nun über BitTorrent verbreitet werden", body)
+            self.assertIn("281,2 GB", body)
+            self.assertIn("102.985 Dateien", body)
+            self.assertIn("39.000 bewertete Dokumente", body)
+            self.assertIn("35.000 Korrespondenzen", body)
+            self.assertIn("3.230 sensible Datensätze", body)
+            self.assertIn("57.000 Einträge", body)
+            self.assertIn("180 Datenbanken", body)
+            self.assertIn("nicht gerichtlich bewiesen", body)
+            self.assertIn("Aufnahme der Ermittlungen gegen Unbekannt", body)
+            self.assertIn("zeitnahe Sicherung", body)
+            self.assertIn("Ermittlung der verantwortlichen Person", body)
+            self.assertIn("Vorgangsnummer oder das Aktenzeichen", body)
             self.assertIn("https://github.com/marioco/AfDLeakercatcher", body)
             for point in PROJECT_LEGAL_REVIEW_POINTS:
                 self.assertIn(point, body)
@@ -271,9 +327,61 @@ class ReportGenerationTests(unittest.TestCase):
 
             pdf_path = by_name["project-case_anlage_ipv4_198_51_100_80.pdf"]
             pdf_bytes = pdf_path.read_bytes()
-            self.assertIn(b"Technische Dokumentation zur Strafanzeige", pdf_bytes)
+            self.assertIn(b"Technische Anlage zur Strafanzeige", pdf_bytes)
             self.assertNotIn(b"ENTWURF", pdf_bytes)
             self.assertNotIn(b"Adressat", pdf_bytes)
+
+    def test_offering_claim_requires_positive_overall_gate(self) -> None:
+        project_hash = "852795102149749ad91123af01ceac5da6f9eb5a"
+        positive = _availability_observation()
+        incomplete = replace(
+            positive,
+            duration_seconds=12.0,
+            completed_full_window=False,
+            termination_reason="Gegenstelle schloss die Verbindung",
+        )
+        result = ScanResult(
+            run_id="availability-gate",
+            started_at_utc="2026-10-20T10:00:00Z",
+            completed_at_utc="2026-10-20T11:00:00Z",
+            records=[
+                _evidence_record(
+                    "198.51.100.81",
+                    6011,
+                    11,
+                    info_hash_hex=project_hash,
+                    availability=positive,
+                ),
+                _evidence_record(
+                    "198.51.100.82",
+                    6012,
+                    12,
+                    info_hash_hex=project_hash,
+                    availability=incomplete,
+                ),
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as temp_name:
+            paths = generate_reports(result, Path(temp_name), ReportConfig())
+            by_name = {path.name: path for path in paths}
+            positive_message = BytesParser(policy=policy.default).parsebytes(
+                by_name["availability-gate_strafanzeige_ipv4_198_51_100_81.eml"].read_bytes()
+            )
+            positive_body = positive_message.get_body(preferencelist=("plain",)).get_content()
+            self.assertIn("meldete, dass bei ihm Teile verfügbar seien", positive_body)
+            self.assertIn("technische Nachricht: UNCHOKE", positive_body)
+            self.assertIn("vollständig durchgeführten Beobachtungszeit", positive_body)
+            self.assertIn("forderte diese Teile nicht an", positive_body)
+
+            self.assertNotIn(
+                "availability-gate_strafanzeige_ipv4_198_51_100_82.eml",
+                by_name,
+            )
+            self.assertNotIn(
+                "availability-gate_anlage_ipv4_198_51_100_82.pdf",
+                by_name,
+            )
 
     @unittest.skipIf(os.name == "nt", "POSIX-Dateimodi sind unter Windows anders")
     def test_staged_report_is_private_before_atomic_publish(self) -> None:
@@ -443,6 +551,34 @@ class ReportGenerationTests(unittest.TestCase):
             paths = generate_reports(result, Path(temp_name), ReportConfig())
             self.assertTrue(paths)
             self.assertTrue(all(path.stat().st_size > 0 for path in paths))
+
+    def test_confirmed_handshake_without_offering_creates_no_complaint(self) -> None:
+        handshake_only = _evidence_record(
+            "198.51.100.98",
+            6881,
+            13,
+            confirmed=True,
+            reportable=False,
+        )
+        self.assertTrue(handshake_only.handshake.confirmed)
+        self.assertFalse(handshake_only.handshake.offering_observed)
+        result = ScanResult(
+            run_id="handshake-only",
+            started_at_utc="2026-10-20T10:00:00Z",
+            completed_at_utc="2026-10-20T11:00:00Z",
+            records=[handshake_only],
+        )
+
+        with tempfile.TemporaryDirectory() as temp_name:
+            paths = generate_reports(result, Path(temp_name), ReportConfig())
+            self.assertEqual(len(paths), 5)
+            self.assertFalse(any("_anlage_" in path.name for path in paths))
+            self.assertFalse(any("_strafanzeige_" in path.name for path in paths))
+            observations_csv = next(
+                path for path in paths if path.name.endswith("_beobachtungen.csv")
+            )
+            with observations_csv.open(encoding="utf-8", newline="") as handle:
+                self.assertEqual(list(csv.DictReader(handle, delimiter=";")), [])
 
     def test_unconfirmed_record_is_not_reported(self) -> None:
         unconfirmed = _evidence_record(
