@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import stat
+from pathlib import Path
 from urllib.parse import quote
 
 import pytest
@@ -16,7 +19,9 @@ from bittorrent_beobachter.config import (
     PeerSettings,
     config_from_dict,
     config_to_dict,
+    load_config,
     parse_magnet,
+    save_config,
     with_bundled_presets,
 )
 from bittorrent_beobachter.models import PeerCandidate, ScanResult, Target, TargetScanMetrics
@@ -36,6 +41,20 @@ def test_defaults_have_no_candidate_or_check_count_limits() -> None:
     assert dht.quiet_seconds == 30.0
     assert peer.retry_attempts == 3
     assert peer.retry_backoff_seconds == 1.0
+
+
+def test_dht_slice_budget_must_exceed_single_query_timeout() -> None:
+    raw = config_to_dict(AppConfig(targets=()))
+    raw["dht"]["timeout_seconds"] = 2.0
+    raw["dht"]["overall_timeout_seconds"] = 2.05
+
+    with pytest.raises(ConfigError, match="overall_timeout_seconds"):
+        config_from_dict(raw)
+    with pytest.raises(ConfigError, match="overall_timeout_seconds"):
+        DhtSettings(timeout_seconds=2.0, overall_timeout_seconds=2.05)
+
+    valid = DhtSettings(timeout_seconds=2.0, overall_timeout_seconds=2.1)
+    assert valid.overall_timeout_seconds == 2.1
 
 
 def test_bundled_targets_contain_all_original_udp_trackers() -> None:
@@ -212,3 +231,53 @@ def test_scan_result_explicit_totals_and_legacy_lists_are_compatible() -> None:
     assert streamed.confirmed_count == 17
     assert streamed.offering_count == 11
     assert streamed.known_vpn_count == 4
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-Dateirechte")
+def test_config_io_preserves_existing_custom_parent_permissions(tmp_path: Path) -> None:
+    config_directory = tmp_path / "frei-gewaehlt"
+    config_directory.mkdir()
+    config_directory.chmod(0o755)
+    config_path = config_directory / "config.json"
+    config = AppConfig(targets=())
+
+    save_config(config_path, config)
+    assert stat.S_IMODE(config_directory.stat().st_mode) == 0o755
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+
+    config_directory.chmod(0o755)
+    assert load_config(config_path) == config
+    assert stat.S_IMODE(config_directory.stat().st_mode) == 0o755
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+
+
+def test_load_config_rejects_directory_before_changing_its_permissions(tmp_path: Path) -> None:
+    config_directory = tmp_path / "versehentlich-als-konfiguration-gewaehlt"
+    config_directory.mkdir()
+    expected_mode: int | None = None
+    if os.name != "nt":
+        config_directory.chmod(0o755)
+        expected_mode = stat.S_IMODE(config_directory.stat().st_mode)
+
+    with pytest.raises(ConfigError, match="keine reguläre Datei"):
+        load_config(config_directory)
+
+    if expected_mode is not None:
+        assert stat.S_IMODE(config_directory.stat().st_mode) == expected_mode
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-Dateirechte")
+def test_save_config_makes_only_new_application_directories_private(tmp_path: Path) -> None:
+    existing_parent = tmp_path / "bestehend"
+    existing_parent.mkdir()
+    existing_parent.chmod(0o755)
+    first_new = existing_parent / "afdleakercatcher"
+    second_new = first_new / "einstellungen"
+    config_path = second_new / "config.json"
+
+    save_config(config_path, AppConfig(targets=()))
+
+    assert stat.S_IMODE(existing_parent.stat().st_mode) == 0o755
+    assert stat.S_IMODE(first_new.stat().st_mode) == 0o700
+    assert stat.S_IMODE(second_new.stat().st_mode) == 0o700
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600

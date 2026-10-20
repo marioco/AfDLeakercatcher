@@ -23,7 +23,6 @@ from bittorrent_beobachter.dht import (
     BOOTSTRAP_ISSUE_NO_GLOBAL_ADDRESS,
     BOOTSTRAP_ISSUE_RESOLVER,
     BOOTSTRAP_ISSUE_TIMEOUT,
-    DHT_ISSUE_DEADLINE,
     DHT_ISSUE_NETWORK,
     DHTConfig,
     DHTCrawler,
@@ -242,37 +241,12 @@ def test_dht_issue_count_is_not_truncated_and_errors_do_not_leak_ips() -> None:
     asyncio.run(scenario())
 
 
-def test_dht_deadline_cancels_active_query() -> None:
-    async def scenario() -> None:
-        cancelled = asyncio.Event()
-
-        async def query(
-            _endpoint: tuple[str, int],
-            _info_hash: bytes,
-            _transaction_id: bytes,
-        ) -> DHTResponse:
-            try:
-                await asyncio.Future()
-            finally:
-                cancelled.set()
-
-        crawler = DHTCrawler(
-            [("8.8.8.8", 6881)],
-            config=DHTConfig(
-                timeout_seconds=30.0,
-                overall_timeout_seconds=0.1,
-            ),
-            query_hook=query,
+def test_dht_rejects_slice_that_cannot_finish_one_query() -> None:
+    with pytest.raises(ValueError, match="overall_timeout_seconds"):
+        DHTConfig(
+            timeout_seconds=30.0,
+            overall_timeout_seconds=0.1,
         )
-        assert await crawler.discover(Target("Test", INFO_HASH)) == []
-        assert cancelled.is_set()
-        assert crawler.queries_failed == 0
-        assert crawler.issue_counts == {DHT_ISSUE_DEADLINE: 1}
-        assert crawler.has_pending_work
-        crawler.close()
-        assert not crawler.has_pending_work
-
-    asyncio.run(scenario())
 
 
 def test_peer_socket_is_closed_when_nonblocking_setup_fails() -> None:
@@ -798,7 +772,7 @@ def test_verifier_error_persists_successful_sibling_batch(
     asyncio.run(scenario())
 
 
-def test_retries_keep_best_positive_early_eof_result(
+def test_retries_after_partial_signals_and_keep_best_diagnostic_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -830,6 +804,8 @@ def test_retries_keep_best_positive_early_eof_result(
             ) -> HandshakeResult:
                 attempts[candidate.ip] += 1
                 if candidate == first and attempts[candidate.ip] == 3:
+                    return _confirmed(candidate)
+                if attempts[candidate.ip] == 1:
                     result = _confirmed(candidate)
                     assert result.availability is not None
                     observation = replace(
@@ -837,7 +813,7 @@ def test_retries_keep_best_positive_early_eof_result(
                         completed_full_window=False,
                         duration_seconds=2.0,
                         termination_reason="peer_closed",
-                        error="Peer schloss nach den positiven Signalen.",
+                        error=None,
                     )
                     return replace(result, availability=observation)
                 return monitor_module._failed_handshake(
@@ -856,9 +832,14 @@ def test_retries_keep_best_positive_early_eof_result(
 
         results = list(store.iter_handshake_results())
         positive = next(item for item in results if item.candidate == first)
+        diagnostic = next(item for item in results if item.candidate == second)
         assert positive.offering_observed
         assert positive.availability is not None
-        assert not positive.availability.completed_full_window
+        assert positive.availability.completed_full_window
+        assert not diagnostic.offering_observed
+        assert diagnostic.availability is not None
+        assert not diagnostic.availability.completed_full_window
+        assert diagnostic.availability.termination_reason == "peer_closed"
         assert attempts == {first.ip: 3, second.ip: 3}
         assert runtime.verification_attempts == 6
         metric = store.metrics_by_hash((target.info_hash_hex,))[target.info_hash_hex]
@@ -942,7 +923,7 @@ def test_external_enrichment_processes_every_positive_in_five_batches(
         def __init__(self, _cache_dir: Path, **_kwargs: object) -> None:
             pass
 
-        def enrich(self, ip: str) -> NetworkEnrichment:
+        def enrich(self, ip: str, *, cancel_event: object = None) -> NetworkEnrichment:
             calls.append(ip)
             return NetworkEnrichment(ip=ip, enriched_at_utc="2026-10-20T12:02:00.000Z")
 
@@ -976,6 +957,91 @@ def test_external_enrichment_processes_every_positive_in_five_batches(
     assert store.evidence_count() == 26
     assert persisted == [5, 5, 5, 5, 5, 1]
     assert result.notices == []
+
+
+def test_cancellation_finishes_current_enrichment_then_persists_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    from bittorrent_beobachter.evidence import EvidenceJournal
+    from bittorrent_beobachter.run_store import RunStore
+
+    target = Target("Ziel", INFO_HASH)
+    config = AppConfig(
+        targets=(target,),
+        enrichment=EnrichmentSettings(enabled=True),
+    )
+    store = RunStore(tmp_path / "cancel-enrich.sqlite3")
+    candidates = [
+        _candidate(target, ip=f"8.40.0.{index}", port=11_000 + index) for index in range(1, 6)
+    ]
+    store.add_candidates(candidates)
+    claimed = store.claim_candidate_batch((target.info_hash_hex,), size=5)
+    store.store_handshake_batch(_confirmed(candidate) for candidate in claimed)
+
+    stop_event = Event()
+    lookup_started = Event()
+    calls: list[str] = []
+
+    class BlockingEnricher:
+        def __init__(self, _cache_dir: Path, **_kwargs: object) -> None:
+            pass
+
+        def enrich(
+            self,
+            ip: str,
+            *,
+            cancel_event: Event | None = None,
+        ) -> NetworkEnrichment:
+            assert cancel_event is stop_event
+            calls.append(ip)
+            lookup_started.set()
+            if not stop_event.wait(timeout=1.0):
+                raise AssertionError("Testabbruch erreichte die blockierende Auskunft nicht")
+            return NetworkEnrichment(
+                ip=ip,
+                enriched_at_utc="2026-10-20T12:02:00.000Z",
+                error=monitor_module.ENRICHMENT_CANCELLED_REASON,
+            )
+
+    monkeypatch.setattr(monitor_module, "NetworkEnricher", BlockingEnricher)
+    journal = EvidenceJournal(tmp_path / "cancel-events.jsonl")
+    result = ScanResult(
+        run_id="cancel-enrichment",
+        started_at_utc="2026-10-20T12:00:00.000Z",
+        run_store_path=store.path,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            monitor_module._persist_all_evidence,
+            config,
+            tmp_path,
+            store,
+            journal,
+            result,
+            lambda _message: None,
+            config_sha256="a" * 64,
+            software_sha256="b" * 64,
+            cancel_event=stop_event,
+        )
+        assert lookup_started.wait(timeout=1.0)
+        stop_event.set()
+        assert future.result(timeout=2.0) == 0
+
+    records = tuple(store.iter_evidence_records(batch_size=5))
+    verification = journal.verify()
+    assert calls == [candidates[0].ip]
+    assert len(records) == 5
+    assert all(
+        record.enrichment.error == monitor_module.ENRICHMENT_CANCELLED_REASON for record in records
+    )
+    assert result.enrichment_failure_count == 5
+    assert verification.valid
+    assert verification.entries_count == 5
 
 
 def test_monitor_exposes_no_global_count_or_time_caps() -> None:

@@ -126,11 +126,13 @@ class HandshakeResult:
 
     @property
     def offering_observed(self) -> bool:
-        """Ein direkt validierter Verfügbarkeits- und Freigabebefund ohne Datenabruf."""
+        """Ein fehlerfrei über das volle Zeitfenster validierter Angebotsbefund."""
         observation = self.availability
         return bool(
             self.confirmed
             and observation is not None
+            and observation.completed_full_window
+            and observation.error is None
             and observation.interested_sent
             and observation.piece_availability_announced
             and observation.unchoked

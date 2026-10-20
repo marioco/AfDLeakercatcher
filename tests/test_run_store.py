@@ -456,7 +456,8 @@ def test_late_sighting_requeues_only_completed_negative_candidate(tmp_path: Path
     assert scheduled.scheduled_candidates == 1
     metrics = store.metrics_by_hash()[HASH_A]
     assert metrics.pending == 1
-    assert metrics.handshake_results == 0
+    assert metrics.handshake_results == 1
+    assert list(store.iter_handshake_results()) == [negative]
 
     duplicate = store.ingest_candidates(
         [late],
@@ -466,6 +467,7 @@ def test_late_sighting_requeues_only_completed_negative_candidate(tmp_path: Path
     assert duplicate.ignored_sightings == 1
     assert store.claim_candidate_batch([HASH_A]) == [late]
     assert store.store_handshake_batch([replace(_handshake(late), availability=None)]) == 1
+    assert list(store.iter_handshake_results()) == [replace(_handshake(late), availability=None)]
 
     repeated = store.ingest_candidates(
         [late],
@@ -853,8 +855,86 @@ def test_new_sighting_during_negative_check_is_requeued_after_completion(
     metrics = store.metrics_by_hash()[HASH_A]
     assert metrics.pending == 1
     assert metrics.done == 0
-    assert metrics.handshake_results == 0
+    assert metrics.handshake_results == 1
+    assert list(store.iter_handshake_results()) == [
+        replace(_handshake(candidate), availability=None)
+    ]
     assert store.claim_candidate_batch([HASH_A]) == [rediscovered]
+
+
+def test_new_candidates_are_checked_before_hot_negative_rechecks(tmp_path: Path) -> None:
+    database_path = tmp_path / "run.sqlite3"
+    store = RunStore(database_path)
+    hot = _candidate(HASH_A, 110)
+    assert store.add_candidates([hot]) == 1
+    assert store.claim_candidate_batch([HASH_A, HASH_B]) == [hot]
+    first_negative = replace(_handshake(hot), availability=None)
+    assert store.store_handshake_batch([first_negative]) == 1
+
+    first_completion = _stored_completion(database_path)
+    first_rediscovery = replace(
+        hot,
+        discovered_at_utc=_offset_utc(first_completion, seconds=10),
+        transaction_id_hex="feed0001",
+        response_sha256="a1" * 32,
+        source_note="Erste erneute Sichtung",
+    )
+    assert (
+        store.ingest_candidates(
+            [first_rediscovery],
+            negative_recheck_cooldown_seconds=10,
+        ).requeued_negative_candidates
+        == 1
+    )
+
+    fresh = [
+        *(_candidate(HASH_A, 200 + index) for index in range(7)),
+        *(_candidate(HASH_B, 300 + index) for index in range(8)),
+    ]
+    assert store.add_candidates(fresh) == 15
+    first_checks: list[PeerCandidate] = []
+    while len(first_checks) < len(fresh):
+        batch = store.claim_candidate_batch([HASH_A, HASH_B], size=5)
+        assert batch
+        assert first_rediscovery not in batch
+        first_checks.extend(batch)
+        store.store_handshake_batch(
+            replace(_handshake(candidate), availability=None) for candidate in batch
+        )
+
+    assert {(*candidate.endpoint, candidate.info_hash_hex) for candidate in first_checks} == {
+        (*candidate.endpoint, candidate.info_hash_hex) for candidate in fresh
+    }
+    assert store.claim_candidate_batch([HASH_A, HASH_B], size=5) == [first_rediscovery]
+
+    second_rediscovery = replace(
+        first_rediscovery,
+        discovered_at_utc=_offset_utc(_claimed_at(database_path), seconds=20),
+        transaction_id_hex="feed0002",
+        response_sha256="a2" * 32,
+        source_note="Sichtung waehrend der Wiederholungspruefung",
+    )
+    assert (
+        store.ingest_candidates(
+            [second_rediscovery],
+            negative_recheck_cooldown_seconds=10,
+        ).deferred_negative_rechecks
+        == 1
+    )
+    second_negative = replace(_handshake(first_rediscovery), availability=None)
+    assert store.store_handshake_batch([second_negative]) == 1
+
+    later_fresh = [_candidate(HASH_B, 400 + index) for index in range(3)]
+    assert store.add_candidates(later_fresh) == 3
+    assert store.claim_candidate_batch([HASH_A, HASH_B], size=5) == later_fresh
+    store.store_handshake_batch(
+        replace(_handshake(candidate), availability=None) for candidate in later_fresh
+    )
+    assert store.claim_candidate_batch([HASH_A, HASH_B], size=5) == [second_rediscovery]
+
+    metrics = store.metrics_by_hash([HASH_A, HASH_B])
+    assert sum(metric.candidates for metric in metrics.values()) == 19
+    assert sum(metric.handshake_results for metric in metrics.values()) == 19
 
 
 def test_new_sighting_during_positive_check_remains_terminal(tmp_path: Path) -> None:

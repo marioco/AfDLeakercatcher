@@ -86,36 +86,6 @@ PUBLISHED_DATASET_FACTS = (
     "180 Datenbanken",
 )
 
-EVIDENCE_LIMITATIONS = (
-    "Es wurden keine Inhalte und keine Torrent-Metadaten heruntergeladen oder hochgeladen.",
-    "Die behauptete Zuordnung des Infohashes zu einem bezeichneten Inhalt "
-    "wurde deshalb nicht verifiziert; Magnetname, Zielbezeichnung und "
-    "Infohash allein beweisen den Inhalt nicht.",
-    "Jeder bestätigte Datensatz belegt, dass der öffentliche Netzwerkendpunkt "
-    "den BitTorrent-Handshake für den genannten Infohash beantwortet hat. Ein "
-    "positiver Verfügbarkeits-Gesamtbefund dokumentiert zusätzlich nur gemeldete "
-    "Stückverfügbarkeit und ein empfangenes UNCHOKE-Signal.",
-    "Auch ein positiver Gesamtbefund beweist keinen tatsächlichen Download oder "
-    "Upload von Inhaltsblöcken.",
-    "Die technische Beobachtung belegt weder Eigentum am Anschluss oder Endgerät "
-    "noch die Identität "
-    "einer Person, deren Handeln oder deren Schuld.",
-    "Öffentliche Routing-/Registry-Angaben beschreiben einen Netzbetreiber "
-    "oder Adressbereich; sie sind keine Auskunft über die Anschlussinhaberin oder "
-    "den Anschlussinhaber.",
-    "Die lokalen SHA-256-Hashes und die lokale Hash-Kette unterstützen nur "
-    "die Integritätsprüfung der lokalen Aufzeichnung; sie sind keine digitale "
-    "Signatur und kein vertrauenswürdiger externer Zeitstempel.",
-    "Die Hash-Kette bestätigt nicht die sachliche Richtigkeit der vor ihrer "
-    "Berechnung gespeicherten Angaben.",
-    "Der SHA-256-Wert der DHT- oder UDP-Tracker-Antwort ist nur ein lokal "
-    "berechneter Fingerabdruck. Das Rohpaket wird datensparsam nicht gespeichert; "
-    "der Wert "
-    "ist deshalb später nicht unabhängig reproduzierbar oder extern bestätigt.",
-    "Die rechtliche Bewertung und alle weiteren Ermittlungen obliegen "
-    "ausschließlich den zuständigen Behörden.",
-)
-
 CSV_FIELDNAMES = (
     "ip",
     "ports",
@@ -147,7 +117,6 @@ CSV_FIELDNAMES = (
     "netzregistrierung_quellen_abruf_utc",
     "netzregistrierung_cache_quellen",
     "netzregistrierungs_fehler",
-    "aussagegrenze",
 )
 
 VPN_CSV_FIELDNAMES = (
@@ -325,15 +294,9 @@ def _availability_statement(record: EvidenceRecord) -> str:
     observation = handshake.availability
     if observation is None or not handshake.offering_observed:
         raise ValueError("Verfügbarkeitstext erfordert einen positiven Gesamtbefund.")
-    if observation.completed_full_window:
-        duration_statement = (
-            "Der Client blieb während der vollständig durchgeführten Beobachtungszeit erreichbar. "
-        )
-    else:
-        duration_statement = (
-            "Die Verbindung endete nach der bereits positiven Beobachtung; "
-            f"Beendigungsgrund: {observation.termination_reason}. "
-        )
+    duration_statement = (
+        "Der Client blieb während der vollständig durchgeführten Beobachtungszeit erreichbar. "
+    )
     return (
         "Das Prüfprogramm stellte eine direkte Verbindung zum BitTorrent-Client "
         "her. Der Client bestätigte die eindeutige digitale Kennung (Infohash). "
@@ -344,8 +307,7 @@ def _availability_statement(record: EvidenceRecord) -> str:
         "Beobachtet wurde von "
         f"{observation.started_at_utc} bis {observation.ended_at_utc} "
         f"({observation.duration_seconds:.1f} Sekunden; vorgesehen: "
-        f"{observation.requested_duration_seconds:.1f} Sekunden). Das "
-        "Prüfprogramm forderte diese Teile nicht an und lud keine Inhalte herunter."
+        f"{observation.requested_duration_seconds:.1f} Sekunden)."
     )
 
 
@@ -355,16 +317,12 @@ def _availability_overview(aggregate: _IpAggregate) -> str:
     first_record: EvidenceRecord | None = None
     first_seen: tuple[datetime, str] | None = None
     last_seen: tuple[datetime, str] | None = None
-    full_windows = 0
-    early_endings = 0
     for record in aggregate.iter_records():
         if first_record is None:
             first_record = record
         observation = record.handshake.availability
         if observation is None or not record.handshake.offering_observed:
             raise ValueError("IP-Aggregat enthält keinen positiven Gesamtbefund.")
-        full_windows += int(observation.completed_full_window)
-        early_endings += int(not observation.completed_full_window)
         for timestamp in (observation.started_at_utc, observation.ended_at_utc):
             parsed = _timestamp_as_datetime(timestamp)
             if first_seen is None or parsed < first_seen[0]:
@@ -384,9 +342,9 @@ def _availability_overview(aggregate: _IpAggregate) -> str:
         "Infohash, meldete verfügbare Teile und gab mit UNCHOKE das Anfordern dieser "
         "Teile frei. Eine der Prüfungen ist wie folgt dokumentiert: "
         f"{first_statement} "
-        f"Insgesamt erreichten {full_windows} Prüfung(en) die vollständig vorgesehene "
-        f"Beobachtungszeit; {early_endings} Verbindung(en) endeten erst nach dem "
-        "bereits positiven Befund. Der gesamte Beobachtungszeitraum reichte von "
+        f"Alle {aggregate.record_count} positiven Prüfungen durchliefen die jeweils "
+        "vorgesehene Beobachtungszeit vollständig und ohne technischen Fehler. Der "
+        "gesamte Beobachtungszeitraum reichte von "
         f"{first_seen[1]} bis {last_seen[1]}. Alle weiteren Einzelzeiten und "
         "Beendigungsgründe stehen vollständig in den technischen Einzelbeobachtungen."
     )
@@ -397,21 +355,8 @@ def _availability_detail_rows(record: EvidenceRecord) -> tuple[tuple[str, str], 
 
     handshake = record.handshake
     observation = handshake.availability
-    if observation is None:
-        return (
-            (
-                "Direkte Verfügbarkeitsbeobachtung",
-                "für diesen älteren Datensatz nicht erfasst",
-            ),
-        )
-    if not handshake.offering_observed:
-        return (
-            (
-                "Direkte Verfügbarkeitsbeobachtung",
-                "kein vollständiger positiver Gesamtbefund",
-            ),
-            ("Angeforderte oder geladene Inhaltsblöcke", "keine"),
-        )
+    if observation is None or not handshake.offering_observed:
+        raise ValueError("Detailzeilen erfordern einen positiven Gesamtbefund.")
 
     control_events = (
         " | ".join(event.kind for event in observation.control_events) or "keine protokolliert"
@@ -432,13 +377,9 @@ def _availability_detail_rows(record: EvidenceRecord) -> tuple[tuple[str, str], 
         ("Peer sendete UNCHOKE", "ja"),
         ("Empfangene Protokollnachrichten", str(observation.messages_received)),
         ("Empfangene Bytes der Protokollprüfung", str(observation.bytes_received)),
-        ("Gesendete REQUEST-Nachrichten", str(observation.request_messages_sent)),
-        ("Empfangene Inhaltsbytes", str(observation.piece_payload_bytes_received)),
-        ("Gesendete Metadatenanfragen", str(observation.metadata_requests_sent)),
         ("Beendigungsgrund", observation.termination_reason),
         ("Protokollierte Steuerereignisse", control_events),
         ("Fehler der Verfügbarkeitsprüfung", observation.error or "keiner"),
-        ("Angeforderte oder geladene Inhaltsblöcke", "keine"),
     )
 
 
@@ -1308,9 +1249,9 @@ def _write_summary_pdf(
         _paragraph("Technischer Laufbericht", styles["Title"], toolkit),
         _paragraph(
             "Zusammenfassung einer gezielten technischen Überprüfung der "
-            "dokumentierten Infohashes im BitTorrent-Netzwerk. Dieser "
-            "Bericht ist eine technische Dokumentation und keine Feststellung "
-            "einer Straftat.",
+            "dokumentierten Infohashes im BitTorrent-Netzwerk. Der Bericht "
+            "dokumentiert Fundwege, direkte Handshakes, vollständig beobachtete "
+            "Kontrollsignale und die daraus erzeugten positiven Gesamtbefunde.",
             styles["BodyText"],
             toolkit,
         ),
@@ -1339,28 +1280,23 @@ def _write_summary_pdf(
         toolkit.Spacer(1, 6),
         _paragraph("Ergebnisse pro Infohash", styles["Heading1"], toolkit),
         *_target_metrics_story(result, styles, toolkit),
-        _paragraph("Aussagegrenze", styles["Heading1"], toolkit),
-        _limitations_paragraph(styles["EvidenceBox"], toolkit),
         _paragraph("Vorgehensweise", styles["Heading1"], toolkit),
         _paragraph(
             "Ein Kandidat wurde aus einer DHT-Antwort oder aus der Antwort "
             "eines konfigurierten UDP-Trackers übernommen. Danach wurde eine "
             "TCP-Verbindung aufgebaut und der BitTorrent-Handshake für "
-            "den konfigurierten Infohash geprüft. Nach bestätigtem Handshake wird "
-            "eine inhaltsfreie Verfügbarkeitsprüfung durchgeführt. Sie beobachtet "
-            "nur Bitfield-/Have- und Choke-/Unchoke-Signale; Piece-, Datei- oder "
-            "Metadaten werden weder angefordert noch geladen. Die protokollierten Hashes "
-            "dienen der Integritätsprüfung der lokal erfassten Ereignisse; sie "
-            "sind keine digitale Signatur und kein vertrauenswürdiger externer "
-            "Zeitstempel. Der lokale Fingerabdruck einer DHT- oder "
-            "UDP-Tracker-Antwort ist später nicht unabhängig reproduzierbar, "
-            "weil das Rohpaket datensparsam "
-            "nicht gespeichert wird.",
+            "den konfigurierten Infohash geprüft. Nach bestätigtem Handshake "
+            "folgte eine zeitlich vollständig durchgeführte Kontrollnachrichtenprüfung. "
+            "Ein positiver Gesamtbefund setzt gemeldete Stückverfügbarkeit, ein "
+            "zeitgleich geltendes UNCHOKE und einen fehlerfreien Abschluss der "
+            "gesamten Beobachtungszeit voraus. Die protokollierten SHA-256-Werte "
+            "binden die lokal erfassten Ereignisse an ihre gespeicherten Datensätze "
+            "und unterstützen deren Integritätsprüfung.",
             styles["BodyText"],
             toolkit,
         ),
         _paragraph(
-            "Übersicht der Anlagen (ohne VPN-Liste)",
+            "Übersicht der technischen Anlagen",
             styles["Heading1"],
             toolkit,
         ),
@@ -1370,7 +1306,6 @@ def _write_summary_pdf(
         table_rows: list[list[Any]] = [
             [
                 _paragraph("IP-Adresse", styles["SmallReportText"], toolkit),
-                _paragraph("Einordnung", styles["SmallReportText"], toolkit),
                 _paragraph("Anzahl", styles["SmallReportText"], toolkit),
                 _paragraph("Infohashes", styles["SmallReportText"], toolkit),
                 _paragraph("Zeitraum UTC", styles["SmallReportText"], toolkit),
@@ -1381,7 +1316,6 @@ def _write_summary_pdf(
             table_rows.append(
                 [
                     _paragraph(summary.ip, styles["SmallReportText"], toolkit),
-                    _paragraph(row["vpn_status"], styles["SmallReportText"], toolkit),
                     _paragraph(
                         row["bestaetigte_handshakes"],
                         styles["CenteredSmall"],
@@ -1398,7 +1332,7 @@ def _write_summary_pdf(
         story.append(
             _data_table(
                 table_rows,
-                (82, 88, 42, 142, 157),
+                (100, 50, 155, 206),
                 toolkit,
                 repeat_rows=1,
             )
@@ -1406,9 +1340,8 @@ def _write_summary_pdf(
     else:
         story.append(
             _paragraph(
-                "In diesem Lauf lagen keine bestätigten Nicht-VPN-Evidenzdatensätze "
-                "für Anlagen vor. Bekannte VPN-Endpunkte stehen ausschließlich "
-                "in der gesonderten VPN-Liste.",
+                "Anzahl der positiven Befunde für technische Anlagen: 0. "
+                "Positive bekannte VPN-Befunde sind in der gesonderten VPN-Liste erfasst.",
                 styles["BodyText"],
                 toolkit,
             )
@@ -1419,7 +1352,8 @@ def _write_summary_pdf(
             _paragraph(
                 f"Die PDF-Vorschau zeigt die ersten {len(reportable)} von "
                 f"{report_index.reportable_ip_count} Anlagen. Die CSV-Datei und "
-                "die Einzelanlagen enthalten sämtliche positiven Nicht-VPN-Befunde.",
+                "die Einzelanlagen enthalten sämtliche positiven Befunde, für die "
+                "technische Anlagen erstellt wurden.",
                 styles["BodyText"],
                 toolkit,
             )
@@ -1437,9 +1371,9 @@ def _write_summary_pdf(
                     toolkit,
                 ),
                 _paragraph(
-                    "Die folgenden Zuordnungen sind unbestätigte Nutzerangaben. "
-                    "Das Programm hat den bezeichneten Inhalt nicht abgerufen "
-                    "oder verifiziert.",
+                    "Die folgenden vom Nutzer mit den jeweiligen Infohashes "
+                    "verbundenen Sachverhaltshinweise wurden im Lauf gebunden "
+                    "dokumentiert.",
                     styles["BodyText"],
                     toolkit,
                 ),
@@ -1456,14 +1390,12 @@ def _write_summary_pdf(
         story.extend(
             [
                 _paragraph(
-                    "Technische Laufhinweise (kein Programmfehler)",
+                    "Technische Laufhinweise",
                     styles["Heading1"],
                     toolkit,
                 ),
                 _paragraph(
-                    "Diese Hinweise dokumentieren die Erreichbarkeit während dieses "
-                    "einzelnen Laufs. Sie sind kein Nachweis für Inhalt, Besitz, "
-                    "Übertragung, Person oder Straftat.",
+                    "Diese Hinweise dokumentieren Erreichbarkeit und Ablauf dieses Prüflaufs.",
                     styles["BodyText"],
                     toolkit,
                 ),
@@ -1633,7 +1565,6 @@ def _write_complaint_attachment_pdf(
                     "Vom Nutzer angegebene Sachverhaltshinweise",
                     row["quellen_sachverhaltshinweise"],
                 ),
-                ("VPN-Einordnung", row["vpn_status"]),
             ),
             styles,
             toolkit,
@@ -1685,7 +1616,6 @@ def _write_complaint_attachment_pdf(
             candidate = record.handshake.candidate
             handshake = record.handshake
             enrichment = record.enrichment
-            vpn = record.vpn
             yield _paragraph(f"Beobachtung {index}", styles["Heading2"], toolkit)
             yield _key_value_table(
                 (
@@ -1739,15 +1669,6 @@ def _write_complaint_attachment_pdf(
                         " | ".join(enrichment.cached_sources) or "nicht angegeben",
                     ),
                     ("Abruffehler", enrichment.error or "nicht angegeben"),
-                    (
-                        "VPN-Einordnung",
-                        "bekannter VPN"
-                        if vpn.status == "known_vpn"
-                        else "kein bekannter VPN-Treffer",
-                    ),
-                    ("VPN-Anbieter", vpn.provider or "nicht angegeben"),
-                    ("VPN-Begründung", vpn.reason or "nicht angegeben"),
-                    ("VPN-Quelle", _vpn_source_text(vpn.source) or "nicht angegeben"),
                     ("SHA-256 des Evidenzereignisses", record.evidence_event_sha256),
                 ),
                 styles,
@@ -1851,16 +1772,11 @@ def _write_vpn_pdf(
     y -= 27
     draw_wrapped(
         "Diese separate Liste enthält IP-Adressen, für die mindestens eine "
-        "konservative Klassifikation als bekannter VPN-Endpunkt vorliegt. Für "
-        "diese Einträge werden keine Einzelanlagen und keine E-Mail-Dateien erzeugt."
+        "konservative Klassifikation als bekannter VPN-Endpunkt vorliegt."
     )
     draw_wrapped(f"Lauf-ID: {result.run_id}")
     draw_wrapped(f"Bericht erstellt (UTC): {generated_at_utc}")
     draw_wrapped(f"Anzahl IP-Adressen: {vpn_count}")
-    draw_wrapped("Aussagegrenze", bold=True, size=13)
-    for limitation in EVIDENCE_LIMITATIONS:
-        draw_wrapped(f"- {limitation}")
-
     written = 0
     if vpn_count:
         draw_wrapped("Bekannte VPN-Endpunkte", bold=True, size=13)
@@ -1885,7 +1801,7 @@ def _write_vpn_pdf(
             y -= 12
             written += 1
     else:
-        draw_wrapped("Keine als bekannter VPN klassifizierte IP-Adresse vorhanden.")
+        draw_wrapped("Anzahl als bekannter VPN klassifizierter IP-Adressen: 0.")
 
     if config.legal_notes:
         draw_wrapped("Zusätzliche Prüfpunkte", bold=True, size=13)
@@ -1915,13 +1831,6 @@ def _paragraph(
 
 def _escape_text(value: object) -> str:
     return html.escape(str(value), quote=True)
-
-
-def _limitations_paragraph(style: Any, toolkit: SimpleNamespace) -> Any:
-    content = "<br/>".join(
-        f"{index}. {_escape_text(text)}" for index, text in enumerate(EVIDENCE_LIMITATIONS, start=1)
-    )
-    return _paragraph(content, style, toolkit, already_escaped=True)
 
 
 def _key_value_table(
@@ -2189,9 +2098,11 @@ def _aggregate_row(aggregate: _IpAggregate) -> dict[str, str]:
         "rdap_handles": enrichment.rdap_handle or "nicht angegeben",
         "laender": enrichment.country or "nicht angegeben",
         "abuse_kontakte": enrichment.abuse_email or "nicht angegeben",
-        "vpn_status": ("bekannter VPN" if aggregate.is_known_vpn else "kein bekannter VPN-Treffer"),
+        "vpn_status": (
+            "bekannter VPN" if aggregate.is_known_vpn else "nicht als bekannter VPN klassifiziert"
+        ),
         "vpn_anbieter": vpn.provider or "nicht angegeben",
-        "vpn_begruendung": vpn.reason or "nicht angegeben",
+        "vpn_begruendung": (vpn.reason or "nicht angegeben") if aggregate.is_known_vpn else "",
         "vpn_quellen": _vpn_source_text(vpn.source) or "nicht angegeben",
         "angefragte_bzw_weitergeleitete_quellen": (
             "vollständig in CSV und technischen Einzelbeobachtungen"
@@ -2204,7 +2115,6 @@ def _aggregate_row(aggregate: _IpAggregate) -> dict[str, str]:
             " | ".join(enrichment.cached_sources) or "nicht angegeben"
         ),
         "netzregistrierungs_fehler": enrichment.error or "nicht angegeben",
-        "aussagegrenze": " ".join(EVIDENCE_LIMITATIONS),
     }
 
 
@@ -2243,9 +2153,11 @@ def _record_row(record: EvidenceRecord, *, ip_is_known_vpn: bool) -> dict[str, s
         "rdap_handles": enrichment.rdap_handle or "nicht angegeben",
         "laender": enrichment.country or "nicht angegeben",
         "abuse_kontakte": enrichment.abuse_email or "nicht angegeben",
-        "vpn_status": "bekannter VPN" if ip_is_known_vpn else "kein bekannter VPN-Treffer",
+        "vpn_status": (
+            "bekannter VPN" if ip_is_known_vpn else "nicht als bekannter VPN klassifiziert"
+        ),
         "vpn_anbieter": vpn.provider or "nicht angegeben",
-        "vpn_begruendung": vpn.reason or "nicht angegeben",
+        "vpn_begruendung": (vpn.reason or "nicht angegeben") if ip_is_known_vpn else "",
         "vpn_quellen": _vpn_source_text(vpn.source) or "nicht angegeben",
         "angefragte_bzw_weitergeleitete_quellen": (
             " | ".join(enrichment.source_urls) or "nicht angegeben"
@@ -2261,7 +2173,6 @@ def _record_row(record: EvidenceRecord, *, ip_is_known_vpn: bool) -> dict[str, s
             " | ".join(enrichment.cached_sources) or "nicht angegeben"
         ),
         "netzregistrierungs_fehler": enrichment.error or "nicht angegeben",
-        "aussagegrenze": " ".join(EVIDENCE_LIMITATIONS),
     }
 
 
@@ -2438,10 +2349,9 @@ def _write_complaint_email(
     else:
         possible_act = (
             "Hiermit erstatte ich Strafanzeige gegen Unbekannt. Der überwachte "
-            "Infohash wurde individuell zur technischen Prüfung vorgegeben. Das "
-            "Programm ordnet ihm keinen bestimmten Inhalt zu. Eine rechtliche "
-            "Bewertung setzt deshalb die behördliche Klärung des tatsächlichen "
-            "Inhalts voraus."
+            "Infohash wurde individuell zur technischen Prüfung vorgegeben. Die "
+            "nachfolgenden Abschnitte dokumentieren den ermittelten Endpunkt, "
+            "den bestätigten Handshake und den positiven Verfügbarkeitsbefund."
         )
 
     if project_hashes:
@@ -2450,8 +2360,7 @@ def _write_complaint_email(
             f"{aggregate.ip} als BitTorrent-Endpunkt ermittelt. Der Endpunkt "
             "bestätigte die überwachte eindeutige digitale Kennung (Infohash). "
             "Unter dieser IP wurden nach dem dokumentierten BitTorrent-Protokollbefund "
-            "Teile des mutmaßlich rechtswidrig entwendeten Datenbestands \N{EN DASH} "
-            "möglicherweise auch der vollständige Bestand \N{EN DASH} zum Download angeboten."
+            "Teile des mutmaßlich rechtswidrig entwendeten Datenbestands zum Download angeboten."
         )
     else:
         ip_finding = (

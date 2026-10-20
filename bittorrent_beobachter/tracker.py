@@ -157,7 +157,7 @@ def parse_connect_response(packet: bytes, *, expected_transaction_id: int) -> in
         raise TrackerProtocolError("UDP-Tracker-Transaktions-ID stimmt nicht ueberein.")
     if action == TRACKER_ACTION_ERROR:
         raise TrackerProtocolError("UDP-Tracker meldete einen Fehler.")
-    if action != TRACKER_ACTION_CONNECT or len(packet) != CONNECT_RESPONSE_BYTES:
+    if action != TRACKER_ACTION_CONNECT or len(packet) < CONNECT_RESPONSE_BYTES:
         raise TrackerProtocolError("UDP-Tracker-Connect-Antwort ist ungueltig.")
     return struct.unpack_from("!Q", packet, 8)[0]
 

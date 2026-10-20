@@ -1,10 +1,10 @@
 # AfDLeakerCatcher
 
-## Windows-Download – Version 0.3.3
+## Windows-Download – Version 0.3.4
 
-### [⬇ AfDLeakerCatcher für Windows herunterladen](https://github.com/marioco/AfDLeakercatcher/releases/download/afdleakercatcher-v0.3.3/AfDLeakerCatcher-Windows-x64.zip)
+### [⬇ AfDLeakerCatcher für Windows herunterladen](https://github.com/marioco/AfDLeakercatcher/releases/download/afdleakercatcher-v0.3.4/AfDLeakerCatcher-Windows-x64.zip)
 
-[SHA-256-Prüfsumme zum Download](https://github.com/marioco/AfDLeakercatcher/releases/download/afdleakercatcher-v0.3.3/AfDLeakerCatcher-Windows-x64.zip.sha256)
+[SHA-256-Prüfsumme zum Download](https://github.com/marioco/AfDLeakercatcher/releases/download/afdleakercatcher-v0.3.4/AfDLeakerCatcher-Windows-x64.zip.sha256)
 
 Keine GitHub-Kenntnisse nötig: Auf den Link klicken, die ZIP-Datei **einmal**
 entpacken und anschließend `AfDLeakerCatcher.exe` doppelklicken. Es gibt keinen
@@ -43,6 +43,13 @@ Kandidat mehr gefunden wurde. Exakte Doppelnennungen desselben Infohashes mit de
 IP und demselben Port werden nur einmal geprüft. Jeder gefundene eindeutige Kandidat
 wird mit einer begrenzten Zahl von Verbindungsversuchen geprüft; standardmäßig sind es
 höchstens drei Versuche.
+
+Ein positiver Angebotsbefund wird nur erzeugt, wenn der bestätigte Client während der
+vollständig abgelaufenen konfigurierten Beobachtungszeit – standardmäßig 60 Sekunden –
+ohne technischen Fehler erreichbar blieb, dabei Stückverfügbarkeit meldete und das
+Anfordern per `UNCHOKE` freigab. Vorzeitig beendete oder fehlerhafte Teilbeobachtungen
+bleiben ausschließlich als Diagnose gespeichert und erzeugen weder eine Strafanzeige
+noch eine technische Anlage.
 
 Kandidaten und Ergebnisse werden fortlaufend in Fünferpaketen in einer privaten lokalen
 SQLite-Laufdatenbank gespeichert; die vollständige Treffermenge wird dadurch nicht im
@@ -130,7 +137,7 @@ aber keine Windows-Herausgebersignatur.
 Jeder Lauf erhält einen eigenen Zeitstempel-Ordner. Alle Dateinamen beginnen mit der
 jeweiligen Lauf-ID und erzeugen:
 
-- `<Lauf-ID>_laufbericht.pdf`: Umfang, Ergebnisse, Fehler und Aussagegrenzen;
+- `<Lauf-ID>_laufbericht.pdf`: Umfang, Ergebnisse und technische Laufkennzahlen;
 - `<Lauf-ID>_beobachtungen.csv`: tabellarische technische Beobachtungen;
 - pro positiver, nicht als bekannter VPN-Endpunkt eingestufter IP eine
   `<Lauf-ID>_anlage_<IP>.pdf` und
@@ -149,9 +156,10 @@ Die Anwendung sendet nie E-Mails. `.eml`-Dateien sind versandfertig formuliert, 
 aber von einem Menschen geprüft, geöffnet und bewusst versandt werden. Wenn keine
 Empfängeradresse konfiguriert wurde, bleibt das Empfängerfeld leer.
 
-„Nicht als VPN erkannt“ bedeutet immer nur **unbekannt**, niemals „sicher kein VPN“.
-Eine positive VPN-Einordnung erfolgt nur durch ein ausdrücklich konfiguriertes
-IP-Präfix oder einen eindeutigen VPN-Markennamen in öffentlichen Netzbetreiberdaten.
+Der CSV-Status `nicht als bekannter VPN klassifiziert` ist eine neutrale
+Klassifikationsangabe. Eine positive VPN-Einordnung erfolgt nur durch ein ausdrücklich
+konfiguriertes IP-Präfix oder einen eindeutigen VPN-Markennamen in öffentlichen
+Netzbetreiberdaten.
 
 ## Datenschutz und verantwortlicher Betrieb
 
@@ -283,7 +291,7 @@ gh attestation verify AfDLeakerCatcher-Windows-x64.zip -R marioco/AfDLeakercatch
 
 Ein Push auf `main` erzeugt nach erfolgreichem Build ein GitHub-Release, sofern für die
 eingetragene Version noch keines existiert. Dasselbe gilt für einen exakt zur
-Paket- und App-Version passenden Tag wie `afdleakercatcher-v0.3.3`. Ein bereits
+Paket- und App-Version passenden Tag wie `afdleakercatcher-v0.3.4`. Ein bereits
 vorhandenes Release wird nicht überschrieben, sondern auf Ziel-Commit, Entwurfsstatus,
 exakt erwartete Assets und ZIP-Prüfsumme kontrolliert. Pull Requests und manuell
 gestartete Läufe stellen nur Actions-Artefakte bereit.

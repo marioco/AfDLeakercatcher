@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import signal
+import stat
+import sys
 import threading
+import types
 from pathlib import Path
 from unittest import mock
 
@@ -15,15 +20,101 @@ from bittorrent_beobachter.config import AppConfig
 from bittorrent_beobachter.models import ScanResult, TargetScanMetrics
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-Dateirechte")
+def test_setup_logging_preserves_existing_custom_parent_permissions(tmp_path: Path) -> None:
+    log_directory = tmp_path / "frei-gewaehlt"
+    log_directory.mkdir()
+    log_directory.chmod(0o755)
+    logger = logging.getLogger("bittorrent_beobachter")
+    previous_handlers = logger.handlers[:]
+    logger.handlers.clear()
+
+    try:
+        configured = cli.setup_logging(log_directory / "app.log")
+        assert stat.S_IMODE(log_directory.stat().st_mode) == 0o755
+        assert stat.S_IMODE((log_directory / "app.log").stat().st_mode) == 0o600
+    finally:
+        for handler in logger.handlers[:]:
+            handler.close()
+        logger.handlers[:] = previous_handlers
+
+    assert configured is logger
+
+
+def test_cli_logging_start_error_is_readable_without_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    invalid_parent = tmp_path / "keine-map"
+    invalid_parent.write_text("Datei statt Verzeichnis", encoding="utf-8")
+    logger = logging.getLogger("bittorrent_beobachter")
+    previous_handlers = logger.handlers[:]
+    logger.handlers.clear()
+
+    try:
+        exit_code = cli.main(
+            [
+                "--log-file",
+                str(invalid_parent / "monitor.log"),
+                "verify-journal",
+            ]
+        )
+    finally:
+        for handler in logger.handlers[:]:
+            handler.close()
+        logger.handlers[:] = previous_handlers
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "Protokolldatei" in captured.err
+    assert "kann nicht verwendet werden" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_gui_continues_with_visible_warning_when_log_path_is_unusable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    invalid_parent = tmp_path / "keine-map"
+    invalid_parent.write_text("Datei statt Verzeichnis", encoding="utf-8")
+    logger = logging.getLogger("bittorrent_beobachter")
+    previous_handlers = logger.handlers[:]
+    logger.handlers.clear()
+    received: dict[str, object] = {}
+
+    def fake_launch_gui(
+        config_path: Path,
+        data_dir: Path,
+        *,
+        startup_warning: str | None = None,
+    ) -> int:
+        received.update(
+            config_path=config_path,
+            data_dir=data_dir,
+            startup_warning=startup_warning,
+        )
+        return 0
+
+    gui_module = types.ModuleType("bittorrent_beobachter.gui")
+    gui_module.launch_gui = fake_launch_gui
+    monkeypatch.setitem(sys.modules, "bittorrent_beobachter.gui", gui_module)
+    try:
+        exit_code = cli.main(["--log-file", str(invalid_parent / "monitor.log")])
+    finally:
+        for handler in logger.handlers[:]:
+            handler.close()
+        logger.handlers[:] = previous_handlers
+
+    assert exit_code == 0
+    assert "Protokolldatei" in str(received["startup_warning"])
+
+
 def test_hidden_gui_smoke_test_uses_packaged_gui_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[str] = []
 
-    monkeypatch.setattr(
-        "bittorrent_beobachter.gui.verify_gui_runtime",
-        lambda: calls.append("gui") or 0,
-    )
+    gui_module = types.ModuleType("bittorrent_beobachter.gui")
+    gui_module.verify_gui_runtime = lambda: calls.append("gui") or 0
+    monkeypatch.setitem(sys.modules, "bittorrent_beobachter.gui", gui_module)
 
     assert cli.main(["--gui-smoke-test"]) == 0
     assert calls == ["gui"]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import queue
 import sqlite3
+import tempfile
 import threading
 from collections.abc import Iterable
 from contextlib import suppress
@@ -185,7 +186,14 @@ def _target_status_text(result: ScanResult) -> str:
 class ObserverApp:
     """Bedienoberfläche mit klarer Trennung von Beobachtung und Behauptung."""
 
-    def __init__(self, root: Tk, config_path: Path, data_dir: Path) -> None:
+    def __init__(
+        self,
+        root: Tk,
+        config_path: Path,
+        data_dir: Path,
+        *,
+        startup_warning: str | None = None,
+    ) -> None:
         self.root = root
         self.config_path = config_path
         self.data_dir = data_dir
@@ -208,6 +216,17 @@ class ObserverApp:
         self._refresh_targets()
         self.root.protocol("WM_DELETE_WINDOW", self._request_close)
         self._poll_events()
+        if startup_warning is not None:
+            messagebox.showwarning(
+                "Protokolldatei nicht verfügbar",
+                (
+                    f"{startup_warning}\n\n"
+                    "Die Oberfläche läuft ohne Dateiprotokoll weiter. "
+                    "Probleme mit dem Ergebnisordner werden beim Prüflauf "
+                    "gesondert gemeldet."
+                ),
+                parent=self.root,
+            )
 
     def _load_initial_config(self) -> AppConfig:
         if not self.config_path.exists():
@@ -877,23 +896,40 @@ class ObserverApp:
             messagebox.showerror("Ergebnisordner nicht geöffnet", str(exc), parent=self.root)
 
 
-def launch_gui(config_path: Path, data_dir: Path) -> int:
+def launch_gui(
+    config_path: Path,
+    data_dir: Path,
+    *,
+    startup_warning: str | None = None,
+) -> int:
     """Startet das Hauptfenster und gibt nach dessen Schließen Erfolg zurück."""
     root = Tk()
-    ObserverApp(root, config_path, data_dir)
+    ObserverApp(
+        root,
+        config_path,
+        data_dir,
+        startup_warning=startup_warning,
+    )
     root.mainloop()
     return 0
 
 
 def verify_gui_runtime() -> int:
-    """Prüft den echten gebündelten Tk-Start ohne ein sichtbares Fenster."""
+    """Baut die echte Oberfläche unsichtbar auf und beendet sie wieder."""
 
-    root = Tk()
-    try:
-        root.withdraw()
-        root.update_idletasks()
-        if not root.tk.call("info", "patchlevel"):
-            raise RuntimeError("Tcl/Tk meldet keine gueltige Laufzeitversion.")
-    finally:
-        root.destroy()
+    with tempfile.TemporaryDirectory(prefix="afdleakercatcher-gui-smoke-") as temp_name:
+        smoke_root = Path(temp_name)
+        root = Tk()
+        try:
+            root.withdraw()
+            ObserverApp(
+                root,
+                smoke_root / "config.json",
+                smoke_root / "data",
+            )
+            root.update_idletasks()
+            if not root.tk.call("info", "patchlevel"):
+                raise RuntimeError("Tcl/Tk meldet keine gueltige Laufzeitversion.")
+        finally:
+            root.destroy()
     return 0

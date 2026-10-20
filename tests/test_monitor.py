@@ -111,7 +111,7 @@ def _config(*, enrichment_enabled: bool = True) -> AppConfig:
         targets=targets,
         dht=DhtSettings(
             timeout_seconds=1.0,
-            overall_timeout_seconds=1.0,
+            overall_timeout_seconds=1.1,
             concurrency=3,
             quiet_seconds=1.0,
             refresh_interval_seconds=0.1,
@@ -205,11 +205,7 @@ def _install_run_fake(
         hashes = tuple(target.info_hash_hex for target in config.targets)
         while batch := store.claim_candidate_batch(hashes, size=5):
             results = tuple(
-                _handshake(
-                    candidate,
-                    completed_full_window=candidate.ip.endswith(".1"),
-                )
-                for candidate in batch
+                _handshake(candidate, completed_full_window=True) for candidate in batch
             )
             persisted_batches.append(len(results))
             store.store_handshake_batch(results)
@@ -223,7 +219,7 @@ def _install_run_fake(
         def __init__(self, _cache_dir: Path, **_kwargs: Any) -> None:
             pass
 
-        def enrich(self, ip: str) -> NetworkEnrichment:
+        def enrich(self, ip: str, *, cancel_event: Any = None) -> NetworkEnrichment:
             enrichment_calls.append(ip)
             return NetworkEnrichment(
                 ip=ip,
@@ -320,6 +316,7 @@ def test_run_scan_persists_batches_and_keeps_large_lists_empty(
         for line in (tmp_path / "evidence" / "events.jsonl").read_text().splitlines()
     ]
     assert events[0]["event_type"] == "scan_started"
+    assert events[0]["evidence_semantics_version"] == 2
     assert events[-1]["event_type"] == "scan_completed"
     assert events[-1]["candidate_count"] == 8
     assert len(events[-1]["target_metrics"]) == 2
@@ -437,6 +434,76 @@ def test_previous_evidence_is_recovered_before_new_network_access(
     assert "legacy-compatible-run" in str(ready_events[0][0])
 
 
+def test_incomplete_recovery_preserves_evidence_semantics_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(enrichment_enabled=False)
+    evidence_dir = tmp_path / "evidence"
+    run_store_dir = evidence_dir / "runs"
+    run_store_dir.mkdir(parents=True)
+    candidate = _candidate(config.targets[0], 9)
+    record = EvidenceRecord(
+        handshake=_handshake(candidate),
+        enrichment=NetworkEnrichment(
+            ip=candidate.ip,
+            enriched_at_utc="2026-10-20T10:01:00.000Z",
+        ),
+        vpn=VpnClassification(status="unknown", provider=None, reason="kein Treffer"),
+        evidence_event_sha256="cd" * 32,
+    )
+    published: list[monitor.RecoveredEvidenceBatch] = []
+
+    def fake_recover(
+        _evidence_dir: Path,
+        *,
+        on_incomplete_run: Any,
+        **_kwargs: Any,
+    ) -> Any:
+        on_incomplete_run(
+            monitor.RecoveredRunContext(
+                run_id="interrupted-v2-run",
+                config_sha256=monitor._config_sha256(config),
+                software_sha256="ef" * 32,
+                config_snapshot=None,
+                config_snapshot_file_sha256=None,
+                store_path=run_store_dir / "interrupted-v2-run.sqlite3",
+                terminal_event=None,
+                evidence_semantics_version=2,
+            )
+        )
+        return SimpleNamespace(inserted_records=0)
+
+    def fake_persist(
+        *_args: Any,
+        batch_persisted: Any,
+        **_kwargs: Any,
+    ) -> int:
+        batch_persisted((record,))
+        return 0
+
+    monkeypatch.setattr(monitor, "recover_evidence_journal", fake_recover)
+    monkeypatch.setattr(monitor, "_persist_all_evidence", fake_persist)
+    monkeypatch.setattr(
+        monitor,
+        "_publish_recovered_batch",
+        lambda batch, *_args, **_kwargs: published.append(batch),
+    )
+
+    monitor._recover_previous_runs(
+        config,
+        tmp_path,
+        evidence_dir,
+        EvidenceJournal(evidence_dir / "events.jsonl"),
+        lambda _message: None,
+        None,
+    )
+
+    assert len(published) == 1
+    assert published[0].records == (record,)
+    assert published[0].evidence_semantics_version == 2
+
+
 def test_terminal_journal_event_is_not_duplicated_after_permission_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -504,6 +571,175 @@ def test_controlled_cancel_flushes_partial_batch_and_writes_final_reports(
     assert result.run_store_path is not None
     assert RunStore(result.run_store_path).evidence_count() == 3
     assert result.report_paths[0].is_file()
+    events = [
+        json.loads(line)["event"]["event_type"]
+        for line in (tmp_path / "evidence" / "events.jsonl").read_text().splitlines()
+    ]
+    assert events[-1] == "scan_cancelled"
+
+
+def test_metrics_keep_unique_checked_candidate_while_recheck_is_pending(
+    tmp_path: Path,
+) -> None:
+    config = _config(enrichment_enabled=False)
+    target = config.targets[0]
+    store = RunStore(tmp_path / "metrics.sqlite3")
+    candidate = _candidate(target, 42)
+    assert store.add_candidates([candidate]) == 1
+    assert store.claim_candidate_batch([target.info_hash_hex]) == [candidate]
+    rediscovered = PeerCandidate(
+        target_label=candidate.target_label,
+        info_hash_hex=candidate.info_hash_hex,
+        ip=candidate.ip,
+        port=candidate.port,
+        discovered_at_utc="2099-10-20T10:00:00.000Z",
+        dht_node_ip=candidate.dht_node_ip,
+        dht_node_port=candidate.dht_node_port,
+        transaction_id_hex="feedbeef",
+        response_sha256="cd" * 32,
+        source_note="Spaetere Sichtung",
+    )
+    assert store.ingest_candidates([rediscovered]).deferred_negative_rechecks == 1
+    assert (
+        store.store_handshake_batch(
+            [
+                HandshakeResult(
+                    candidate=candidate,
+                    attempted_at_utc="2026-10-20T10:00:00.500Z",
+                    completed_at_utc="2026-10-20T10:00:01.000Z",
+                    confirmed=False,
+                    remote_peer_id_hex=None,
+                    reserved_bits_hex=None,
+                    local_ip=None,
+                    local_port=None,
+                    bytes_sent=0,
+                    bytes_received=0,
+                    error="ConnectionRefusedError: abgelehnt",
+                    availability=None,
+                )
+            ]
+        )
+        == 1
+    )
+
+    runtimes = {
+        configured_target.info_hash_hex: monitor._TargetRuntimeMetrics(
+            target=configured_target,
+            verification_attempts=3 if configured_target == target else 0,
+        )
+        for configured_target in config.targets
+    }
+    metrics = {
+        item.info_hash_hex: item for item in monitor._build_target_metrics(config, store, runtimes)
+    }
+
+    assert metrics[target.info_hash_hex].candidates_discovered == 1
+    assert metrics[target.info_hash_hex].candidates_checked == 1
+    assert metrics[target.info_hash_hex].verification_attempts == 3
+    assert metrics[target.info_hash_hex].terminal_failures == 1
+    stored = store.metrics_by_hash([target.info_hash_hex])[target.info_hash_hex]
+    assert stored.pending == 1
+    assert stored.done == 0
+    assert stored.handshake_results == 1
+
+
+def test_cancel_requested_as_network_phase_returns_is_recorded_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_run_fake(monkeypatch)
+    cancel_event = monitor.Event()
+    progress_messages: list[str] = []
+
+    async def request_cancel_before_return(
+        _config: AppConfig,
+        _store: RunStore,
+        _data_dir: Path,
+        _runtimes: dict[str, Any],
+        _progress: Any,
+        *,
+        cancel_event: Any,
+        evidence_ready: Any,
+    ) -> list[str]:
+        assert evidence_ready is not None
+        cancel_event.set()
+        return []
+
+    monkeypatch.setattr(monitor, "_network_phase", request_cancel_before_return)
+    result = run_scan(
+        _config(enrichment_enabled=False),
+        tmp_path,
+        cancel_event=cancel_event,
+        progress=progress_messages.append,
+    )
+
+    assert result.cancelled is True
+    assert sum("kontrolliert abgebrochen" in notice for notice in result.notices) == 1
+    assert (
+        progress_messages.count(
+            "Prueflauf wird kontrolliert beendet; Restbefunde werden gespeichert."
+        )
+        == 1
+    )
+    events = [
+        json.loads(line)["event"]["event_type"]
+        for line in (tmp_path / "evidence" / "events.jsonl").read_text().splitlines()
+    ]
+    assert events[-1] == "scan_cancelled"
+
+
+def test_cancel_requested_during_final_persistence_is_recorded_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_run_fake(monkeypatch)
+    cancel_event = monitor.Event()
+    progress_messages: list[str] = []
+
+    async def leave_one_record_for_final_persistence(
+        config: AppConfig,
+        store: RunStore,
+        _data_dir: Path,
+        runtimes: dict[str, Any],
+        _progress: Any,
+        *,
+        cancel_event: Any,
+        evidence_ready: Any,
+    ) -> list[str]:
+        assert not cancel_event.is_set()
+        assert evidence_ready is not None
+        candidate = _candidate(config.targets[0], 42)
+        assert store.add_candidates((candidate,)) == 1
+        claimed = store.claim_candidate_batch((config.targets[0].info_hash_hex,), size=5)
+        store.store_handshake_batch((_handshake(claimed[0]),))
+        runtimes[config.targets[0].info_hash_hex].verification_attempts += 1
+        return []
+
+    original_persist = monitor._persist_all_evidence
+
+    def persist_then_cancel(*args: Any, **kwargs: Any) -> int:
+        stored = original_persist(*args, **kwargs)
+        cancel_event.set()
+        return stored
+
+    monkeypatch.setattr(monitor, "_network_phase", leave_one_record_for_final_persistence)
+    monkeypatch.setattr(monitor, "_persist_all_evidence", persist_then_cancel)
+    result = run_scan(
+        _config(enrichment_enabled=False),
+        tmp_path,
+        cancel_event=cancel_event,
+        progress=progress_messages.append,
+    )
+
+    assert result.cancelled is True
+    assert result.offering_count == 1
+    assert sum("kontrolliert abgebrochen" in notice for notice in result.notices) == 1
+    assert (
+        progress_messages.count(
+            "Prueflauf wird kontrolliert beendet; Restbefunde werden gespeichert."
+        )
+        == 1
+    )
     events = [
         json.loads(line)["event"]["event_type"]
         for line in (tmp_path / "evidence" / "events.jsonl").read_text().splitlines()
@@ -622,7 +858,7 @@ def test_discovery_fails_when_no_configured_source_answers(
             targets=(target,),
             dht=DhtSettings(
                 timeout_seconds=1.0,
-                overall_timeout_seconds=1.0,
+                overall_timeout_seconds=1.1,
                 concurrency=1,
                 quiet_seconds=1.0,
                 refresh_interval_seconds=0.1,

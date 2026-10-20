@@ -33,6 +33,8 @@ MAX_RESPONSE_BYTES = 65_507
 MAX_BOOTSTRAP_NODES = 16
 CANDIDATE_BATCH_SIZE = 5
 DHT_MIN_FREE_SPACE_BYTES = 100_000_000
+DHT_K_CLOSEST_NODES = 8
+DHT_QUERY_SCHEDULING_MARGIN_SECONDS = 0.1
 
 BOOTSTRAP_ISSUE_DNS = "dns"
 BOOTSTRAP_ISSUE_NO_GLOBAL_ADDRESS = "no_global_address"
@@ -87,6 +89,15 @@ class DHTConfig:
             0.1,
             MAX_OVERALL_TIMEOUT_SECONDS,
         )
+        if (
+            self.overall_timeout_seconds - self.timeout_seconds
+            < DHT_QUERY_SCHEDULING_MARGIN_SECONDS
+        ):
+            raise ValueError(
+                "overall_timeout_seconds muss mindestens "
+                f"{DHT_QUERY_SCHEDULING_MARGIN_SECONDS:.1f} Sekunden groesser als "
+                "timeout_seconds sein."
+            )
         _require_bounded_integer("concurrency", self.concurrency, 1, MAX_CONCURRENCY)
         _require_bounded_integer(
             "max_response_bytes", self.max_response_bytes, 512, MAX_RESPONSE_BYTES
@@ -428,11 +439,12 @@ async def resolve_bootstrap_nodes(
 
 
 class _DHTNodeFrontier:
-    """Private SQLite-Warteschlange für die vollständige DHT-Knotenfront."""
+    """Private SQLite-Warteschlange für eine BEP-5-konvergierende Knotenfront."""
 
     _PENDING = 0
     _IN_PROGRESS = 1
     _QUERIED = 2
+    _FAILED = 3
 
     def __init__(self, parent_directory: Path | None = None) -> None:
         self._temporary_directory = tempfile.TemporaryDirectory(
@@ -463,11 +475,13 @@ class _DHTNodeFrontier:
                     node_id BLOB,
                     distance BLOB NOT NULL CHECK(length(distance) = 20),
                     priority INTEGER NOT NULL CHECK(priority IN (0, 1)),
-                    state INTEGER NOT NULL CHECK(state IN (0, 1, 2)),
+                    state INTEGER NOT NULL CHECK(state IN (0, 1, 2, 3)),
                     UNIQUE(ip, port)
                 );
                 CREATE INDEX node_frontier_claim
                 ON node_frontier(state, priority, distance, id);
+                CREATE INDEX node_frontier_closest
+                ON node_frontier(priority, distance, id, state);
                 """
             )
         except BaseException:
@@ -578,7 +592,7 @@ class _DHTNodeFrontier:
                 )
 
     def claim(self, size: int) -> tuple[Endpoint, ...]:
-        """Reserviert einen kleinen priorisierten Batch atomar zur Abfrage."""
+        """Reserviert Bootstrap- oder k-nächste Zielknoten atomar zur Abfrage."""
 
         if isinstance(size, bool) or not isinstance(size, int) or size < 1:
             raise ValueError("size muss eine positive Ganzzahl sein.")
@@ -589,11 +603,19 @@ class _DHTNodeFrontier:
                 """
                 SELECT id, ip, port
                 FROM node_frontier
-                WHERE state = ?
+                WHERE state = ? AND (
+                    priority = 0 OR id IN (
+                        SELECT closest.id
+                        FROM node_frontier AS closest
+                        WHERE closest.priority = 1 AND closest.state != ?
+                        ORDER BY closest.distance, closest.id
+                        LIMIT ?
+                    )
+                )
                 ORDER BY priority, distance, id
                 LIMIT ?
                 """,
-                (self._PENDING, size),
+                (self._PENDING, self._FAILED, DHT_K_CLOSEST_NODES, size),
             ).fetchall()
             connection.executemany(
                 "UPDATE node_frontier SET state = ? WHERE id = ? AND state = ?",
@@ -608,6 +630,16 @@ class _DHTNodeFrontier:
     def mark_queried(self, endpoint: Endpoint) -> None:
         """Markiert eine beendete Abfrage endgültig als bearbeitet."""
 
+        self._mark_completed(endpoint, self._QUERIED)
+
+    def mark_failed(self, endpoint: Endpoint) -> None:
+        """Entfernt einen fehlgeschlagenen Kontakt aus dem k-nächsten Nahbereich."""
+
+        self._mark_completed(endpoint, self._FAILED)
+
+    def _mark_completed(self, endpoint: Endpoint, state: int) -> None:
+        """Setzt genau eine aktive Abfrage auf einen terminalen Frontier-Status."""
+
         normalized = normalize_global_endpoint(*endpoint)
         if normalized is None:
             raise ValueError("DHT-Endpunkt muss global erreichbar sein.")
@@ -619,7 +651,7 @@ class _DHTNodeFrontier:
                 SET state = ?
                 WHERE ip = ? AND port = ? AND state = ?
                 """,
-                (self._QUERIED, normalized[0], normalized[1], self._IN_PROGRESS),
+                (state, normalized[0], normalized[1], self._IN_PROGRESS),
             )
         if cursor.rowcount != 1:
             raise RuntimeError("DHT-Endpunkt war nicht als aktive Abfrage reserviert.")
@@ -636,12 +668,32 @@ class _DHTNodeFrontier:
         return cursor.rowcount
 
     def has_unfinished(self) -> bool:
-        """Meldet noch nicht endgültig bearbeitete Knoten ohne sie zu laden."""
+        """Meldet offene Bootstrap- oder k-nächste Zielknoten ohne sie zu laden."""
 
         connection = self._require_connection()
         row = connection.execute(
-            "SELECT EXISTS(SELECT 1 FROM node_frontier WHERE state != ? LIMIT 1)",
-            (self._QUERIED,),
+            """
+            SELECT EXISTS(
+                SELECT 1
+                FROM node_frontier
+                WHERE state IN (?, ?) AND (
+                    priority = 0 OR id IN (
+                        SELECT closest.id
+                        FROM node_frontier AS closest
+                        WHERE closest.priority = 1 AND closest.state != ?
+                        ORDER BY closest.distance, closest.id
+                        LIMIT ?
+                    )
+                )
+                LIMIT 1
+            )
+            """,
+            (
+                self._PENDING,
+                self._IN_PROGRESS,
+                self._FAILED,
+                DHT_K_CLOSEST_NODES,
+            ),
         ).fetchone()
         return bool(row and row[0])
 
@@ -839,11 +891,14 @@ class DHTCrawler:
         candidate_callback: CandidateBatchHook | None = None,
         collect: bool = True,
     ) -> list[PeerCandidate]:
-        """Durchsucht die vollständige entdeckte DHT-Front und streamt Peers.
+        """Durchsucht den protokollgemäß konvergierenden DHT-Nahbereich und streamt Peers.
 
         Eine private temporäre SQLite-Warteschlange dedupliziert und priorisiert
-        die unbegrenzte Knotenfront auf der Platte. Im Python-Speicher bleiben
-        nur ein kleiner Claim und höchstens ``concurrency`` aktive Anfragen.
+        alle entdeckten Knoten auf der Platte. Abgefragt werden Bootstrap-Knoten
+        und die jeweils k nächsten nicht fehlgeschlagenen Kontakte zum Infohash.
+        Weiter entfernte Knoten bleiben diagnostisch gespeichert, blockieren die
+        Konvergenz aber nicht. Im Python-Speicher bleiben nur ein kleiner Claim
+        und höchstens ``concurrency`` aktive Anfragen.
         ``overall_timeout_seconds`` begrenzt dabei nur einen Zeitschnitt. Eine
         noch offene Front bleibt für den nächsten Aufruf dieses Crawlers
         erhalten und wird nicht erneut am Bootstrap begonnen.
@@ -882,8 +937,13 @@ class DHTCrawler:
         deadline_reached = False
         try:
             while True:
+                remaining = deadline - loop.time()
                 available_slots = self.config.concurrency - len(active)
-                claimed = frontier.claim(available_slots) if available_slots else ()
+                claimed = (
+                    frontier.claim(available_slots)
+                    if available_slots and remaining > self.config.timeout_seconds
+                    else ()
+                )
                 for endpoint in claimed:
                     transaction_id = self._new_transaction_id()
                     task = asyncio.create_task(
@@ -893,6 +953,9 @@ class DHTCrawler:
                     self.queries_started += 1
 
                 if not active:
+                    if remaining <= self.config.timeout_seconds and frontier.has_unfinished():
+                        deadline_reached = True
+                        self._record_issue(errors, DHT_ISSUE_DEADLINE)
                     break
                 remaining = deadline - loop.time()
                 if remaining <= 0:
@@ -938,17 +1001,17 @@ class DHTCrawler:
                     except DHTQueryError as exc:
                         self.queries_failed += 1
                         self._record_issue(errors, exc.category)
-                        frontier.mark_queried(endpoint)
+                        frontier.mark_failed(endpoint)
                         continue
                     except DHTProtocolError:
                         self.queries_failed += 1
                         self._record_issue(errors, DHT_ISSUE_PROTOCOL)
-                        frontier.mark_queried(endpoint)
+                        frontier.mark_failed(endpoint)
                         continue
                     except OSError:
                         self.queries_failed += 1
                         self._record_issue(errors, DHT_ISSUE_NETWORK)
-                        frontier.mark_queried(endpoint)
+                        frontier.mark_failed(endpoint)
                         continue
                     self.queries_completed += 1
 

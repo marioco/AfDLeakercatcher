@@ -183,6 +183,134 @@ def _runtime_app(tmp_path: Path, config: AppConfig | None = None) -> Any:
     return app
 
 
+def test_gui_smoke_builds_real_observer_app_in_temporary_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, Path, Path, str | None]] = []
+
+    class SmokeRoot:
+        def __init__(self) -> None:
+            self.tk = self
+            self.withdrawn = False
+            self.updated = False
+            self.destroyed = False
+
+        def withdraw(self) -> None:
+            self.withdrawn = True
+
+        def update_idletasks(self) -> None:
+            self.updated = True
+
+        def call(self, *args: str) -> str:
+            assert args == ("info", "patchlevel")
+            return "9.0.4"
+
+        def destroy(self) -> None:
+            self.destroyed = True
+
+    root = SmokeRoot()
+
+    def fake_observer_app(
+        received_root: object,
+        config_path: Path,
+        data_dir: Path,
+        *,
+        startup_warning: str | None = None,
+    ) -> None:
+        calls.append((received_root, config_path, data_dir, startup_warning))
+
+    monkeypatch.setattr(gui, "Tk", lambda: root)
+    monkeypatch.setattr(gui, "ObserverApp", fake_observer_app)
+
+    assert gui.verify_gui_runtime() == 0
+    assert len(calls) == 1
+    assert calls[0][0] is root
+    assert calls[0][1].name == "config.json"
+    assert calls[0][2].name == "data"
+    assert calls[0][3] is None
+    assert root.withdrawn is True
+    assert root.updated is True
+    assert root.destroyed is True
+
+
+def test_observer_app_shows_logging_startup_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shown: list[tuple[str, str, object]] = []
+
+    class WarningRoot:
+        def title(self, _value: str) -> None:
+            pass
+
+        def protocol(self, _name: str, _callback: object) -> None:
+            pass
+
+    root = WarningRoot()
+    monkeypatch.setattr(gui, "_configure_window_geometry", lambda _root: None)
+    monkeypatch.setattr(gui.ObserverApp, "_load_initial_config", lambda _app: AppConfig(targets=()))
+    monkeypatch.setattr(gui.ObserverApp, "_build_ui", lambda _app: None)
+    monkeypatch.setattr(gui.ObserverApp, "_refresh_targets", lambda _app: None)
+    monkeypatch.setattr(gui.ObserverApp, "_poll_events", lambda _app: None)
+    monkeypatch.setattr(
+        gui.messagebox,
+        "showwarning",
+        lambda title, message, *, parent: shown.append((title, message, parent)),
+        raising=False,
+    )
+
+    gui.ObserverApp(
+        root,
+        tmp_path / "config.json",
+        tmp_path / "data",
+        startup_warning="Logpfad unbrauchbar",
+    )
+
+    assert len(shown) == 1
+    assert shown[0][0] == "Protokolldatei nicht verfügbar"
+    assert "Logpfad unbrauchbar" in shown[0][1]
+    assert "ohne Dateiprotokoll" in shown[0][1]
+    assert shown[0][2] is root
+
+
+def test_launch_gui_passes_startup_warning_to_observer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[Path, Path, str | None]] = []
+
+    class LaunchRoot:
+        def __init__(self) -> None:
+            self.mainloop_called = False
+
+        def mainloop(self) -> None:
+            self.mainloop_called = True
+
+    root = LaunchRoot()
+
+    def fake_observer_app(
+        received_root: object,
+        config_path: Path,
+        data_dir: Path,
+        *,
+        startup_warning: str | None = None,
+    ) -> None:
+        assert received_root is root
+        calls.append((config_path, data_dir, startup_warning))
+
+    monkeypatch.setattr(gui, "Tk", lambda: root)
+    monkeypatch.setattr(gui, "ObserverApp", fake_observer_app)
+
+    assert (
+        gui.launch_gui(
+            tmp_path / "config.json",
+            tmp_path / "data",
+            startup_warning="Logpfad unbrauchbar",
+        )
+        == 0
+    )
+    assert calls == [(tmp_path / "config.json", tmp_path / "data", "Logpfad unbrauchbar")]
+    assert root.mainloop_called is True
+
+
 def test_main_window_fits_small_high_dpi_desktop() -> None:
     root = _ScreenRootDouble(800, 500)
 

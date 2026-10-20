@@ -272,13 +272,24 @@ class ReportGenerationTests(unittest.TestCase):
                     row["angefragte_bzw_weitergeleitete_quellen"],
                     "https://rdap.example.invalid/object",
                 )
+                self.assertEqual(
+                    row["vpn_status"],
+                    "nicht als bekannter VPN klassifiziert",
+                )
+                self.assertEqual(row["vpn_begruendung"], "")
                 self.assertNotIn("netzregistrierungs_quellen", row)
+                self.assertNotIn("aussagegrenze", row)
 
             with by_name["run_42_vpn_liste.csv"].open(encoding="utf-8", newline="") as handle:
                 vpn_rows = list(csv.DictReader(handle, delimiter=";"))
             self.assertEqual(len(vpn_rows), 1)
             self.assertEqual(vpn_rows[0]["ip"], "2001:db8::5")
             self.assertEqual(vpn_rows[0]["vpn_anbieter"], "Beispiel VPN")
+            self.assertEqual(vpn_rows[0]["vpn_begruendung"], "expliziter Testpraefix")
+            self.assertEqual(
+                vpn_rows[0]["vpn_quellen"],
+                "https://vpn.example.invalid/list",
+            )
             self.assertEqual(
                 tuple(vpn_rows[0]),
                 ("ip", "vpn_anbieter", "vpn_begruendung", "vpn_quellen"),
@@ -304,7 +315,7 @@ class ReportGenerationTests(unittest.TestCase):
             self.assertIn("4. Technischer Beleg", plain_body)
             self.assertIn("meldete, dass bei ihm Teile verfügbar seien", plain_body)
             self.assertIn("technische Nachricht: UNCHOKE", plain_body)
-            self.assertIn("forderte diese Teile nicht an", plain_body)
+            self.assertNotIn("forderte diese Teile nicht an", plain_body)
             self.assertIn("https://github.com/marioco/AfDLeakercatcher", plain_body)
             self.assertNotIn("AfD-Datenleak", plain_body)
             self.assertNotIn("Entwurf", plain_body)
@@ -313,6 +324,15 @@ class ReportGenerationTests(unittest.TestCase):
             self.assertEqual(len(attachments), 1)
             notice_path = by_name["run_42_anlage_ipv4_198_51_100_10.pdf"]
             self.assertEqual(attachments[0].get_payload(decode=True), notice_path.read_bytes())
+            notice_bytes = notice_path.read_bytes()
+            self.assertNotIn(b"VPN-Einordnung", notice_bytes)
+            self.assertNotIn(b"VPN-Begr", notice_bytes)
+            self.assertNotIn(b"kein bekannter VPN-Treffer", notice_bytes)
+            self.assertNotIn(b"Kein expliziter VPN-Treffer", notice_bytes)
+            for report_name in ("run_42_laufbericht.pdf", "run_42_vpn_liste.pdf"):
+                report_bytes = by_name[report_name].read_bytes()
+                self.assertNotIn(b"Aussagegrenze", report_bytes)
+                self.assertNotIn(b"beweist keinen", report_bytes)
 
             manifest_lines = (
                 by_name["run_42_SHA256SUMS.txt"].read_text(encoding="utf-8").splitlines()
@@ -323,6 +343,30 @@ class ReportGenerationTests(unittest.TestCase):
                 expected_hash, filename = entry.split(" *", maxsplit=1)
                 actual_hash = hashlib.sha256(by_name[filename].read_bytes()).hexdigest()
                 self.assertEqual(expected_hash, actual_hash)
+
+    def test_unknown_vpn_csv_is_neutral_and_hides_internal_reason(self) -> None:
+        internal_reason = (
+            "Kein expliziter VPN-Treffer; daraus folgt keine Aussage, ob die IP ein VPN ist."
+        )
+        records = [
+            replace(
+                _evidence_record("198.51.100.60", 6060 + sequence, sequence),
+                vpn=VpnClassification(status="unknown", reason=internal_reason),
+            )
+            for sequence in (1, 2)
+        ]
+
+        single_row = reports_module._record_row(records[0], ip_is_known_vpn=False)
+        aggregate = reports_module._aggregate_reportable_records(records)[0]
+        aggregate_row = reports_module._aggregate_row(aggregate)
+
+        for row in (single_row, aggregate_row):
+            self.assertEqual(
+                row["vpn_status"],
+                "nicht als bekannter VPN klassifiziert",
+            )
+            self.assertEqual(row["vpn_begruendung"], "")
+            self.assertNotIn(internal_reason, row.values())
 
     def test_project_case_creates_complete_complaint_email(self) -> None:
         project_hash = "852795102149749ad91123af01ceac5da6f9eb5a"
@@ -394,10 +438,11 @@ class ReportGenerationTests(unittest.TestCase):
             self.assertIn(
                 "Unter dieser IP wurden nach dem dokumentierten "
                 "BitTorrent-Protokollbefund Teile des mutmaßlich rechtswidrig "
-                "entwendeten Datenbestands \N{EN DASH} möglicherweise auch der vollständige "
-                "Bestand \N{EN DASH} zum Download angeboten.",
+                "entwendeten Datenbestands zum Download angeboten.",
                 body,
             )
+            self.assertNotIn("vollständige Bestand", body)
+            self.assertNotIn("möglicherweise auch", body)
             self.assertIn("Aufnahme der Ermittlungen gegen Unbekannt", body)
             self.assertIn("zeitnahe Sicherung", body)
             self.assertIn("Ermittlung der verantwortlichen Person", body)
@@ -577,6 +622,11 @@ class ReportGenerationTests(unittest.TestCase):
             completed_full_window=False,
             termination_reason="Gegenstelle schloss die Verbindung",
         )
+        errored = replace(
+            positive,
+            termination_reason="protocol_or_network_error",
+            error="Peer-Protokollfehler am Ende des Beobachtungsfensters.",
+        )
         result = ScanResult(
             run_id="availability-gate",
             started_at_utc="2026-10-20T10:00:00Z",
@@ -596,6 +646,13 @@ class ReportGenerationTests(unittest.TestCase):
                     info_hash_hex=project_hash,
                     availability=incomplete,
                 ),
+                _evidence_record(
+                    "198.51.100.83",
+                    6013,
+                    13,
+                    info_hash_hex=project_hash,
+                    availability=errored,
+                ),
             ],
         )
 
@@ -610,33 +667,22 @@ class ReportGenerationTests(unittest.TestCase):
             self.assertIn("meldete, dass bei ihm Teile verfügbar seien", positive_body)
             self.assertIn("technische Nachricht: UNCHOKE", positive_body)
             self.assertIn("vollständig durchgeführten Beobachtungszeit", positive_body)
-            self.assertIn("forderte diese Teile nicht an", positive_body)
+            self.assertNotIn("forderte diese Teile nicht an", positive_body)
 
-            incomplete_message = BytesParser(policy=policy.default).parsebytes(
-                by_name["availability-gate_strafanzeige_ipv4_198_51_100_82.eml"].read_bytes()
-            )
-            incomplete_body = incomplete_message.get_body(preferencelist=("plain",)).get_content()
-            self.assertIn(
-                "Die Verbindung endete nach der bereits positiven Beobachtung",
-                incomplete_body,
-            )
-            self.assertIn(
-                "Beendigungsgrund: Gegenstelle schloss die Verbindung",
-                incomplete_body,
-            )
-            self.assertIn(
-                "(12.0 Sekunden; vorgesehen: 60.0 Sekunden)",
-                incomplete_body,
+            self.assertNotIn(
+                "availability-gate_strafanzeige_ipv4_198_51_100_82.eml",
+                by_name,
             )
             self.assertNotIn(
-                "vollständig durchgeführten Beobachtungszeit",
-                incomplete_body,
+                "availability-gate_strafanzeige_ipv4_198_51_100_83.eml",
+                by_name,
             )
-            detail_rows = dict(reports_module._availability_detail_rows(result.records[1]))
-            self.assertEqual(
-                detail_rows["Vollständige Beobachtungszeit erreicht"],
-                "nein",
-            )
+            self.assertFalse(result.records[1].handshake.offering_observed)
+            self.assertFalse(result.records[2].handshake.offering_observed)
+            with self.assertRaisesRegex(ValueError, "positiven Gesamtbefund"):
+                reports_module._availability_detail_rows(result.records[1])
+            with self.assertRaisesRegex(ValueError, "positiven Gesamtbefund"):
+                reports_module._availability_detail_rows(result.records[2])
 
     def test_run_store_records_take_precedence_and_use_five_item_reads(self) -> None:
         database_record = _evidence_record("198.51.100.85", 6015, 15)

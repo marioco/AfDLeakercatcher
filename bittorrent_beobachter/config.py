@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from .dht import MAX_BOOTSTRAP_NODES
+from .dht import DHT_QUERY_SCHEDULING_MARGIN_SECONDS, MAX_BOOTSTRAP_NODES
 from .models import Target
 
 MAX_CONFIG_BYTES = 256_000
@@ -66,6 +66,17 @@ class DhtSettings:
     quiet_seconds: float = 30.0
     refresh_interval_seconds: float = 2.0
     bootstrap_nodes: tuple[tuple[str, int], ...] = DEFAULT_BOOTSTRAP_NODES
+
+    def __post_init__(self) -> None:
+        if (
+            self.overall_timeout_seconds - self.timeout_seconds
+            < DHT_QUERY_SCHEDULING_MARGIN_SECONDS
+        ):
+            raise ConfigError(
+                "dht.overall_timeout_seconds muss mindestens "
+                f"{DHT_QUERY_SCHEDULING_MARGIN_SECONDS:.1f} Sekunden groesser als "
+                "dht.timeout_seconds sein."
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -598,12 +609,11 @@ def load_config(path: Path) -> AppConfig:
     """Lädt eine größenbegrenzte UTF-8-JSON-Konfiguration."""
     try:
         metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ConfigError(f"Konfiguration ist keine reguläre Datei: {path}")
         size = metadata.st_size
-        if os.name != "nt":
-            if stat.S_IMODE(path.parent.stat().st_mode) != 0o700:
-                path.parent.chmod(0o700)
-            if stat.S_IMODE(metadata.st_mode) != 0o600:
-                path.chmod(0o600)
+        if os.name != "nt" and stat.S_IMODE(metadata.st_mode) != 0o600:
+            path.chmod(0o600)
     except FileNotFoundError as exc:
         raise ConfigError(f"Konfiguration nicht gefunden: {path}") from exc
     except OSError as exc:
@@ -673,11 +683,8 @@ def save_config(path: Path, config: AppConfig) -> None:
     validated_config = config_from_dict(config_to_dict(config))
     payload = json.dumps(config_to_dict(validated_config), ensure_ascii=False, indent=2) + "\n"
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if os.name != "nt":
-        path.parent.chmod(0o700)
+    _create_private_directories(path.parent)
     temporary_root = path.parent
-    temporary_root.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -699,6 +706,26 @@ def save_config(path: Path, config: AppConfig) -> None:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
         raise
+
+
+def _create_private_directories(directory: Path) -> None:
+    """Erzeugt nur fehlende Verzeichnisse privat und verändert vorhandene nicht."""
+
+    missing: list[Path] = []
+    current = directory
+    while not current.exists():
+        missing.append(current)
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    for path in reversed(missing):
+        try:
+            path.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        if os.name != "nt":
+            path.chmod(0o700)
 
 
 def load_migrated_config(path: Path) -> AppConfig:

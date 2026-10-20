@@ -15,10 +15,12 @@ from unittest.mock import patch
 import bittorrent_beobachter.dht as dht_module
 from bittorrent_beobachter.bencode import bdecode, bencode
 from bittorrent_beobachter.dht import (
+    DHT_K_CLOSEST_NODES,
     DHTConfig,
     DHTCrawler,
     DHTNode,
     DHTProtocolError,
+    DHTQueryError,
     DHTResponse,
     build_get_peers_query,
     is_global_endpoint,
@@ -132,6 +134,8 @@ class DHTParsingTests(unittest.TestCase):
             DHTConfig(timeout_seconds=31.0)
         with self.assertRaises(ValueError):
             DHTConfig(overall_timeout_seconds=301.0)
+        with self.assertRaisesRegex(ValueError, "groesser"):
+            DHTConfig(timeout_seconds=1.0, overall_timeout_seconds=1.05)
 
 
 class DHTCrawlerTests(unittest.IsolatedAsyncioTestCase):
@@ -325,7 +329,7 @@ class DHTCrawlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(crawler.queries_started, 2)
         self.assertEqual(crawler.queries_completed, 2)
 
-    async def test_crawler_queries_every_node_in_a_wide_front(self) -> None:
+    async def test_crawler_queries_protocol_k_closest_nodes_in_a_wide_front(self) -> None:
         bootstrap = ("8.8.8.8", 6881)
         nodes = tuple(
             DHTNode(index.to_bytes(20, "big"), "1.1.1.1", 10_000 + index) for index in range(192)
@@ -347,13 +351,51 @@ class DHTCrawlerTests(unittest.IsolatedAsyncioTestCase):
         crawler = DHTCrawler([bootstrap], query_hook=query)
 
         self.assertEqual(await crawler.discover(Target("Test", bytes(20))), [])
-        self.assertEqual(len(calls), 193)
+        self.assertEqual(len(calls), 1 + DHT_K_CLOSEST_NODES)
         self.assertEqual(
             set(calls[1:]),
-            {("1.1.1.1", 10_000 + index) for index in range(192)},
+            {("1.1.1.1", 10_000 + index) for index in range(DHT_K_CLOSEST_NODES)},
         )
 
-    async def test_disk_frontier_keeps_wide_branched_graph_bounded_without_loss(
+    async def test_endlessly_farther_nodes_do_not_block_kademlia_convergence(self) -> None:
+        bootstrap = ("8.8.8.8", 6881)
+        calls: list[tuple[str, int]] = []
+
+        async def query(
+            endpoint: tuple[str, int], _info_hash: bytes, transaction_id: bytes
+        ) -> DHTResponse:
+            calls.append(endpoint)
+            step = 0 if endpoint == bootstrap else endpoint[1] - 20_000
+            next_step = step + 1
+            return DHTResponse(
+                source=endpoint,
+                transaction_id=transaction_id,
+                nodes=(
+                    DHTNode(
+                        next_step.to_bytes(20, "big"),
+                        "1.1.1.1",
+                        20_000 + next_step,
+                    ),
+                ),
+                peers=(),
+                response_sha256="d" * 64,
+            )
+
+        crawler = DHTCrawler(
+            [bootstrap],
+            config=DHTConfig(concurrency=1),
+            query_hook=query,
+        )
+
+        self.assertEqual(await crawler.discover(Target("Test", bytes(20))), [])
+        self.assertEqual(len(calls), 1 + DHT_K_CLOSEST_NODES)
+        self.assertEqual(
+            calls,
+            [bootstrap]
+            + [("1.1.1.1", 20_000 + index) for index in range(1, DHT_K_CLOSEST_NODES + 1)],
+        )
+
+    async def test_disk_frontier_replaces_failed_k_and_ignores_farther_branches(
         self,
     ) -> None:
         bootstrap = ("8.8.8.8", 6881)
@@ -396,6 +438,8 @@ class DHTCrawlerTests(unittest.IsolatedAsyncioTestCase):
                 elif endpoint[0].startswith("8.20."):
                     octets = tuple(int(part) for part in endpoint[0].split("."))
                     index = octets[2] * 250 + octets[3] - 1
+                    if index < DHT_K_CLOSEST_NODES:
+                        raise DHTQueryError("simulierter Ausfall eines nahen Kontakts")
                     child = endpoint_for(21, index)
                     nodes = (
                         DHTNode(
@@ -437,13 +481,13 @@ class DHTCrawlerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await crawler.discover(Target("Test", bytes(20))), [])
 
         expected = {bootstrap}
-        expected.update(endpoint_for(20, index) for index in range(width))
-        expected.update(endpoint_for(21, index) for index in range(width))
-        self.assertEqual(len(calls), 1 + 2 * width)
+        expected.update(endpoint_for(20, index) for index in range(2 * DHT_K_CLOSEST_NODES))
+        self.assertEqual(len(calls), 1 + 2 * DHT_K_CLOSEST_NODES)
         self.assertEqual(set(calls), expected)
         self.assertEqual(crawler.queries_started, len(expected))
-        self.assertEqual(crawler.queries_completed, len(expected))
-        self.assertEqual(peak_active_queries, concurrency)
+        self.assertEqual(crawler.queries_completed, 1 + DHT_K_CLOSEST_NODES)
+        self.assertEqual(crawler.queries_failed, DHT_K_CLOSEST_NODES)
+        self.assertEqual(peak_active_queries, min(concurrency, DHT_K_CLOSEST_NODES))
         self.assertTrue(claim_sizes)
         self.assertTrue(
             all(
@@ -680,8 +724,8 @@ class DHTCrawlerTests(unittest.IsolatedAsyncioTestCase):
         crawler = DHTCrawler(
             [bootstrap],
             config=DHTConfig(
-                timeout_seconds=1.0,
-                overall_timeout_seconds=0.1,
+                timeout_seconds=0.1,
+                overall_timeout_seconds=0.2,
                 concurrency=1,
             ),
             query_hook=query,

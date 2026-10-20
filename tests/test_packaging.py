@@ -17,14 +17,14 @@ ARCHIVE_NAME = f"{PRODUCT_NAME}-Windows-x64.zip"
 CHECKSUM_NAME = f"{ARCHIVE_NAME}.sha256"
 RELEASE_ARTIFACT_NAME = f"{PRODUCT_NAME}-Windows-x64-release"
 EXPECTED_LICENSE_HASHES = {
-    "Python-3.12.10.txt": "3b2f81fe21d181c499c59a256c8e1968455d6689d269aa85373bfb6af41da3bf",
-    "Tcl-8.6.15.txt": "0d1e4405f6273f091732764ed89b57066be63ce64869be6c71ea337dc4f2f9b5",
-    "Tk-8.6.15.txt": "0d1e4405f6273f091732764ed89b57066be63ce64869be6c71ea337dc4f2f9b5",
-    "OpenSSL-3.0.16-LICENSE.txt": (
+    "Python-3.14.8.txt": "935cf13e19f8c31b497d20b05d73623431a226b230c3599bc30fa3348979bc68",
+    "Tcl-9.0.4.txt": "c0a69a2bfd757361ec7e6143973b103c90409316b49e9c88db26ad6388e79f16",
+    "Tk-9.0.4.txt": "2cde822b93ca16ae535c954b7dfe658b4ad10df2a193628d1b358f1765e8b198",
+    "OpenSSL-3.5.9-LICENSE.txt": (
         "7d5450cb2d142651b8afa315b5f238efc805dad827d91ba367d8516bc9d49e7a"
     ),
-    "OpenSSL-3.0.16-ACKNOWLEDGEMENTS.md": (
-        "ab2e0973f82e48268f9918cb52d19efe43ff2e4549d40efaee365b2a95d7f91d"
+    "OpenSSL-3.5.9-ACKNOWLEDGEMENTS.md": (
+        "58dee45791f007ced048114717f86672778fe75c551827c57e760861446ce3c3"
     ),
     "ReportLab-4.5.1.txt": "ef831761646313921375fc2cb888e8eeaf7da213d0b92852c10c42f3a0b4d138",
     "Pillow-13.0.0.txt": "dda12a98c1979cf3d94df1cff45d27a4cb3f04a60c76f76902ac54cac03ec0ce",
@@ -130,22 +130,42 @@ def test_bundled_runtime_versions_match_the_shipped_license_texts() -> None:
     workflow = _text(".github/workflows/build.yml")
     local_build = _text("build_windows.ps1")
 
-    assert workflow.count('python-version: "3.12.10"') == 2
-    assert 'expected_python = "3.12.10"' in workflow
-    assert 'expected_tcl_tk = "8.6.15"' in workflow
-    assert 'expected_openssl = "OpenSSL 3.0.16 11 Feb 2025"' in workflow
+    assert workflow.count('python-version: "3.14.8"') == 2
+    assert 'expected_python = "3.14.8"' in workflow
+    assert 'expected_tcl_tk = "9.0.4"' in workflow
+    assert 'expected_openssl = "OpenSSL 3.5.9 29 Sep 2026"' in workflow
     assert "actual_openssl = ssl.OPENSSL_VERSION" in workflow
-    assert '$ExpectedPythonVersion = "3.12.10"' in local_build
-    assert '$ExpectedTclTkVersion = "8.6.15"' in local_build
-    assert '$ExpectedOpenSslVersion = "OpenSSL 3.0.16 11 Feb 2025"' in local_build
+    assert '$ExpectedPythonVersion = "3.14.8"' in local_build
+    assert '$ExpectedTclTkVersion = "9.0.4"' in local_build
+    assert '$ExpectedOpenSslVersion = "OpenSSL 3.5.9 29 Sep 2026"' in local_build
     assert "actual_openssl = ssl.OPENSSL_VERSION" in local_build
     assert 'root.tk.call("package", "provide", "Tk")' in workflow
     assert 'root.tk.call("package", "provide", "Tk")' in local_build
+    assert "EXPECTED_PYTHON_VERSION = (3, 14, 8)" in _text("BitTorrentBeobachter.spec")
+    assert 'EXPECTED_OPENSSL_VERSION = "OpenSSL 3.5.9 29 Sep 2026"' in _text(
+        "BitTorrentBeobachter.spec"
+    )
+    assert 'EXPECTED_TCL_VERSION = "9.0.4"' in _text("BitTorrentBeobachter.spec")
+    assert 'EXPECTED_TK_VERSION = "9.0.4"' in _text("BitTorrentBeobachter.spec")
+    assert 'root.tk.call("package", "provide", "Tk")' in _text("BitTorrentBeobachter.spec")
+    for runtime_name in (
+        "python314.dll",
+        "tcl90.dll",
+        "tcl9tk90.dll",
+        "libcrypto-3.dll",
+        "libssl-3.dll",
+    ):
+        assert runtime_name in workflow
+        assert runtime_name in local_build
+    assert "Runtime-Inventar:" in workflow
+    assert "Runtime-Inventar:" in local_build
+    assert "Get-FileHash -Algorithm SHA256" in workflow
+    assert "Get-FileHash -Algorithm SHA256" in local_build
     assert 'Where-Object { $_.Name -like "libcrypto-3*.dll" }' in workflow
     assert 'Where-Object { $_.Name -like "libssl-3*.dll" }' in workflow
-    assert "Assert-BundledOpenSslLibraries" in local_build
-    assert 'Where-Object { $_.Name -like "libcrypto-3*.dll" }' in local_build
-    assert 'Where-Object { $_.Name -like "libssl-3*.dll" }' in local_build
+    assert "Assert-BundledRuntimeInventory" in local_build
+    assert '"libcrypto-3*.dll"' in local_build
+    assert '"libssl-3*.dll"' in local_build
 
 
 def test_windows_build_places_pdf_beside_executable() -> None:
@@ -185,6 +205,20 @@ def test_windows_job_builds_one_final_zip_and_preserves_raw_app_artifact() -> No
     assert "Gebündelte Tkinter-GUI erfolgreich gestartet und beendet." in workflow
 
 
+def test_local_windows_build_smokes_bundled_executable_before_archiving() -> None:
+    local_build = _text("build_windows.ps1")
+
+    version_smoke = local_build.index('-Arguments @("--version")')
+    gui_smoke = local_build.index('-Arguments @("--gui-smoke-test")')
+    archive_creation = local_build.index("[System.IO.Compression.ZipFile]::CreateFromDirectory(")
+
+    assert "function Invoke-BundledExecutableSmokeTest" in local_build
+    assert "$Process.WaitForExit($TimeoutMilliseconds)" in local_build
+    assert "$Process.Kill()" in local_build
+    assert "[int] $TimeoutMilliseconds = 30000" in local_build
+    assert version_smoke < gui_smoke < archive_creation
+
+
 def test_ci_and_local_windows_build_use_hash_locked_dependencies() -> None:
     workflow = _text(".github/workflows/build.yml")
     local_build = _text("build_windows.ps1")
@@ -204,6 +238,7 @@ def test_ci_and_local_windows_build_use_hash_locked_dependencies() -> None:
     ):
         assert package in lock
     assert "--hash=sha256:" in lock
+    assert "pip-compile for Python 3.14 builds" in lock
 
 
 def test_exact_final_zip_is_attested_and_published() -> None:
@@ -225,7 +260,7 @@ def test_version_sources_tag_checks_and_direct_download_are_consistent() -> None
     project = tomllib.loads(_text("pyproject.toml"))
     version = project["project"]["version"]
 
-    assert version == _app_version() == "0.3.3"
+    assert version == _app_version() == "0.3.4"
     assert f"Windows-Download \N{EN DASH} Version {version}" in readme
     release_path = f"releases/download/afdleakercatcher-v{version}/"
     assert readme.count(release_path) >= 2

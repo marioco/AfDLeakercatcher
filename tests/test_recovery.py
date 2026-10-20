@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -12,7 +13,9 @@ from types import SimpleNamespace
 
 import pytest
 
+import bittorrent_beobachter.monitor as monitor_module
 import bittorrent_beobachter.recovery as recovery_module
+from bittorrent_beobachter.config import default_app_config
 from bittorrent_beobachter.evidence import EvidenceJournal, EvidenceJournalError
 from bittorrent_beobachter.models import (
     EvidenceRecord,
@@ -21,6 +24,7 @@ from bittorrent_beobachter.models import (
     PeerAvailabilityObservation,
     PeerCandidate,
     PeerControlEvent,
+    ScanResult,
     VpnClassification,
 )
 from bittorrent_beobachter.recovery import (
@@ -122,6 +126,35 @@ def _record(info_hash: str, index: int) -> EvidenceRecord:
     )
 
 
+def _record_with_legacy_gate_difference(
+    index: int,
+    *,
+    completed_full_window: bool,
+    availability_error: str | None,
+    interested_sent: bool = True,
+) -> EvidenceRecord:
+    record = _record(HASH_A, index)
+    availability = record.handshake.availability
+    assert availability is not None
+    return replace(
+        record,
+        handshake=replace(
+            record.handshake,
+            availability=replace(
+                availability,
+                completed_full_window=completed_full_window,
+                interested_sent=interested_sent,
+                termination_reason=(
+                    "duration_elapsed"
+                    if completed_full_window and availability_error is None
+                    else "peer_closed"
+                ),
+                error=availability_error,
+            ),
+        ),
+    )
+
+
 def _start_event(
     run_id: str,
     *,
@@ -129,6 +162,7 @@ def _start_event(
     config_sha256: str = CONFIG_A,
     software_sha256: str = SOFTWARE_A,
     snapshot_sha256: str = SNAPSHOT_HASH_A,
+    evidence_semantics_version: int = 2,
 ) -> dict[str, object]:
     return {
         "event_type": "scan_started",
@@ -136,8 +170,11 @@ def _start_event(
         "config_sha256": config_sha256,
         "config_snapshot": f"{run_id}.config.json",
         "config_snapshot_file_sha256": snapshot_sha256,
+        "evidence_semantics_version": evidence_semantics_version,
         "software_sha256": software_sha256,
-        "targets": [{"label": "Recovery-Ziel", "info_hash": info_hash}],
+        "targets": [
+            {"label": "Ziel A" if info_hash == HASH_A else "Ziel B", "info_hash": info_hash}
+        ],
         "network_enrichment_enabled": False,
     }
 
@@ -155,8 +192,28 @@ def _legacy_start_event(
         config_sha256=config_sha256,
         software_sha256=software_sha256,
     )
+    del event["evidence_semantics_version"]
     del event["config_snapshot"]
     del event["config_snapshot_file_sha256"]
+    return event
+
+
+def _v033_start_event(
+    run_id: str,
+    *,
+    info_hash: str = HASH_A,
+    config_sha256: str = CONFIG_A,
+    software_sha256: str = SOFTWARE_A,
+    snapshot_sha256: str = SNAPSHOT_HASH_A,
+) -> dict[str, object]:
+    event = _start_event(
+        run_id,
+        info_hash=info_hash,
+        config_sha256=config_sha256,
+        software_sha256=software_sha256,
+        snapshot_sha256=snapshot_sha256,
+    )
+    del event["evidence_semantics_version"]
     return event
 
 
@@ -202,6 +259,7 @@ def _published_terminal_event(
     *,
     config_sha256: str = CONFIG_A,
     software_sha256: str = SOFTWARE_A,
+    report_binding: dict[str, object] | None = None,
 ) -> dict[str, object]:
     event = _terminal_event(
         run_id,
@@ -210,13 +268,78 @@ def _published_terminal_event(
         software_sha256=software_sha256,
     )
     event.update(
-        {
+        report_binding
+        or {
             "report_file_count": 1,
             "report_manifest": "manifest.json",
             "report_manifest_sha256": "9" * 64,
         }
     )
     return event
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_report_package(
+    output_dir: Path,
+    report_run_id: str,
+    *,
+    file_prefix: str | None = None,
+) -> dict[str, object]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_prefix = file_prefix or report_run_id
+    report_paths: list[Path] = []
+    for suffix in (
+        "_laufbericht.pdf",
+        "_beobachtungen.csv",
+        "_vpn_liste.csv",
+        "_vpn_liste.pdf",
+    ):
+        path = output_dir / f"{report_prefix}{suffix}"
+        path.write_bytes(f"Testbericht {suffix}\n".encode())
+        report_paths.append(path)
+
+    manifest_path = output_dir / f"{report_prefix}_SHA256SUMS.txt"
+    manifest_lines = [
+        "# SHA-256-Manifest der erzeugten Berichte",
+        f"# Lauf-ID: {report_run_id}",
+        "# Erstellt (UTC): 2026-10-20T10:02:00.000Z",
+        "# Die Manifestdatei selbst ist wegen des Zirkelschlusses nicht enthalten.",
+        *(f"{_sha256_file(path)} *{path.name}" for path in report_paths),
+    ]
+    manifest_path.write_text("\n".join(manifest_lines) + "\n", encoding="utf-8")
+    return {
+        "report_file_count": len(report_paths) + 1,
+        "report_manifest": manifest_path.name,
+        "report_manifest_sha256": _sha256_file(manifest_path),
+    }
+
+
+def _recovery_report_directory(evidence_dir: Path, batch: RecoveredEvidenceBatch) -> Path:
+    digest = hashlib.sha256(
+        "\n".join(record.evidence_event_sha256 for record in batch.records).encode("ascii")
+    ).hexdigest()[:16]
+    return evidence_dir.parent / "reports" / batch.run_id / f"wiederhergestellt-{digest}"
+
+
+def _write_recovery_report_package(
+    evidence_dir: Path,
+    batch: RecoveredEvidenceBatch,
+) -> dict[str, object]:
+    digest = hashlib.sha256(
+        "\n".join(record.evidence_event_sha256 for record in batch.records).encode("ascii")
+    ).hexdigest()[:16]
+    report_run_id = f"recovery-{batch.run_id[-32:]}-{digest}"
+    return _write_report_package(
+        _recovery_report_directory(evidence_dir, batch),
+        report_run_id,
+    )
 
 
 def _prepare_store(evidence_dir: Path, run_id: str, records: list[EvidenceRecord]) -> RunStore:
@@ -272,6 +395,7 @@ def test_mixed_journal_recovers_only_evidence_event(tmp_path: Path) -> None:
             config_snapshot=f"{run_id}.config.json",
             config_snapshot_file_sha256=SNAPSHOT_HASH_A,
             records=(expected,),
+            evidence_semantics_version=2,
         )
     ]
 
@@ -332,6 +456,40 @@ def test_multiple_runs_in_one_journal_batch_lose_no_records(tmp_path: Path) -> N
         replace(record_b, evidence_event_sha256=entries[3].event_sha256)
     ]
     assert [batch.run_id for batch in callbacks] == ["run-a", "run-b"]
+
+
+def test_journal_evidence_must_match_started_infohash(tmp_path: Path) -> None:
+    evidence_dir = tmp_path / "evidence"
+    run_id = "run-wrong-infohash"
+    source_record = _record(HASH_B, 62)
+    store = _prepare_store(evidence_dir, run_id, [source_record])
+    EvidenceJournal(evidence_dir / "events.jsonl").append_many(
+        (_start_event(run_id, info_hash=HASH_A), _evidence_event(run_id, source_record))
+    )
+
+    with pytest.raises(EvidenceRecoveryError, match="nicht an scan_started gebunden"):
+        recover_evidence_journal(evidence_dir)
+
+    assert store.evidence_count() == 0
+
+
+def test_db_only_evidence_must_match_started_target_label(tmp_path: Path) -> None:
+    evidence_dir = tmp_path / "evidence"
+    run_id = "run-wrong-target-label"
+    source_record = _record(HASH_A, 63)
+    candidate = replace(source_record.handshake.candidate, target_label="Anderes Ziel")
+    source_record = replace(
+        source_record,
+        handshake=replace(source_record.handshake, candidate=candidate),
+    )
+    _prepare_store(evidence_dir, run_id, [source_record])
+    EvidenceJournal(evidence_dir / "events.jsonl").append(_start_event(run_id))
+    callbacks: list[RecoveredRunContext] = []
+
+    with pytest.raises(EvidenceRecoveryError, match="nicht an scan_started gebunden"):
+        recover_evidence_journal(evidence_dir, on_incomplete_run=callbacks.append)
+
+    assert callbacks == []
 
 
 def test_missing_run_database_fails_without_creating_one(tmp_path: Path) -> None:
@@ -525,8 +683,34 @@ def test_db_only_offering_handshake_is_reported_as_incomplete_run(tmp_path: Path
             config_snapshot_file_sha256=SNAPSHOT_HASH_A,
             store_path=store.path,
             terminal_event="scan_failed",
+            evidence_semantics_version=2,
         )
     ]
+
+
+def test_incomplete_run_context_keeps_terminal_manifest_binding(tmp_path: Path) -> None:
+    evidence_dir = tmp_path / "evidence"
+    run_id = "run-incomplete-manifest"
+    source_record = _record(HASH_A, 34)
+    _prepare_store(evidence_dir, run_id, [source_record])
+    report_binding = _write_report_package(
+        evidence_dir.parent / "reports" / run_id,
+        run_id,
+    )
+    EvidenceJournal(evidence_dir / "events.jsonl").append_many(
+        (
+            _start_event(run_id),
+            _published_terminal_event(run_id, report_binding=report_binding),
+        )
+    )
+    contexts: list[RecoveredRunContext] = []
+
+    recover_evidence_journal(evidence_dir, on_incomplete_run=contexts.append)
+
+    assert len(contexts) == 1
+    assert contexts[0].report_manifest == report_binding["report_manifest"]
+    assert contexts[0].report_manifest_sha256 == report_binding["report_manifest_sha256"]
+    assert contexts[0].report_file_count == report_binding["report_file_count"]
 
 
 def test_completed_store_without_unpersisted_offering_is_not_reported(tmp_path: Path) -> None:
@@ -614,6 +798,68 @@ def test_reconciled_callback_is_retried_after_callback_failure(tmp_path: Path) -
     assert [batch.records for batch in retried] == [(expected,)]
 
 
+def test_v033_pending_publish_state_is_migrated_as_semantics_v1(tmp_path: Path) -> None:
+    evidence_dir = tmp_path / "evidence"
+    run_id = "v033-pending-state"
+    source_record = _record(HASH_A, 57)
+    store = _prepare_store(evidence_dir, run_id, [source_record])
+    entries = EvidenceJournal(evidence_dir / "events.jsonl").append_many(
+        (_v033_start_event(run_id), _evidence_event(run_id, source_record))
+    )
+    expected = replace(source_record, evidence_event_sha256=entries[1].event_sha256)
+    assert store.store_evidence_batch([expected]) == 1
+    state_path = evidence_dir / recovery_module._PUBLISH_STATE_FILENAME
+    with sqlite3.connect(state_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE pending_reconciled_reports (
+                event_sha256 TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                config_sha256 TEXT NOT NULL,
+                software_sha256 TEXT NOT NULL,
+                config_snapshot TEXT,
+                config_snapshot_file_sha256 TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO pending_reconciled_reports VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                entries[1].event_sha256,
+                run_id,
+                CONFIG_A,
+                SOFTWARE_A,
+                f"{run_id}.config.json",
+                SNAPSHOT_HASH_A,
+            ),
+        )
+        connection.commit()
+    reconciled: list[RecoveredEvidenceBatch] = []
+
+    recover_evidence_journal(evidence_dir, on_reconciled=reconciled.append)
+
+    assert [batch.evidence_semantics_version for batch in reconciled] == [1]
+    with sqlite3.connect(state_path) as connection:
+        columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(pending_reconciled_reports)"
+            ).fetchall()
+        }
+        semantics_version = connection.execute(
+            """
+            SELECT evidence_semantics_version
+            FROM pending_reconciled_reports
+            WHERE event_sha256 = ?
+            """,
+            (entries[1].event_sha256,),
+        ).fetchone()
+    assert "evidence_semantics_version" in columns
+    assert semantics_version == (1,)
+
+
 @pytest.mark.parametrize("terminal_event", ("scan_completed", "scan_cancelled", "scan_failed"))
 def test_clean_terminal_run_does_not_repeat_reconciled_callback(
     tmp_path: Path,
@@ -623,6 +869,10 @@ def test_clean_terminal_run_does_not_repeat_reconciled_callback(
     run_id = f"run-clean-{terminal_event}"
     source_record = _record(HASH_A, 43)
     store = _prepare_store(evidence_dir, run_id, [source_record])
+    report_binding = _write_report_package(
+        evidence_dir.parent / "reports" / run_id,
+        run_id,
+    )
     entries = EvidenceJournal(evidence_dir / "events.jsonl").append_many(
         (
             _start_event(run_id),
@@ -630,7 +880,11 @@ def test_clean_terminal_run_does_not_repeat_reconciled_callback(
             {"event_type": "diagnostic", "index": 1},
             {"event_type": "diagnostic", "index": 2},
             {"event_type": "diagnostic", "index": 3},
-            _published_terminal_event(run_id, terminal_event),
+            _published_terminal_event(
+                run_id,
+                terminal_event,
+                report_binding=report_binding,
+            ),
         )
     )
     expected = replace(source_record, evidence_event_sha256=entries[1].event_sha256)
@@ -642,6 +896,89 @@ def test_clean_terminal_run_does_not_repeat_reconciled_callback(
     assert summary == RecoverySummary(scanned_entries=6, evidence_events=1)
     assert reconciled == []
     assert list(store.iter_evidence_records()) == [expected]
+
+
+def test_clean_terminal_accepts_report_slug_for_long_run_id(tmp_path: Path) -> None:
+    evidence_dir = tmp_path / "evidence"
+    run_id = "long-run-" + "x" * 100
+    source_record = _record(HASH_A, 49)
+    store = _prepare_store(evidence_dir, run_id, [source_record])
+    report_binding = _write_report_package(
+        evidence_dir.parent / "reports" / run_id,
+        run_id,
+        file_prefix=run_id[:80],
+    )
+    entries = EvidenceJournal(evidence_dir / "events.jsonl").append_many(
+        (
+            _start_event(run_id),
+            _evidence_event(run_id, source_record),
+            _published_terminal_event(run_id, report_binding=report_binding),
+        )
+    )
+    expected = replace(source_record, evidence_event_sha256=entries[1].event_sha256)
+    assert store.store_evidence_batch([expected]) == 1
+    reconciled: list[RecoveredEvidenceBatch] = []
+
+    recover_evidence_journal(evidence_dir, on_reconciled=reconciled.append)
+
+    assert reconciled == []
+
+
+@pytest.mark.parametrize(
+    "damage",
+    (
+        "manifest_name",
+        "manifest_sha256",
+        "file_count",
+        "listed_file",
+        "unlisted_file",
+        "unlisted_directory",
+    ),
+)
+def test_terminal_report_package_must_match_complete_manifest_binding(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    evidence_dir = tmp_path / "evidence"
+    run_id = f"run-invalid-package-{damage}"
+    source_record = _record(HASH_A, 48)
+    store = _prepare_store(evidence_dir, run_id, [source_record])
+    output_dir = evidence_dir.parent / "reports" / run_id
+    report_binding = _write_report_package(output_dir, run_id)
+    terminal_binding = dict(report_binding)
+    if damage == "manifest_name":
+        terminal_binding["report_manifest"] = "anderes_SHA256SUMS.txt"
+    elif damage == "manifest_sha256":
+        terminal_binding["report_manifest_sha256"] = "0" * 64
+    elif damage == "file_count":
+        terminal_binding["report_file_count"] = int(report_binding["report_file_count"]) + 1
+    elif damage == "listed_file":
+        (output_dir / f"{run_id}_laufbericht.pdf").write_bytes(b"nachtraeglich beschaedigt")
+    elif damage == "unlisted_file":
+        (output_dir / "nicht-im-manifest.txt").write_text("unerwartet", encoding="utf-8")
+    else:
+        unlisted_directory = output_dir / "nicht-im-manifest"
+        unlisted_directory.mkdir()
+        (unlisted_directory / "payload.txt").write_text("unerwartet", encoding="utf-8")
+
+    entries = EvidenceJournal(evidence_dir / "events.jsonl").append_many(
+        (
+            _start_event(run_id),
+            _evidence_event(run_id, source_record),
+            _published_terminal_event(run_id, report_binding=terminal_binding),
+        )
+    )
+    expected = replace(source_record, evidence_event_sha256=entries[1].event_sha256)
+    assert store.store_evidence_batch([expected]) == 1
+    reconciled: list[RecoveredEvidenceBatch] = []
+
+    summary = recover_evidence_journal(evidence_dir, on_reconciled=reconciled.append)
+
+    assert summary == RecoverySummary(scanned_entries=3, evidence_events=1)
+    assert [batch.records for batch in reconciled] == [(expected,)]
+    assert reconciled[0].report_manifest == terminal_binding["report_manifest"]
+    assert reconciled[0].report_manifest_sha256 == terminal_binding["report_manifest_sha256"]
+    assert reconciled[0].report_file_count == terminal_binding["report_file_count"]
 
 
 def test_terminal_run_with_missing_record_calls_reconciled_callback(tmp_path: Path) -> None:
@@ -695,7 +1032,12 @@ def test_published_terminal_repair_retries_callback_until_acknowledged(tmp_path:
     assert list(store.iter_evidence_records()) == [expected]
 
     retried: list[RecoveredEvidenceBatch] = []
-    summary = recover_evidence_journal(evidence_dir, on_reconciled=retried.append)
+
+    def successful_callback(batch: RecoveredEvidenceBatch) -> None:
+        retried.append(batch)
+        _write_recovery_report_package(evidence_dir, batch)
+
+    summary = recover_evidence_journal(evidence_dir, on_reconciled=successful_callback)
 
     assert summary == RecoverySummary(scanned_entries=3, evidence_events=1)
     assert [batch.records for batch in retried] == [(expected,)]
@@ -707,8 +1049,184 @@ def test_published_terminal_repair_retries_callback_until_acknowledged(tmp_path:
     )
     assert after_acknowledgement == []
 
+    recovery_dir = _recovery_report_directory(evidence_dir, retried[0])
+    (recovery_dir / next(path.name for path in recovery_dir.glob("*_laufbericht.pdf"))).write_bytes(
+        b"beschaedigt"
+    )
+    retried_after_damage: list[RecoveredEvidenceBatch] = []
 
-def test_manifestless_failed_run_remains_reconciled_callback_retryable(tmp_path: Path) -> None:
+    def repair_callback(batch: RecoveredEvidenceBatch) -> None:
+        retried_after_damage.append(batch)
+        _write_recovery_report_package(evidence_dir, batch)
+
+    recover_evidence_journal(evidence_dir, on_reconciled=repair_callback)
+
+    assert [batch.records for batch in retried_after_damage] == [(expected,)]
+    final_callbacks: list[RecoveredEvidenceBatch] = []
+    recover_evidence_journal(evidence_dir, on_reconciled=final_callbacks.append)
+    assert final_callbacks == []
+
+    next(recovery_dir.glob("*_SHA256SUMS.txt")).unlink()
+    retried_after_missing: list[RecoveredEvidenceBatch] = []
+
+    def restore_missing_callback(batch: RecoveredEvidenceBatch) -> None:
+        retried_after_missing.append(batch)
+        _write_recovery_report_package(evidence_dir, batch)
+
+    recover_evidence_journal(evidence_dir, on_reconciled=restore_missing_callback)
+
+    assert [batch.records for batch in retried_after_missing] == [(expected,)]
+    callbacks_after_restore: list[RecoveredEvidenceBatch] = []
+    recover_evidence_journal(evidence_dir, on_reconciled=callbacks_after_restore.append)
+    assert callbacks_after_restore == []
+
+
+@pytest.mark.parametrize(
+    "residue_kind",
+    ("previous_manifest", "unlisted_file", "unlisted_directory"),
+)
+def test_monitor_repairs_recovery_package_with_unlisted_residue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    residue_kind: str,
+) -> None:
+    evidence_dir = tmp_path / "evidence"
+    run_id = f"run-recovery-residue-{residue_kind}"
+    source_record = _record(HASH_A, 64)
+    _prepare_store(evidence_dir, run_id, [source_record])
+    EvidenceJournal(evidence_dir / "events.jsonl").append_many(
+        (_start_event(run_id), _evidence_event(run_id, source_record))
+    )
+    generated_packages = 0
+
+    def fake_generate_reports(
+        result: ScanResult,
+        output_dir: Path,
+        _config: object,
+        **_kwargs: object,
+    ) -> list[Path]:
+        nonlocal generated_packages
+        generated_packages += 1
+        report_run_id = result.run_id
+        _write_report_package(output_dir, report_run_id)
+        return list(output_dir.iterdir())
+
+    monkeypatch.setattr(monitor_module, "generate_reports", fake_generate_reports)
+    callbacks = 0
+
+    def publish(batch: RecoveredEvidenceBatch) -> None:
+        nonlocal callbacks
+        callbacks += 1
+        monitor_module._publish_recovered_batch(
+            batch,
+            default_app_config(),
+            tmp_path,
+            lambda _message: None,
+            None,
+        )
+
+    recover_evidence_journal(evidence_dir, on_reconciled=publish)
+    assert callbacks == 1
+    recovery_dir = next(
+        path
+        for path in (tmp_path / "reports" / run_id).iterdir()
+        if path.name.startswith("wiederhergestellt-")
+    )
+    manifest = next(recovery_dir.glob("*_SHA256SUMS.txt"))
+    residue_name = (
+        f".{manifest.name}.previous"
+        if residue_kind == "previous_manifest"
+        else "unerwartete-restdatei.tmp"
+    )
+    residue_path = recovery_dir / residue_name
+    if residue_kind == "unlisted_directory":
+        residue_path.mkdir()
+        (residue_path / "payload.bin").write_bytes(b"aufbewahrter Testrest")
+    else:
+        residue_path.write_bytes(b"aufbewahrter Testrest")
+
+    recover_evidence_journal(evidence_dir, on_reconciled=publish)
+
+    assert callbacks == 2
+    assert generated_packages == 2
+    assert monitor_module._recovery_report_is_complete(
+        recovery_dir,
+        manifest.name.removesuffix("_SHA256SUMS.txt"),
+    )
+    quarantines = tuple(recovery_dir.parent.glob(f".{recovery_dir.name}.defekt-*"))
+    assert len(quarantines) == 1
+    preserved_residue = quarantines[0] / residue_name
+    if residue_kind == "unlisted_directory":
+        preserved_residue = preserved_residue / "payload.bin"
+    assert preserved_residue.read_bytes() == b"aufbewahrter Testrest"
+
+    recover_evidence_journal(evidence_dir, on_reconciled=publish)
+
+    assert callbacks == 2
+    assert generated_packages == 2
+
+
+def test_monitor_repairs_symlinked_recovery_batch_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = "run-symlinked-recovery-batch"
+    record = replace(_record(HASH_A, 65), evidence_event_sha256="7" * 64)
+    batch = RecoveredEvidenceBatch(
+        run_id=run_id,
+        config_sha256=CONFIG_A,
+        software_sha256=SOFTWARE_A,
+        config_snapshot=None,
+        config_snapshot_file_sha256=None,
+        records=(record,),
+        evidence_semantics_version=2,
+    )
+    digest = hashlib.sha256(record.evidence_event_sha256.encode("ascii")).hexdigest()[:16]
+    run_output_dir = tmp_path / "reports" / run_id
+    run_output_dir.mkdir(parents=True)
+    batch_output_dir = run_output_dir / f"wiederhergestellt-{digest}"
+    preserved_target = tmp_path / "preserved-symlink-target"
+    preserved_target.mkdir()
+    (preserved_target / "payload.bin").write_bytes(b"nicht folgen")
+    try:
+        batch_output_dir.symlink_to(preserved_target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Verzeichnis-Symlinks sind nicht verfuegbar: {exc}")
+
+    def fake_generate_reports(
+        result: ScanResult,
+        output_dir: Path,
+        _config: object,
+        **_kwargs: object,
+    ) -> list[Path]:
+        _write_report_package(output_dir, result.run_id)
+        return list(output_dir.iterdir())
+
+    monkeypatch.setattr(monitor_module, "generate_reports", fake_generate_reports)
+
+    monitor_module._publish_recovered_batch(
+        batch,
+        default_app_config(),
+        tmp_path,
+        lambda _message: None,
+        None,
+    )
+
+    assert batch_output_dir.is_dir()
+    assert not batch_output_dir.is_symlink()
+    assert (preserved_target / "payload.bin").read_bytes() == b"nicht folgen"
+    quarantines = tuple(run_output_dir.glob(f".{batch_output_dir.name}.defekt-*"))
+    assert len(quarantines) == 1
+    assert quarantines[0].is_symlink()
+    assert monitor_module._recovery_report_is_complete(
+        batch_output_dir,
+        f"recovery-{run_id[-32:]}-{digest}",
+    )
+
+
+def test_manifestless_failed_run_is_acknowledged_after_valid_recovery_package(
+    tmp_path: Path,
+) -> None:
     evidence_dir = tmp_path / "evidence"
     run_id = "run-manifestless-failure"
     source_record = _record(HASH_A, 47)
@@ -724,10 +1242,61 @@ def test_manifestless_failed_run_remains_reconciled_callback_retryable(tmp_path:
     assert store.store_evidence_batch([expected]) == 1
     reconciled: list[RecoveredEvidenceBatch] = []
 
-    summary = recover_evidence_journal(evidence_dir, on_reconciled=reconciled.append)
+    def publish_callback(batch: RecoveredEvidenceBatch) -> None:
+        reconciled.append(batch)
+        _write_recovery_report_package(evidence_dir, batch)
+
+    summary = recover_evidence_journal(evidence_dir, on_reconciled=publish_callback)
 
     assert summary == RecoverySummary(scanned_entries=3, evidence_events=1)
     assert [batch.records for batch in reconciled] == [(expected,)]
+    repeated: list[RecoveredEvidenceBatch] = []
+
+    recover_evidence_journal(evidence_dir, on_reconciled=repeated.append)
+
+    assert repeated == []
+
+
+def test_evidence_after_terminal_retries_publication_until_acknowledged(tmp_path: Path) -> None:
+    evidence_dir = tmp_path / "evidence"
+    run_id = "run-late-recovered-evidence"
+    source_record = _record(HASH_A, 61)
+    store = _prepare_store(evidence_dir, run_id, [source_record])
+    report_binding = _write_report_package(
+        evidence_dir.parent / "reports" / run_id,
+        run_id,
+    )
+    entries = EvidenceJournal(evidence_dir / "events.jsonl").append_many(
+        (
+            _start_event(run_id),
+            _published_terminal_event(run_id, report_binding=report_binding),
+            _evidence_event(run_id, source_record),
+        )
+    )
+    expected = replace(source_record, evidence_event_sha256=entries[2].event_sha256)
+    assert store.store_evidence_batch([expected]) == 1
+    failed_callbacks: list[RecoveredEvidenceBatch] = []
+
+    def failing_callback(batch: RecoveredEvidenceBatch) -> None:
+        failed_callbacks.append(batch)
+        raise RuntimeError("simulierter Ausfall fuer spaete Evidenz")
+
+    with pytest.raises(RuntimeError, match="Ausfall fuer spaete Evidenz"):
+        recover_evidence_journal(evidence_dir, on_reconciled=failing_callback)
+
+    assert [batch.records for batch in failed_callbacks] == [(expected,)]
+    retried: list[RecoveredEvidenceBatch] = []
+
+    def successful_callback(batch: RecoveredEvidenceBatch) -> None:
+        retried.append(batch)
+        _write_recovery_report_package(evidence_dir, batch)
+
+    recover_evidence_journal(evidence_dir, on_reconciled=successful_callback)
+
+    assert [batch.records for batch in retried] == [(expected,)]
+    after_acknowledgement: list[RecoveredEvidenceBatch] = []
+    recover_evidence_journal(evidence_dir, on_reconciled=after_acknowledgement.append)
+    assert after_acknowledgement == []
 
 
 def test_interrupted_consistent_run_retries_reconciled_callback(tmp_path: Path) -> None:
@@ -785,6 +1354,194 @@ def test_low_disk_aborts_and_cleans_private_same_volume_index(
     if os.name != "nt":
         assert observed_modes == [(0o700, 0o600)]
     assert tuple(evidence_dir.glob(".afdleakercatcher-recovery-*")) == ()
+
+
+@pytest.mark.parametrize(
+    ("completed_full_window", "availability_error"),
+    (
+        (False, None),
+        (True, "Peer schloss die Verbindung vorzeitig."),
+        (False, "Peer schloss die Verbindung vorzeitig."),
+    ),
+)
+def test_v033_gate_only_evidence_is_skipped_runwise_without_publication(
+    tmp_path: Path,
+    completed_full_window: bool,
+    availability_error: str | None,
+) -> None:
+    evidence_dir = tmp_path / "evidence"
+    run_id = "v033-early-end"
+    source_record = _record_with_legacy_gate_difference(
+        53,
+        completed_full_window=completed_full_window,
+        availability_error=availability_error,
+    )
+    store = _prepare_store(evidence_dir, run_id, [source_record])
+    EvidenceJournal(evidence_dir / "events.jsonl").append_many(
+        (
+            _v033_start_event(run_id, software_sha256=SOFTWARE_A),
+            _evidence_event(run_id, source_record, software_sha256=SOFTWARE_A),
+        )
+    )
+    recovered: list[RecoveredEvidenceBatch] = []
+    reconciled: list[RecoveredEvidenceBatch] = []
+    notices: list[LegacyRecoveryNotice] = []
+
+    summary = recover_evidence_journal(
+        evidence_dir,
+        on_recovered=recovered.append,
+        on_reconciled=reconciled.append,
+        on_legacy_skipped=notices.append,
+    )
+
+    assert summary == RecoverySummary(
+        scanned_entries=2,
+        evidence_events=1,
+        skipped_legacy_runs=1,
+    )
+    assert store.evidence_count() == 0
+    assert recovered == []
+    assert reconciled == []
+    assert len(notices) == 1
+    assert notices[0].run_id == run_id
+    assert "Version 0.3.3" in notices[0].reason
+
+
+def test_explicit_semantics_v1_gate_only_evidence_is_skipped(tmp_path: Path) -> None:
+    evidence_dir = tmp_path / "evidence"
+    run_id = "explicit-v1-early-end"
+    source_record = _record_with_legacy_gate_difference(
+        54,
+        completed_full_window=False,
+        availability_error="Fruehes EOF.",
+    )
+    store = _prepare_store(evidence_dir, run_id, [source_record])
+    EvidenceJournal(evidence_dir / "events.jsonl").append_many(
+        (
+            _start_event(run_id, evidence_semantics_version=1),
+            _evidence_event(run_id, source_record),
+        )
+    )
+    notices: list[LegacyRecoveryNotice] = []
+
+    summary = recover_evidence_journal(evidence_dir, on_legacy_skipped=notices.append)
+
+    assert summary.skipped_legacy_runs == 1
+    assert store.evidence_count() == 0
+    assert [notice.run_id for notice in notices] == [run_id]
+
+
+def test_v033_db_only_gate_record_is_skipped_before_incomplete_callback(tmp_path: Path) -> None:
+    evidence_dir = tmp_path / "evidence"
+    run_id = "v033-db-only-early-end"
+    source_record = _record_with_legacy_gate_difference(
+        58,
+        completed_full_window=False,
+        availability_error="Fruehes EOF.",
+    )
+    store = _prepare_store(evidence_dir, run_id, [source_record])
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("UPDATE handshake_results SET offering_observed = 1")
+        connection.commit()
+    EvidenceJournal(evidence_dir / "events.jsonl").append(_v033_start_event(run_id))
+    incomplete: list[RecoveredRunContext] = []
+    notices: list[LegacyRecoveryNotice] = []
+
+    summary = recover_evidence_journal(
+        evidence_dir,
+        on_incomplete_run=incomplete.append,
+        on_legacy_skipped=notices.append,
+    )
+
+    assert summary == RecoverySummary(scanned_entries=1, skipped_legacy_runs=1)
+    assert incomplete == []
+    assert [notice.run_id for notice in notices] == [run_id]
+
+
+def test_unknown_future_evidence_semantics_version_is_rejected(tmp_path: Path) -> None:
+    evidence_dir = tmp_path / "evidence"
+    EvidenceJournal(evidence_dir / "events.jsonl").append(
+        _start_event("future-semantics", evidence_semantics_version=3)
+    )
+
+    with pytest.raises(EvidenceRecoveryError, match="nicht unterstuetzt"):
+        recover_evidence_journal(evidence_dir)
+
+
+def test_semantics_v2_gate_failure_is_fatal(tmp_path: Path) -> None:
+    evidence_dir = tmp_path / "evidence"
+    run_id = "v2-early-end"
+    source_record = _record_with_legacy_gate_difference(
+        55,
+        completed_full_window=False,
+        availability_error="Fruehes EOF.",
+    )
+    store = _prepare_store(evidence_dir, run_id, [source_record])
+    EvidenceJournal(evidence_dir / "events.jsonl").append_many(
+        (_start_event(run_id), _evidence_event(run_id, source_record))
+    )
+
+    with pytest.raises(EvidenceRecoveryError, match="Positivsemantik Version 2"):
+        recover_evidence_journal(evidence_dir)
+
+    assert store.evidence_count() == 0
+
+
+def test_semantics_v2_db_only_gate_failure_is_fatal(tmp_path: Path) -> None:
+    evidence_dir = tmp_path / "evidence"
+    run_id = "v2-db-only-early-end"
+    source_record = _record_with_legacy_gate_difference(
+        59,
+        completed_full_window=False,
+        availability_error="Fruehes EOF.",
+    )
+    store = _prepare_store(evidence_dir, run_id, [source_record])
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("UPDATE handshake_results SET offering_observed = 1")
+        connection.commit()
+    EvidenceJournal(evidence_dir / "events.jsonl").append(_start_event(run_id))
+
+    with pytest.raises(EvidenceRecoveryError, match="Positivsemantik Version 2"):
+        recover_evidence_journal(evidence_dir)
+
+
+def test_v033_db_only_other_negative_condition_is_fatal(tmp_path: Path) -> None:
+    evidence_dir = tmp_path / "evidence"
+    run_id = "v033-db-only-not-old-positive"
+    source_record = _record_with_legacy_gate_difference(
+        60,
+        completed_full_window=False,
+        availability_error="Fruehes EOF.",
+        interested_sent=False,
+    )
+    store = _prepare_store(evidence_dir, run_id, [source_record])
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("UPDATE handshake_results SET offering_observed = 1")
+        connection.commit()
+    EvidenceJournal(evidence_dir / "events.jsonl").append(_v033_start_event(run_id))
+
+    with pytest.raises(EvidenceRecoveryError, match="fachlich aber nicht positiven"):
+        recover_evidence_journal(evidence_dir)
+
+
+def test_v033_gate_difference_with_other_negative_condition_is_fatal(tmp_path: Path) -> None:
+    evidence_dir = tmp_path / "evidence"
+    run_id = "v033-not-old-positive"
+    source_record = _record_with_legacy_gate_difference(
+        56,
+        completed_full_window=False,
+        availability_error="Fruehes EOF.",
+        interested_sent=False,
+    )
+    store = _prepare_store(evidence_dir, run_id, [source_record])
+    EvidenceJournal(evidence_dir / "events.jsonl").append_many(
+        (_v033_start_event(run_id), _evidence_event(run_id, source_record))
+    )
+
+    with pytest.raises(EvidenceRecoveryError, match="nicht an scan_started gebunden"):
+        recover_evidence_journal(evidence_dir)
+
+    assert store.evidence_count() == 0
 
 
 def test_legacy_start_and_schema_v1_database_reconcile_on_upgrade(tmp_path: Path) -> None:

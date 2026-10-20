@@ -1,15 +1,15 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ExpectedPythonVersion = "3.12.10"
-$ExpectedTclTkVersion = "8.6.15"
-$ExpectedOpenSslVersion = "OpenSSL 3.0.16 11 Feb 2025"
+$ExpectedPythonVersion = "3.14.8"
+$ExpectedTclTkVersion = "9.0.4"
+$ExpectedOpenSslVersion = "OpenSSL 3.5.9 29 Sep 2026"
 $ThirdPartyLicenseNames = @(
-    "Python-3.12.10.txt",
-    "Tcl-8.6.15.txt",
-    "Tk-8.6.15.txt",
-    "OpenSSL-3.0.16-LICENSE.txt",
-    "OpenSSL-3.0.16-ACKNOWLEDGEMENTS.md",
+    "Python-3.14.8.txt",
+    "Tcl-9.0.4.txt",
+    "Tk-9.0.4.txt",
+    "OpenSSL-3.5.9-LICENSE.txt",
+    "OpenSSL-3.5.9-ACKNOWLEDGEMENTS.md",
     "ReportLab-4.5.1.txt",
     "Pillow-13.0.0.txt",
     "charset-normalizer-3.5.2.txt",
@@ -27,6 +27,34 @@ function Invoke-CheckedPython {
         $Command = "python " + ($Arguments -join " ")
         throw "$Command ist mit Exitcode $LASTEXITCODE fehlgeschlagen."
     }
+}
+
+function Invoke-BundledExecutableSmokeTest {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Executable,
+        [Parameter(Mandatory = $true)]
+        [string[]] $Arguments,
+        [Parameter(Mandatory = $true)]
+        [string] $Description,
+        [int] $TimeoutMilliseconds = 30000
+    )
+
+    $Process = Start-Process -FilePath $Executable `
+        -ArgumentList $Arguments -PassThru
+    try {
+        if (-not $Process.WaitForExit($TimeoutMilliseconds)) {
+            $Process.Kill()
+            $Process.WaitForExit()
+            throw "$Description wurde nach $TimeoutMilliseconds Millisekunden abgebrochen."
+        }
+        if ($Process.ExitCode -ne 0) {
+            throw "$Description ist mit Exitcode $($Process.ExitCode) fehlgeschlagen."
+        }
+    } finally {
+        $Process.Dispose()
+    }
+    Write-Host "$Description erfolgreich."
 }
 
 function Assert-BundledRuntimeVersions {
@@ -77,7 +105,7 @@ print(
     }
 }
 
-function Assert-BundledOpenSslLibraries {
+function Assert-BundledRuntimeInventory {
     param(
         [Parameter(Mandatory = $true)]
         [string] $PackageDirectory
@@ -88,21 +116,58 @@ function Assert-BundledOpenSslLibraries {
         throw "Das interne PyInstaller-Verzeichnis fehlt: $InternalDirectory"
     }
 
-    $CryptoLibraries = @(
-        Get-ChildItem -LiteralPath $InternalDirectory -File |
-            Where-Object { $_.Name -like "libcrypto-3*.dll" }
+    $RuntimeFiles = @(
+        Get-ChildItem -LiteralPath $InternalDirectory -Recurse -File
     )
-    $SslLibraries = @(
-        Get-ChildItem -LiteralPath $InternalDirectory -File |
-            Where-Object { $_.Name -like "libssl-3*.dll" }
+    $ExpectedRuntimeNames = @(
+        "python314.dll",
+        "tcl90.dll",
+        "tcl9tk90.dll",
+        "libcrypto-3.dll",
+        "libssl-3.dll"
     )
-    if ($CryptoLibraries.Count -ne 1 -or $SslLibraries.Count -ne 1) {
-        throw "Das Windows-Paket enthält nicht genau eine OpenSSL-3-Crypto- und SSL-Bibliothek."
-    }
-    foreach ($Library in @($CryptoLibraries + $SslLibraries)) {
-        if ($Library.Length -le 0) {
-            throw "Das Windows-Paket enthält eine leere OpenSSL-Bibliothek: $($Library.FullName)"
+    foreach ($Name in $ExpectedRuntimeNames) {
+        $RuntimeMatches = @(
+            $RuntimeFiles | Where-Object { $_.Name -ceq $Name }
+        )
+        if ($RuntimeMatches.Count -ne 1) {
+            throw "Das Windows-Paket enthält $Name nicht genau einmal."
         }
+        $RuntimeFile = $RuntimeMatches[0]
+        if ($RuntimeFile.Length -le 0) {
+            throw "Das Windows-Paket enthält eine leere Laufzeitdatei: $($RuntimeFile.FullName)"
+        }
+        $RuntimeHash = (
+            Get-FileHash -Algorithm SHA256 -LiteralPath $RuntimeFile.FullName
+        ).Hash.ToLowerInvariant()
+        $RuntimeDescription = (
+            "{0} ({1} Byte, SHA-256 {2})" -f `
+                $RuntimeFile.Name, $RuntimeFile.Length, $RuntimeHash
+        )
+        Write-Host "Runtime-Inventar: $RuntimeDescription"
+    }
+
+    $VersionedPythonLibraries = @(
+        $RuntimeFiles | Where-Object { $_.Name -match '^python3[0-9]{2}\.dll$' }
+    )
+    if (
+        $VersionedPythonLibraries.Count -ne 1 -or
+        $VersionedPythonLibraries[0].Name -cne "python314.dll"
+    ) {
+        throw "Das Windows-Paket enthält eine unerwartete Python-Laufzeitbibliothek."
+    }
+    $OpenSslLibraries = @(
+        $RuntimeFiles | Where-Object {
+            $_.Name -like "libcrypto-3*.dll" -or $_.Name -like "libssl-3*.dll"
+        }
+    )
+    if (
+        $OpenSslLibraries.Count -ne 2 -or
+        @($OpenSslLibraries | Where-Object {
+            $_.Name -notin @("libcrypto-3.dll", "libssl-3.dll")
+        }).Count -ne 0
+    ) {
+        throw "Das Windows-Paket enthält unerwartete OpenSSL-3-Bibliotheken."
     }
 }
 
@@ -202,7 +267,15 @@ $PackageDirectory = Join-Path $ProjectRoot "dist/AfDLeakerCatcher"
 if (-not (Test-Path -LiteralPath $PackageDirectory -PathType Container)) {
     throw "PyInstaller hat das erwartete Paketverzeichnis nicht erstellt: $PackageDirectory"
 }
-Assert-BundledOpenSslLibraries -PackageDirectory $PackageDirectory
+Assert-BundledRuntimeInventory -PackageDirectory $PackageDirectory
+$Executable = Join-Path $PackageDirectory "AfDLeakerCatcher.exe"
+if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) {
+    throw "Die gebaute Programmdatei fehlt: $Executable"
+}
+Invoke-BundledExecutableSmokeTest -Executable $Executable `
+    -Arguments @("--version") -Description "EXE-Smoke-Test mit --version"
+Invoke-BundledExecutableSmokeTest -Executable $Executable `
+    -Arguments @("--gui-smoke-test") -Description "GUI-Smoke-Test"
 Copy-Item -LiteralPath (Join-Path $ProjectRoot "README.md") `
     -Destination (Join-Path $PackageDirectory "README.md") -Force
 Copy-Item -LiteralPath (Join-Path $ProjectRoot "LICENSE") `

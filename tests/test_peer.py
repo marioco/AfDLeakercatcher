@@ -208,7 +208,7 @@ class PeerVerifierTests(unittest.IsolatedAsyncioTestCase):
             ["unchoke", "choke", "bitfield"],
         )
 
-    async def test_early_disconnect_preserves_validated_positive_signals(self) -> None:
+    async def test_early_disconnect_preserves_signals_without_positive_gate(self) -> None:
         wire = peer_message(1) + peer_message(5, b"\x80")
 
         result, _fake_socket, _fake_loop = await run_verifier(
@@ -219,7 +219,7 @@ class PeerVerifierTests(unittest.IsolatedAsyncioTestCase):
         observation = result.availability
         assert observation is not None
         self.assertTrue(result.confirmed)
-        self.assertTrue(result.offering_observed)
+        self.assertFalse(result.offering_observed)
         self.assertFalse(observation.completed_full_window)
         self.assertTrue(observation.piece_availability_announced)
         self.assertTrue(observation.unchoked)
@@ -239,7 +239,7 @@ class PeerVerifierTests(unittest.IsolatedAsyncioTestCase):
 
                 observation = result.availability
                 assert observation is not None
-                self.assertTrue(result.offering_observed)
+                self.assertFalse(result.offering_observed)
                 self.assertIsNotNone(observation.error)
                 self.assertEqual(observation.piece_payload_bytes_received, 0)
                 self.assertEqual(fake_loop.incoming, bytearray(payload))
@@ -310,7 +310,7 @@ class PeerVerifierTests(unittest.IsolatedAsyncioTestCase):
 
         observation = result.availability
         assert observation is not None
-        self.assertTrue(result.offering_observed)
+        self.assertFalse(result.offering_observed)
         self.assertEqual(observation.metadata_requests_sent, 0)
         self.assertEqual(observation.piece_payload_bytes_received, 0)
         self.assertEqual(fake_loop.incoming, bytearray(metadata_payload))
@@ -376,7 +376,7 @@ class PeerVerifierTests(unittest.IsolatedAsyncioTestCase):
 
         observation = result.availability
         assert observation is not None
-        self.assertTrue(result.offering_observed)
+        self.assertFalse(result.offering_observed)
         self.assertIsNotNone(observation.error)
         self.assertEqual(fake_loop.incoming, bytearray(unknown_payload))
 

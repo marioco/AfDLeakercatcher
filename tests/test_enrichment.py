@@ -12,6 +12,7 @@ import urllib.request
 from datetime import UTC, datetime, timedelta
 from email.message import Message
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 import pytest
@@ -21,6 +22,7 @@ from bittorrent_beobachter.enrichment import (
     _REQUEST_IP_ATTRIBUTE,
     _REQUEST_REDIRECT_URLS_ATTRIBUTE,
     _REQUEST_SOURCE_ATTRIBUTE,
+    ENRICHMENT_CANCELLED_REASON,
     EXTERNAL_LOOKUP_DISCLOSURE,
     ExternalLookupDisabledError,
     NetworkEnricher,
@@ -112,6 +114,59 @@ def test_external_lookup_is_disabled_by_default(tmp_path: Path) -> None:
     assert "rdap.lacnic.net" in EXTERNAL_LOOKUP_DISCLOSURE
     assert "stat.ripe.net" in EXTERNAL_LOOKUP_DISCLOSURE
     assert "protokollieren" in EXTERNAL_LOOKUP_DISCLOSURE
+
+
+def test_cancelled_enrichment_skips_all_sources(tmp_path: Path) -> None:
+    cancel_event = Event()
+    cancel_event.set()
+    calls: list[str] = []
+
+    def forbidden_urlopen(request: Any, *, timeout: float) -> _JsonResponse:
+        del timeout
+        calls.append(request.full_url)
+        raise AssertionError("Abgebrochene Quellen duerfen nicht aufgerufen werden")
+
+    result = NetworkEnricher(
+        tmp_path,
+        external_lookup_enabled=True,
+        urlopen=forbidden_urlopen,
+        now=lambda: FIXED_NOW,
+    ).enrich("8.8.8.8", cancel_event=cancel_event)
+
+    assert calls == []
+    assert result.source_urls == ()
+    assert result.source_fetched_at_utc == ()
+    assert result.error == (
+        f"RDAP: {ENRICHMENT_CANCELLED_REASON}; RIPEstat: {ENRICHMENT_CANCELLED_REASON}"
+    )
+
+
+def test_cancellation_between_sources_skips_remaining_lookup(tmp_path: Path) -> None:
+    cancel_event = Event()
+    calls: list[str] = []
+
+    def cancel_after_rdap(request: Any, *, timeout: float) -> _JsonResponse:
+        del timeout
+        calls.append(request.full_url)
+        if "rdap.org" in request.full_url:
+            cancel_event.set()
+            return _JsonResponse(_rdap_payload())
+        raise AssertionError("RIPEstat muss nach dem Abbruch uebersprungen werden")
+
+    result = NetworkEnricher(
+        tmp_path / "second-source",
+        external_lookup_enabled=True,
+        urlopen=cancel_after_rdap,
+        now=lambda: FIXED_NOW,
+    ).enrich("8.8.8.8", cancel_event=cancel_event)
+
+    assert len(calls) == 1
+    assert "rdap.org" in calls[0]
+    assert result.rdap_name == "EXAMPLE-NET"
+    assert result.prefix is None
+    assert result.source_urls == ("https://rdap.org/ip/8.8.8.8",)
+    assert result.source_fetched_at_utc == (("rdap", "2026-10-20T12:00:00Z"),)
+    assert f"RIPEstat: {ENRICHMENT_CANCELLED_REASON}" in (result.error or "")
 
 
 def test_default_http_client_ignores_proxy_environment(

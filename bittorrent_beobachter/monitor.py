@@ -37,7 +37,12 @@ from .dht import (
     DHTCrawler,
     resolve_bootstrap_nodes,
 )
-from .enrichment import EnrichmentError, NetworkEnricher, VpnClassifier
+from .enrichment import (
+    ENRICHMENT_CANCELLED_REASON,
+    EnrichmentError,
+    NetworkEnricher,
+    VpnClassifier,
+)
 from .evidence import (
     EvidenceJournal,
     EvidenceJournalError,
@@ -73,6 +78,7 @@ EvidenceBatchCallback = Callable[[tuple[EvidenceRecord, ...]], None]
 PERSIST_BATCH_SIZE = 5
 PARALLEL_VERIFY_BATCHES = 8
 VERIFY_IDLE_POLL_SECONDS = 0.1
+EVIDENCE_SEMANTICS_VERSION = 2
 MIN_FREE_SPACE_BYTES = 100_000_000
 
 
@@ -630,7 +636,9 @@ async def _verify_all_candidates(
         timeout=config.peer.timeout_seconds,
         observation_seconds=config.peer.observation_seconds,
     )
-    checked = sum(metric.done for metric in store.metrics_by_hash(target_hashes).values())
+    checked = sum(
+        metric.handshake_results for metric in store.metrics_by_hash(target_hashes).values()
+    )
 
     active_tasks: set[asyncio.Task[tuple[HandshakeResult, ...]]] = set()
     unpersisted_tasks: set[asyncio.Task[tuple[HandshakeResult, ...]]] = set()
@@ -668,13 +676,19 @@ async def _verify_all_candidates(
         store.store_handshake_batch(result_batch)
         unpersisted_tasks.remove(task)
         task_order.pop(task)
-        checked += len(result_batch)
+        checked = sum(
+            metric.handshake_results for metric in store.metrics_by_hash(target_hashes).values()
+        )
         if failure_completion:
             progress(
-                f"Fehlerabschluss: {checked} bereits geprüfte Kandidat(en) dauerhaft verarbeitet."
+                f"Fehlerabschluss: {checked} eindeutige Kandidat(en) mindestens einmal "
+                "dauerhaft geprüft."
             )
         else:
-            progress(f"Direkte Peer-Pruefung: {checked} Kandidat(en) dauerhaft verarbeitet.")
+            progress(
+                f"Direkte Peer-Pruefung: {checked} eindeutige Kandidat(en) mindestens "
+                "einmal dauerhaft geprüft."
+            )
         return result_batch
 
     try:
@@ -906,6 +920,7 @@ def _persist_all_evidence(
     *,
     config_sha256: str,
     software_sha256: str,
+    cancel_event: Event | None = None,
     full_batches_only: bool = False,
     batch_persisted: EvidenceBatchCallback | None = None,
 ) -> int:
@@ -950,9 +965,16 @@ def _persist_all_evidence(
                 )
                 continue
 
+            if cancel_event is not None and cancel_event.is_set():
+                enrichment_failures["abgebrochen"] += 1
+                enriched_batch.append(
+                    (_empty_enrichment(ip, reason=ENRICHMENT_CANCELLED_REASON), offline_vpn)
+                )
+                continue
+
             progress(f"Netzregistrierungsabfrage fuer positiven Befund {stored + 1}.")
             try:
-                network_data = enricher.enrich(ip)
+                network_data = enricher.enrich(ip, cancel_event=cancel_event)
             except (EnrichmentError, OSError) as exc:
                 enrichment_failures[type(exc).__name__] += 1
                 network_data = _empty_enrichment(ip, reason=_safe_error(exc))
@@ -1030,7 +1052,7 @@ def _build_target_metrics(
                 tracker_queries_completed=runtime.tracker_queries_completed,
                 tracker_queries_failed=runtime.tracker_queries_failed,
                 candidates_discovered=aggregate.candidates,
-                candidates_checked=aggregate.done,
+                candidates_checked=aggregate.handshake_results,
                 verification_attempts=runtime.verification_attempts,
                 confirmed_handshakes=aggregate.confirmed,
                 piece_availability_observed=aggregate.piece_availability,
@@ -1098,15 +1120,34 @@ def _recovery_report_is_complete(output_dir: Path, report_run_id: str) -> bool:
 
     manifest_path = output_dir / f"{report_run_id}_SHA256SUMS.txt"
     try:
+        if (
+            output_dir.is_symlink()
+            or not output_dir.is_dir()
+            or output_dir.parent.is_symlink()
+            or output_dir.resolve(strict=True).parent != output_dir.parent.resolve(strict=True)
+        ):
+            return False
         if manifest_path.is_symlink() or not manifest_path.is_file():
             return False
         if manifest_path.stat().st_size > 4_000_000:
             return False
         seen_names: set[str] = set()
-        with manifest_path.open("r", encoding="utf-8") as handle:
-            for raw_line in handle:
-                line = raw_line.rstrip("\n")
-                if not line or line.startswith("#"):
+        run_id_header_count = 0
+        with manifest_path.open("r", encoding="utf-8", newline=None) as handle:
+            while raw_line := handle.readline(4_097):
+                if len(raw_line) > 4_096:
+                    return False
+                line = raw_line.rstrip("\r\n")
+                if not line:
+                    continue
+                if line.startswith("#"):
+                    if line.startswith("# Lauf-ID: "):
+                        run_id_header_count += 1
+                        if not secrets.compare_digest(
+                            line.removeprefix("# Lauf-ID: "),
+                            report_run_id,
+                        ):
+                            return False
                     continue
                 digest, separator, file_name = line.partition(" *")
                 if (
@@ -1114,7 +1155,11 @@ def _recovery_report_is_complete(output_dir: Path, report_run_id: str) -> bool:
                     or len(digest) != 64
                     or any(character not in "0123456789abcdef" for character in digest)
                     or not file_name
-                    or Path(file_name).name != file_name
+                    or file_name.strip() != file_name
+                    or file_name in {".", ".."}
+                    or "/" in file_name
+                    or "\\" in file_name
+                    or "\x00" in file_name
                     or file_name in seen_names
                 ):
                     return False
@@ -1124,6 +1169,19 @@ def _recovery_report_is_complete(output_dir: Path, report_run_id: str) -> bool:
                 if not secrets.compare_digest(_file_sha256(report_path), digest):
                     return False
                 seen_names.add(file_name)
+
+        if run_id_header_count != 1:
+            return False
+        actual_names: set[str] = set()
+        with os.scandir(output_dir) as entries:
+            for entry in entries:
+                if entry.is_symlink():
+                    return False
+                if entry.is_dir(follow_symlinks=False):
+                    return False
+                if not entry.is_file(follow_symlinks=False):
+                    return False
+                actual_names.add(entry.name)
     except (OSError, UnicodeError):
         return False
 
@@ -1133,7 +1191,41 @@ def _recovery_report_is_complete(output_dir: Path, report_run_id: str) -> bool:
         "_vpn_liste.csv",
         "_vpn_liste.pdf",
     )
-    return all(f"{report_run_id}{suffix}" in seen_names for suffix in required_suffixes)
+    return actual_names == seen_names | {manifest_path.name} and all(
+        f"{report_run_id}{suffix}" in seen_names for suffix in required_suffixes
+    )
+
+
+def _quarantine_invalid_recovery_report_directory(output_dir: Path) -> None:
+    """Verschiebt ein defektes app-eigenes Batchverzeichnis verlustfrei beiseite."""
+
+    try:
+        if not output_dir.is_symlink():
+            with os.scandir(output_dir) as entries:
+                if next(entries, None) is None:
+                    return
+    except OSError as exc:
+        raise MonitorError(
+            f"Recovery-Berichtsverzeichnis kann nicht geprueft werden: {output_dir}"
+        ) from exc
+
+    parent = output_dir.parent
+    for _attempt in range(100):
+        quarantine_dir = parent / f".{output_dir.name}.defekt-{secrets.token_hex(4)}"
+        if quarantine_dir.exists() or quarantine_dir.is_symlink():
+            continue
+        try:
+            os.replace(output_dir, quarantine_dir)
+            _ensure_private_directory(output_dir, app_owned=True)
+        except OSError as exc:
+            raise MonitorError(
+                "Beschaedigtes Recovery-Berichtsverzeichnis kann nicht verlustfrei "
+                f"beiseite verschoben werden: {output_dir}"
+            ) from exc
+        return
+    raise MonitorError(
+        f"Kein sicherer Quarantaenename fuer Recovery-Berichte verfuegbar: {output_dir}"
+    )
 
 
 def _publish_recovered_batch(
@@ -1149,15 +1241,22 @@ def _publish_recovered_batch(
         "\n".join(record.evidence_event_sha256 for record in batch.records).encode("ascii")
     ).hexdigest()[:16]
     report_run_id = f"recovery-{batch.run_id[-32:]}-{digest}"
-    run_output_dir = _ensure_private_directory(
-        data_dir / "reports" / batch.run_id,
-        app_owned=True,
-    )
-    batch_output_dir = _ensure_private_directory(
-        run_output_dir / f"wiederhergestellt-{digest}",
-        app_owned=True,
+    reports_root = data_dir / "reports"
+    if reports_root.is_symlink():
+        raise MonitorError(f"Recovery-Berichtswurzel darf kein Symlink sein: {reports_root}")
+    reports_root = _ensure_private_directory(reports_root, app_owned=True)
+    run_output_path = reports_root / batch.run_id
+    if run_output_path.is_symlink():
+        raise MonitorError(f"Recovery-Laufverzeichnis darf kein Symlink sein: {run_output_path}")
+    run_output_dir = _ensure_private_directory(run_output_path, app_owned=True)
+    batch_output_path = run_output_dir / f"wiederhergestellt-{digest}"
+    batch_output_dir = (
+        batch_output_path
+        if batch_output_path.is_symlink()
+        else _ensure_private_directory(batch_output_path, app_owned=True)
     )
     if not _recovery_report_is_complete(batch_output_dir, report_run_id):
+        _quarantine_invalid_recovery_report_directory(batch_output_dir)
         generated_at = _utc_now_text()
         result = ScanResult(
             run_id=report_run_id,
@@ -1262,6 +1361,7 @@ def _recover_previous_runs(
                     config_snapshot=context.config_snapshot,
                     config_snapshot_file_sha256=context.config_snapshot_file_sha256,
                     records=records,
+                    evidence_semantics_version=context.evidence_semantics_version,
                 )
             )
 
@@ -1362,6 +1462,7 @@ def _run_scan_locked_impl(
             "config_sha256": config_hash,
             "config_snapshot": config_snapshot_path.name,
             "config_snapshot_file_sha256": config_snapshot_file_hash,
+            "evidence_semantics_version": EVIDENCE_SEMANTICS_VERSION,
             "software_sha256": software_hash,
             "targets": [
                 {"label": target.label, "info_hash": target.info_hash_hex}
@@ -1428,6 +1529,7 @@ def _run_scan_locked_impl(
                 progress,
                 config_sha256=config_hash,
                 software_sha256=software_hash,
+                cancel_event=cancel_event,
                 full_batches_only=True,
                 batch_persisted=publish_report_snapshot,
             )
@@ -1443,6 +1545,21 @@ def _run_scan_locked_impl(
 
     network_notices: list[str] = []
     network_failure: MonitorError | None = None
+
+    def mark_cancelled() -> None:
+        if result.cancelled:
+            return
+        result.cancelled = True
+        result.notices.append(
+            "Der Prueflauf wurde kontrolliert abgebrochen; alle bis dahin "
+            "gefundenen positiven Befunde wurden fertig ausgegeben."
+        )
+        progress("Prueflauf wird kontrolliert beendet; Restbefunde werden gespeichert.")
+
+    def mark_cancelled_if_requested() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            mark_cancelled()
+
     try:
         network_notices = asyncio.run(
             _network_phase(
@@ -1456,12 +1573,7 @@ def _run_scan_locked_impl(
             )
         )
     except ScanCancelled:
-        result.cancelled = True
-        result.notices.append(
-            "Der Prueflauf wurde kontrolliert abgebrochen; alle bis dahin "
-            "gefundenen positiven Befunde wurden fertig ausgegeben."
-        )
-        progress("Prueflauf wird kontrolliert beendet; Restbefunde werden gespeichert.")
+        mark_cancelled()
     except TimeoutError as exc:
         network_failure = MonitorError(
             "Eine einzelne Netzwerkoperation ueberschritt ihr Zeitlimit."
@@ -1477,6 +1589,7 @@ def _run_scan_locked_impl(
     if network_failure is not None:
         result.errors.append(str(network_failure))
     result.notices.extend(network_notices)
+    mark_cancelled_if_requested()
     _persist_all_evidence(
         config,
         data_dir,
@@ -1486,12 +1599,14 @@ def _run_scan_locked_impl(
         progress,
         config_sha256=config_hash,
         software_sha256=software_hash,
+        cancel_event=cancel_event,
         batch_persisted=lambda records: setattr(
             result,
             "known_vpn_total",
             result.known_vpn_total + sum(record.vpn.status == "known_vpn" for record in records),
         ),
     )
+    mark_cancelled_if_requested()
     _refresh_result_metrics(result, config, store, runtimes)
 
     result.completed_at_utc = _utc_now_text()

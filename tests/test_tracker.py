@@ -50,7 +50,7 @@ def _compact_ipv6(ip: str, port: int) -> bytes:
     return socket.inet_pton(socket.AF_INET6, ip) + port.to_bytes(2, "big")
 
 
-def test_connect_request_and_response_are_bep15_exact() -> None:
+def test_connect_request_and_response_follow_bep15_minimum_length() -> None:
     request = build_connect_request(0x01020304)
 
     assert len(request) == 16
@@ -63,6 +63,15 @@ def test_connect_request_and_response_are_bep15_exact() -> None:
     assert (
         parse_connect_response(response, expected_transaction_id=0x01020304) == 0x1122334455667788
     )
+    assert (
+        parse_connect_response(
+            response + b"future extension",
+            expected_transaction_id=0x01020304,
+        )
+        == 0x1122334455667788
+    )
+    with pytest.raises(TrackerProtocolError, match="ungueltig"):
+        parse_connect_response(response[:-1], expected_transaction_id=0x01020304)
 
     with pytest.raises(TrackerProtocolError):
         parse_connect_response(response, expected_transaction_id=7)

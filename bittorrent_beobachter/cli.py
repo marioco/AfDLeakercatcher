@@ -36,8 +36,12 @@ class PrivateRotatingFileHandler(RotatingFileHandler):
 
     def _open(self) -> object:
         stream = super()._open()
-        if os.name != "nt":
-            Path(self.baseFilename).chmod(0o600)
+        try:
+            if os.name != "nt":
+                Path(self.baseFilename).chmod(0o600)
+        except OSError:
+            stream.close()
+            raise
         return stream
 
     def doRollover(self) -> None:
@@ -57,15 +61,13 @@ def default_log_file(data_dir: Path) -> Path:
 
 def setup_logging(log_file: Path) -> logging.Logger:
     """Konfiguriert UTC-Ausgabe und die vorgeschriebene kleine Rotation."""
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-    if os.name != "nt":
-        log_file.parent.chmod(0o700)
     logger = logging.getLogger("bittorrent_beobachter")
     logger.setLevel(logging.INFO)
     logger.propagate = False
     if logger.handlers:
         return logger
 
+    _create_private_directories(log_file.parent)
     formatter = logging.Formatter(LOG_FORMAT, datefmt="%Y-%m-%d %H:%M:%S")
     formatter.converter = time.gmtime
     file_handler = PrivateRotatingFileHandler(
@@ -77,13 +79,51 @@ def setup_logging(log_file: Path) -> logging.Logger:
     file_handler.namer = lambda _name: str(log_file.with_suffix(".old"))
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
-    if log_file.exists() and os.name != "nt":
-        log_file.chmod(0o600)
     stream = sys.stdout
     if stream is not None and callable(getattr(stream, "write", None)):
         stream_handler = logging.StreamHandler(stream)
         stream_handler.setFormatter(formatter)
         logger.addHandler(stream_handler)
+    return logger
+
+
+def _create_private_directories(directory: Path) -> None:
+    """Erzeugt fehlende Logverzeichnisse privat, ohne bestehende Eltern umzusetzen."""
+
+    missing: list[Path] = []
+    current = directory
+    while not current.exists():
+        missing.append(current)
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    for path in reversed(missing):
+        try:
+            path.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        if os.name != "nt":
+            path.chmod(0o700)
+
+
+def _stderr_logger() -> logging.Logger:
+    """Liefert bei unbrauchbarer Logdatei eine minimale sichtbare Protokollierung."""
+
+    logger = logging.getLogger("bittorrent_beobachter")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if logger.handlers:
+        return logger
+    stream = sys.stderr
+    if stream is not None and callable(getattr(stream, "write", None)):
+        formatter = logging.Formatter(LOG_FORMAT, datefmt="%Y-%m-%d %H:%M:%S")
+        formatter.converter = time.gmtime
+        stream_handler = logging.StreamHandler(stream)
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+    else:
+        logger.addHandler(logging.NullHandler())
     return logger
 
 
@@ -393,15 +433,29 @@ def main(argv: list[str] | None = None) -> int:
 
         return verify_gui_runtime()
     data_dir, config_path, log_file = _resolve_paths(args)
-    logger = setup_logging(log_file)
     command = args.command or "gui"
+    startup_warning: str | None = None
+    try:
+        logger = setup_logging(log_file)
+    except OSError as exc:
+        startup_warning = f"Die Protokolldatei {log_file} kann nicht verwendet werden: {exc}"
+        logger = _stderr_logger()
+        if command != "gui":
+            if sys.stderr is not None and callable(getattr(sys.stderr, "write", None)):
+                print(f"FEHLER: {startup_warning}", file=sys.stderr)
+            return 2
+        logger.error("%s", startup_warning)
     logger.info("=== %s %s gestartet (%s) ===", APP_NAME, VERSION, command)
 
     try:
         if command == "gui":
             from .gui import launch_gui
 
-            return launch_gui(config_path, data_dir)
+            return launch_gui(
+                config_path,
+                data_dir,
+                startup_warning=startup_warning,
+            )
         if command == "init":
             return _initialize_config(args, config_path)
         if command == "scan":

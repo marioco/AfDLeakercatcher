@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 from . import APP_NAME, VERSION
@@ -41,6 +42,7 @@ MAX_CACHE_FILES = 512
 MAX_CACHE_TOTAL_BYTES = 32 * 1024 * 1024
 CACHE_FORMAT_VERSION = 3
 MAX_REDIRECTS = 5
+ENRICHMENT_CANCELLED_REASON = "Netzauskunft wegen kontrolliertem Abbruch uebersprungen."
 RDAP_REDIRECT_PATHS = {
     "rdap.org": ("/ip/",),
     "rdap.arin.net": ("/registry/ip/",),
@@ -792,7 +794,7 @@ class NetworkEnricher:
             from_cache=False,
         )
 
-    def enrich(self, ip: str) -> NetworkEnrichment:
+    def enrich(self, ip: str, *, cancel_event: Event | None = None) -> NetworkEnrichment:
         """Liefere nach Opt-in Netz-/Organisationsfelder fuer eine oeffentliche IP."""
 
         normalized_ip = validate_public_ip(ip)
@@ -805,28 +807,38 @@ class NetworkEnricher:
         rdap: dict[str, Any] = {}
         ripestat: dict[str, Any] = {}
         source_results: list[tuple[str, _SourceResult]] = []
-        try:
-            rdap_result = self._load_source(
-                source="rdap",
-                url=rdap_url,
-                projector=lambda payload: _project_rdap(payload, normalized_ip),
-                cache_normalizer=_normalize_cached_rdap,
-            )
-            rdap = rdap_result.data
-            source_results.append(("rdap", rdap_result))
-        except (EnrichmentError, OSError) as exc:
-            errors.append(f"RDAP: {exc}")
-        try:
-            ripestat_result = self._load_source(
-                source="ripestat-prefix-overview",
-                url=ripestat_url,
-                projector=lambda payload: _project_ripestat(payload, normalized_ip),
-                cache_normalizer=_normalize_cached_ripestat,
-            )
-            ripestat = ripestat_result.data
-            source_results.append(("ripestat-prefix-overview", ripestat_result))
-        except (EnrichmentError, OSError) as exc:
-            errors.append(f"RIPEstat: {exc}")
+        rdap_started = False
+        ripestat_started = False
+        if cancel_event is not None and cancel_event.is_set():
+            errors.append(f"RDAP: {ENRICHMENT_CANCELLED_REASON}")
+        else:
+            rdap_started = True
+            try:
+                rdap_result = self._load_source(
+                    source="rdap",
+                    url=rdap_url,
+                    projector=lambda payload: _project_rdap(payload, normalized_ip),
+                    cache_normalizer=_normalize_cached_rdap,
+                )
+                rdap = rdap_result.data
+                source_results.append(("rdap", rdap_result))
+            except (EnrichmentError, OSError) as exc:
+                errors.append(f"RDAP: {exc}")
+        if cancel_event is not None and cancel_event.is_set():
+            errors.append(f"RIPEstat: {ENRICHMENT_CANCELLED_REASON}")
+        else:
+            ripestat_started = True
+            try:
+                ripestat_result = self._load_source(
+                    source="ripestat-prefix-overview",
+                    url=ripestat_url,
+                    projector=lambda payload: _project_ripestat(payload, normalized_ip),
+                    cache_normalizer=_normalize_cached_ripestat,
+                )
+                ripestat = ripestat_result.data
+                source_results.append(("ripestat-prefix-overview", ripestat_result))
+            except (EnrichmentError, OSError) as exc:
+                errors.append(f"RIPEstat: {exc}")
         prefix = ripestat.get("prefix")
         if prefix is not None and ipaddress.ip_address(normalized_ip) not in ipaddress.ip_network(
             prefix, strict=True
@@ -846,9 +858,12 @@ class NetworkEnricher:
             if source != "rdap"
             for url in result.redirect_urls
         ]
-        source_urls = tuple(
-            dict.fromkeys([rdap_url, *rdap_redirect_urls, ripestat_url, *ripestat_redirect_urls])
-        )
+        source_url_values: list[str] = []
+        if rdap_started:
+            source_url_values.extend((rdap_url, *rdap_redirect_urls))
+        if ripestat_started:
+            source_url_values.extend((ripestat_url, *ripestat_redirect_urls))
+        source_urls = tuple(dict.fromkeys(source_url_values))
         assembled_at_utc = _utc_text(self._current_time())
 
         return NetworkEnrichment(

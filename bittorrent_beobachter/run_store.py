@@ -1160,11 +1160,11 @@ class RunStore:
                                 "Reservierter Kandidat besitzt inkonsistente Laufzeiten."
                             )
                         if (
-                            row["offering_observed"] is not None
+                            row["offering_observed"] == 1
                             or row["evidence_candidate_id"] is not None
                         ):
                             raise RunStoreError(
-                                "Reservierter Kandidat besitzt bereits Ergebnis- oder Evidenzdaten."
+                                "Reservierter Kandidat besitzt einen positiven Befund oder Evidenz."
                             )
                         _claimed_text, claimed_at = _require_utc_timestamp(
                             str(row["claimed_at_utc"]),
@@ -1211,10 +1211,6 @@ class RunStore:
                         ignored_sightings += 1
                         continue
 
-                    connection.execute(
-                        "DELETE FROM handshake_results WHERE candidate_id = ?",
-                        (candidate_id,),
-                    )
                     updated = connection.execute(
                         """
                         UPDATE candidates
@@ -1250,7 +1246,12 @@ class RunStore:
         target_hashes: Iterable[str],
         size: int = 5,
     ) -> list[PeerCandidate]:
-        """Reserviert bis zu ``size`` Kandidaten fair reihum ueber alle Ziele."""
+        """Reserviert bis zu ``size`` Kandidaten fair reihum ueber alle Ziele.
+
+        Noch nie direkt gepruefte Endpunkte haben laufweit Vorrang vor spaeteren
+        Wiederholungspruefungen. Damit koennen haeufig erneut gemeldete negative
+        Endpunkte die erstmalige Pruefung neuer Kandidaten nicht verdraengen.
+        """
 
         if isinstance(size, bool) or not isinstance(size, int) or size < 1:
             raise ValueError("size muss eine positive Ganzzahl sein.")
@@ -1266,6 +1267,22 @@ class RunStore:
                 ).fetchone()
                 next_hash = str(cursor_row["value"]) if cursor_row is not None else hashes[0]
                 start = hashes.index(next_hash) if next_hash in hashes else 0
+                first_checks_only = any(
+                    connection.execute(
+                        """
+                        SELECT 1
+                        FROM candidates AS c
+                        LEFT JOIN handshake_results AS h ON h.candidate_id = c.id
+                        WHERE c.status = 'pending'
+                          AND c.info_hash = ?
+                          AND h.candidate_id IS NULL
+                        LIMIT 1
+                        """,
+                        (info_hash,),
+                    ).fetchone()
+                    is not None
+                    for info_hash in hashes
+                )
                 selected: list[PeerCandidate] = []
                 last_hash_index: int | None = None
 
@@ -1276,13 +1293,16 @@ class RunStore:
                         info_hash = hashes[hash_index]
                         row = connection.execute(
                             """
-                            SELECT id, candidate_json
-                            FROM candidates
-                            WHERE status = 'pending' AND info_hash = ?
-                            ORDER BY id
+                            SELECT c.id, c.candidate_json
+                            FROM candidates AS c
+                            LEFT JOIN handshake_results AS h ON h.candidate_id = c.id
+                            WHERE c.status = 'pending'
+                              AND c.info_hash = ?
+                              AND (? = 0 OR h.candidate_id IS NULL)
+                            ORDER BY c.id
                             LIMIT 1
                             """,
-                            (info_hash,),
+                            (info_hash, int(first_checks_only)),
                         ).fetchone()
                         if row is None:
                             continue
@@ -1353,13 +1373,17 @@ class RunStore:
                     row = connection.execute(
                         """
                         SELECT
-                            id,
-                            candidate_json,
-                            status,
-                            rediscovery_candidate_json,
-                            rediscovered_at_utc
-                        FROM candidates
-                        WHERE info_hash = ? AND ip = ? AND port = ?
+                            c.id,
+                            c.candidate_json,
+                            c.status,
+                            c.rediscovery_candidate_json,
+                            c.rediscovered_at_utc,
+                            h.offering_observed AS previous_offering_observed,
+                            e.candidate_id AS evidence_candidate_id
+                        FROM candidates AS c
+                        LEFT JOIN handshake_results AS h ON h.candidate_id = c.id
+                        LEFT JOIN evidence_records AS e ON e.candidate_id = c.id
+                        WHERE c.info_hash = ? AND c.ip = ? AND c.port = ?
                         """,
                         (candidate.info_hash_hex, candidate.ip, candidate.port),
                     ).fetchone()
@@ -1375,6 +1399,13 @@ class RunStore:
                     if str(row["status"]) != "in_progress":
                         raise RunStoreError(
                             "Handshake-Ergebnis gehoert nicht zu einem reservierten Kandidaten."
+                        )
+                    if (
+                        row["previous_offering_observed"] == 1
+                        or row["evidence_candidate_id"] is not None
+                    ):
+                        raise RunStoreError(
+                            "Ein positiver Befund darf nicht erneut geprueft werden."
                         )
                     raw_rediscovery = row["rediscovery_candidate_json"]
                     raw_rediscovered_at = row["rediscovered_at_utc"]
@@ -1422,6 +1453,16 @@ class RunStore:
                             error_category,
                             stored_at_utc
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT (candidate_id) DO UPDATE SET
+                            result_json = excluded.result_json,
+                            confirmed = excluded.confirmed,
+                            availability_present = excluded.availability_present,
+                            piece_availability = excluded.piece_availability,
+                            unchoked = excluded.unchoked,
+                            offering_observed = excluded.offering_observed,
+                            termination_reason = excluded.termination_reason,
+                            error_category = excluded.error_category,
+                            stored_at_utc = excluded.stored_at_utc
                         """,
                         (
                             candidate_id,
@@ -1439,10 +1480,6 @@ class RunStore:
                         ),
                     )
                     if rediscovered_candidate is not None and not result.offering_observed:
-                        connection.execute(
-                            "DELETE FROM handshake_results WHERE candidate_id = ?",
-                            (candidate_id,),
-                        )
                         updated = connection.execute(
                             """
                             UPDATE candidates
