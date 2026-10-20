@@ -24,7 +24,7 @@ from bittorrent_beobachter.models import (
     VpnClassification,
 )
 from bittorrent_beobachter.reports import (
-    EVIDENCE_LIMITATIONS,
+    PROJECT_LEGAL_REVIEW_POINTS,
     ReportConfig,
     _format_endpoint,
     _publish_staged_files,
@@ -44,11 +44,12 @@ def _evidence_record(
     vpn_provider: str | None = None,
     confirmed: bool = True,
     source_note: str = "",
+    info_hash_hex: str | None = None,
 ) -> EvidenceRecord:
     minute = f"{sequence:02d}"
     candidate = PeerCandidate(
         target_label=f"Ziel {sequence}",
-        info_hash_hex=(f"{sequence:x}" * 40)[:40],
+        info_hash_hex=info_hash_hex or (f"{sequence:x}" * 40)[:40],
         ip=ip,
         port=port,
         discovered_at_utc=f"2026-10-20T10:{minute}:00Z",
@@ -130,7 +131,7 @@ def _scan_result() -> ScanResult:
 class ReportGenerationTests(unittest.TestCase):
     """Prueft Berichtsaufteilung, Integritaet und Reproduzierbarkeit."""
 
-    def test_generates_aggregated_reports_drafts_and_manifest(self) -> None:
+    def test_generates_aggregated_reports_emails_and_manifest(self) -> None:
         result = _scan_result()
         config = ReportConfig(
             reporter_name="Test Meldestelle",
@@ -155,10 +156,10 @@ class ReportGenerationTests(unittest.TestCase):
                 self.assertEqual(stat.S_IMODE(Path(temp_name).stat().st_mode), 0o700)
                 self.assertTrue(all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in paths))
             self.assertEqual(paths[-1].name, "run_42_SHA256SUMS.txt")
-            self.assertIn("run_42_hinweis_ipv4_198_51_100_10.pdf", by_name)
-            self.assertIn("run_42_entwurf_ipv4_198_51_100_10.eml", by_name)
-            self.assertFalse(any("_hinweis_ipv6_" in name for name in by_name))
-            self.assertFalse(any("_entwurf_ipv6_" in name for name in by_name))
+            self.assertIn("run_42_anlage_ipv4_198_51_100_10.pdf", by_name)
+            self.assertIn("run_42_strafanzeige_ipv4_198_51_100_10.eml", by_name)
+            self.assertFalse(any("_anlage_ipv6_" in name for name in by_name))
+            self.assertFalse(any("_strafanzeige_ipv6_" in name for name in by_name))
 
             with by_name["run_42_beobachtungen.csv"].open(encoding="utf-8", newline="") as handle:
                 all_rows = list(csv.DictReader(handle, delimiter=";"))
@@ -196,25 +197,25 @@ class ReportGenerationTests(unittest.TestCase):
             self.assertNotIn("ports", vpn_rows[0])
             self.assertNotIn("infohashes", vpn_rows[0])
 
-            draft_path = by_name["run_42_entwurf_ipv4_198_51_100_10.eml"]
-            message = BytesParser(policy=policy.default).parsebytes(draft_path.read_bytes())
+            email_path = by_name["run_42_strafanzeige_ipv4_198_51_100_10.eml"]
+            message = BytesParser(policy=policy.default).parsebytes(email_path.read_bytes())
             self.assertEqual(message["X-Unsent"], "1")
             self.assertIsNone(message["To"])
             self.assertIsNone(message["From"])
+            self.assertEqual(
+                message["Subject"],
+                "Strafanzeige gegen Unbekannt - BitTorrent-Endpunkt 198.51.100.10",
+            )
             plain_body = message.get_body(preferencelist=("plain",)).get_content()
-            for limitation in EVIDENCE_LIMITATIONS:
-                self.assertIn(limitation, plain_body)
-            self.assertIn("keine digitale Signatur", plain_body)
-            self.assertIn("kein vertrauenswürdiger externer Zeitstempel", plain_body)
-            self.assertIn("sachliche Richtigkeit", plain_body)
-            self.assertIn("nicht unabhängig reproduzierbar", plain_body)
-            self.assertIn("Quellenspezifische Abrufzeitpunkte", plain_body)
-            self.assertIn("Angefragte bzw. weitergeleitete Quellen", plain_body)
-            self.assertIn("Netzangaben zusammengestellt", plain_body)
-            self.assertIn("Aus lokalem Cache: rdap", plain_body)
+            self.assertIn("hiermit erstatte ich Strafanzeige gegen Unbekannt", plain_body)
+            self.assertIn("Vorgangsnummer oder des Aktenzeichens", plain_body)
+            self.assertIn("weder einen vollständigen Download oder Upload", plain_body)
+            self.assertIn("https://github.com/marioco/AfDLeakercatcher", plain_body)
+            self.assertNotIn("Entwurf", plain_body)
+            self.assertNotIn("Quellenspezifische Abrufzeitpunkte", plain_body)
             attachments = list(message.iter_attachments())
             self.assertEqual(len(attachments), 1)
-            notice_path = by_name["run_42_hinweis_ipv4_198_51_100_10.pdf"]
+            notice_path = by_name["run_42_anlage_ipv4_198_51_100_10.pdf"]
             self.assertEqual(attachments[0].get_payload(decode=True), notice_path.read_bytes())
 
             manifest_lines = (
@@ -226,6 +227,53 @@ class ReportGenerationTests(unittest.TestCase):
                 expected_hash, filename = entry.split(" *", maxsplit=1)
                 actual_hash = hashlib.sha256(by_name[filename].read_bytes()).hexdigest()
                 self.assertEqual(expected_hash, actual_hash)
+
+    def test_project_case_creates_clear_complaint_without_hashes_in_email(self) -> None:
+        project_hash = "852795102149749ad91123af01ceac5da6f9eb5a"
+        custom_hash = "f" * 40
+        result = ScanResult(
+            run_id="project-case",
+            started_at_utc="2026-10-20T10:00:00Z",
+            completed_at_utc="2026-10-20T11:00:00Z",
+            records=[
+                _evidence_record(
+                    "198.51.100.80",
+                    6009,
+                    9,
+                    info_hash_hex=project_hash,
+                ),
+                _evidence_record(
+                    "198.51.100.80",
+                    6010,
+                    10,
+                    info_hash_hex=custom_hash,
+                ),
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as temp_name:
+            paths = generate_reports(result, Path(temp_name), ReportConfig())
+            by_name = {path.name: path for path in paths}
+            email_path = by_name["project-case_strafanzeige_ipv4_198_51_100_80.eml"]
+            message = BytesParser(policy=policy.default).parsebytes(email_path.read_bytes())
+            self.assertIn("Strafanzeige gegen Unbekannt", message["Subject"])
+            self.assertIn("AfD-Datenleak", message["Subject"])
+            body = message.get_body(preferencelist=("plain",)).get_content()
+            self.assertIn("hiermit erstatte ich Strafanzeige gegen Unbekannt", body)
+            self.assertIn("Mindestens einer", body)
+            self.assertIn("Vorgangsnummer oder des Aktenzeichens", body)
+            self.assertIn("https://github.com/marioco/AfDLeakercatcher", body)
+            for point in PROJECT_LEGAL_REVIEW_POINTS:
+                self.assertIn(point, body)
+            self.assertNotIn(project_hash, body)
+            self.assertNotIn(custom_hash, body)
+            self.assertNotIn("ENTWURF", body)
+
+            pdf_path = by_name["project-case_anlage_ipv4_198_51_100_80.pdf"]
+            pdf_bytes = pdf_path.read_bytes()
+            self.assertIn(b"Technische Dokumentation zur Strafanzeige", pdf_bytes)
+            self.assertNotIn(b"ENTWURF", pdf_bytes)
+            self.assertNotIn(b"Adressat", pdf_bytes)
 
     @unittest.skipIf(os.name == "nt", "POSIX-Dateimodi sind unter Windows anders")
     def test_staged_report_is_private_before_atomic_publish(self) -> None:
@@ -301,18 +349,18 @@ class ReportGenerationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_name:
             paths = generate_reports(result, Path(temp_name), ReportConfig())
             by_name = {path.name: path for path in paths}
-            alpha_pdf = by_name["source-isolation_hinweis_ipv4_198_51_100_21.pdf"].read_bytes()
-            beta_pdf = by_name["source-isolation_hinweis_ipv4_198_51_100_22.pdf"].read_bytes()
+            alpha_pdf = by_name["source-isolation_anlage_ipv4_198_51_100_21.pdf"].read_bytes()
+            beta_pdf = by_name["source-isolation_anlage_ipv4_198_51_100_22.pdf"].read_bytes()
             self.assertIn(b"SOURCE_NOTE_ALPHA_ONLY", alpha_pdf)
             self.assertNotIn(b"SOURCE_NOTE_BETA_ONLY", alpha_pdf)
             self.assertIn(b"SOURCE_NOTE_BETA_ONLY", beta_pdf)
             self.assertNotIn(b"SOURCE_NOTE_ALPHA_ONLY", beta_pdf)
 
             alpha_message = BytesParser(policy=policy.default).parsebytes(
-                by_name["source-isolation_entwurf_ipv4_198_51_100_21.eml"].read_bytes()
+                by_name["source-isolation_strafanzeige_ipv4_198_51_100_21.eml"].read_bytes()
             )
             alpha_body = alpha_message.get_body(preferencelist=("plain",)).get_content()
-            self.assertIn("SOURCE_NOTE_ALPHA_ONLY", alpha_body)
+            self.assertNotIn("SOURCE_NOTE_ALPHA_ONLY", alpha_body)
             self.assertNotIn("SOURCE_NOTE_BETA_ONLY", alpha_body)
 
             observations_path = by_name["source-isolation_beobachtungen.csv"]
@@ -328,7 +376,7 @@ class ReportGenerationTests(unittest.TestCase):
                 alpha_row["quellen_sachverhaltshinweise"],
             )
 
-    def test_any_known_vpn_classification_suppresses_individual_draft(self) -> None:
+    def test_any_known_vpn_classification_suppresses_individual_complaint(self) -> None:
         ordinary = _evidence_record("198.51.100.40", 6000, 4)
         vpn = _evidence_record(
             "198.51.100.40",
@@ -347,8 +395,8 @@ class ReportGenerationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_name:
             paths = generate_reports(result, Path(temp_name), ReportConfig())
             names = {path.name for path in paths}
-            self.assertFalse(any("_hinweis_" in name for name in names))
-            self.assertFalse(any("_entwurf_" in name for name in names))
+            self.assertFalse(any("_anlage_" in name for name in names))
+            self.assertFalse(any("_strafanzeige_" in name for name in names))
             summary_pdf = next(path for path in paths if path.name.endswith("_laufbericht.pdf"))
             self.assertNotIn(b"198.51.100.40", summary_pdf.read_bytes())
             observations_csv = next(
@@ -413,7 +461,7 @@ class ReportGenerationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_name:
             paths = generate_reports(result, Path(temp_name), ReportConfig())
             self.assertEqual(len(paths), 5)
-            self.assertFalse(any("_hinweis_" in path.name for path in paths))
+            self.assertFalse(any("_anlage_" in path.name for path in paths))
             observations_csv = next(
                 path for path in paths if path.name.endswith("_beobachtungen.csv")
             )

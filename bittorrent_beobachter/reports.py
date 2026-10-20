@@ -1,7 +1,7 @@
-"""Erzeugt neutrale, nachvollziehbare Berichte aus bestaetigten Beobachtungen.
+"""Erzeugt nachvollziehbare Anzeigen und Berichte aus bestaetigten Beobachtungen.
 
 Das Modul versendet nichts. E-Mail-Ausgaben werden ausschliesslich als lokale
-``.eml``-Entwuerfe mit angehaengtem PDF erstellt. ReportLab wird erst beim
+versandfertige ``.eml``-Dateien mit angehaengtem PDF erstellt. ReportLab wird erst beim
 Erzeugen der PDFs importiert, damit alle anderen Programmteile auch ohne die
 optionale PDF-Abhaengigkeit importierbar bleiben.
 """
@@ -29,6 +29,21 @@ from types import SimpleNamespace
 from typing import Any
 
 from .models import EvidenceRecord, ScanResult
+
+PROJECT_REPOSITORY_URL = "https://github.com/marioco/AfDLeakercatcher"
+PROJECT_LEAK_INFO_HASHES = frozenset(
+    {
+        "852795102149749ad91123af01ceac5da6f9eb5a",
+        "db503db679f508aa31a9e07913b2aa8cf7aa6dff",
+    }
+)
+PROJECT_LEGAL_REVIEW_POINTS = (
+    "Datenhehlerei (§ 202d StGB)",
+    "Datenschutzstraftaten (§ 42 BDSG)",
+    "unerlaubte Verwertung urheberrechtlich geschützter Werke (§ 106 UrhG)",
+    "gefährdendes Verbreiten personenbezogener Daten (§ 126a StGB)",
+    "Verletzung von Geschäftsgeheimnissen (§ 23 GeschGehG)",
+)
 
 EVIDENCE_LIMITATIONS = (
     "Es wurden keine Inhalte und keine Torrent-Metadaten heruntergeladen oder hochgeladen.",
@@ -127,6 +142,20 @@ class _IpAggregate:
         return any(record.vpn.status == "known_vpn" for record in self.records)
 
 
+def _project_leak_hashes(aggregate: _IpAggregate) -> tuple[str, ...]:
+    """Liefert nur die fest im Projekt hinterlegten, fallbezogenen Infohashes."""
+
+    return tuple(
+        sorted(
+            {
+                record.handshake.candidate.info_hash_hex
+                for record in aggregate.records
+                if record.handshake.candidate.info_hash_hex in PROJECT_LEAK_INFO_HASHES
+            }
+        )
+    )
+
+
 def safe_ip_filename(ip: str) -> str:
     """Gibt eine kanonische, betriebssystemuebergreifend sichere IP-Kennung zurueck."""
 
@@ -156,8 +185,8 @@ def generate_reports(
 
     Ausschliesslich bestaetigte Eintraege aus ``result.records`` werden
     ausgewertet. Bekannte VPN-Endpunkte erscheinen ausschliesslich in einer
-    datensparsamen VPN-Liste; fuer sie werden weder Einzelhinweise noch
-    E-Mail-Entwuerfe erzeugt. Das SHA-256-Manifest wird zuletzt erstellt und
+    datensparsamen VPN-Liste; fuer sie werden weder Einzelanlagen noch
+    E-Mail-Dateien erzeugt. Das SHA-256-Manifest wird zuletzt erstellt und
     hasht alle anderen erzeugten Dateien.
     """
 
@@ -217,7 +246,7 @@ def generate_reports(
 
         for aggregate in reportable:
             ip_slug = safe_ip_filename(aggregate.ip)
-            notice_path = staging_dir / f"{run_slug}_hinweis_{ip_slug}.pdf"
+            notice_path = staging_dir / f"{run_slug}_anlage_{ip_slug}.pdf"
             _write_notice_pdf(
                 notice_path,
                 result,
@@ -228,7 +257,7 @@ def generate_reports(
             )
             generated_files.append(notice_path)
 
-            draft_path = staging_dir / f"{run_slug}_entwurf_{ip_slug}.eml"
+            draft_path = staging_dir / f"{run_slug}_strafanzeige_{ip_slug}.eml"
             _write_email_draft(
                 draft_path,
                 result,
@@ -532,7 +561,8 @@ def _write_summary_pdf(
     story: list[Any] = [
         _paragraph("Technischer Laufbericht", styles["Title"], toolkit),
         _paragraph(
-            "Zusammenfassung eines begrenzten BitTorrent-Netzwerktests. Dieser "
+            "Zusammenfassung einer gezielten technischen Überprüfung der "
+            "dokumentierten Infohashes im BitTorrent-Netzwerk. Dieser "
             "Bericht ist eine technische Dokumentation und keine Feststellung "
             "einer Straftat.",
             styles["BodyText"],
@@ -548,7 +578,7 @@ def _write_summary_pdf(
                 ("Handshake-Versuche", str(len(result.handshakes))),
                 ("Bestätigte Handshakes", str(result.confirmed_count)),
                 ("Bestätigte IP-Adressen mit Evidenz", str(len(aggregates))),
-                ("Einzelhinweise", str(len(reportable))),
+                ("Anlagen zu Strafanzeigen", str(len(reportable))),
                 ("Bekannte VPN-IP-Adressen", str(len(vpn_only))),
             ),
             styles,
@@ -572,7 +602,7 @@ def _write_summary_pdf(
             toolkit,
         ),
         _paragraph(
-            "Übersicht der Einzelhinweise (ohne VPN-Liste)",
+            "Übersicht der Anlagen (ohne VPN-Liste)",
             styles["Heading1"],
             toolkit,
         ),
@@ -619,7 +649,7 @@ def _write_summary_pdf(
         story.append(
             _paragraph(
                 "In diesem Lauf lagen keine bestätigten Nicht-VPN-Evidenzdatensätze "
-                "für Einzelhinweise vor. Bekannte VPN-Endpunkte stehen ausschließlich "
+                "für Anlagen vor. Bekannte VPN-Endpunkte stehen ausschließlich "
                 "in der gesonderten VPN-Liste.",
                 styles["BodyText"],
                 toolkit,
@@ -703,40 +733,76 @@ def _write_notice_pdf(
 ) -> None:
     styles = _styles(toolkit)
     row = _aggregate_row(aggregate)
+    project_hashes = _project_leak_hashes(aggregate)
+    if project_hashes:
+        project_context = (
+            "Die in dieser Anlage erfassten Projekt-Infohashes "
+            f"{', '.join(project_hashes)} werden im Open-Source-Projekt "
+            "AfDLeakercatcher dem als „AfD-Datenleak“ bezeichneten Datenbestand "
+            "zugeordnet. Diese Inhaltszuordnung wurde bei der Messung nicht "
+            "durch einen Download überprüft."
+        )
+    else:
+        project_context = (
+            "Für die dokumentierten Infohashes enthält diese Anlage keine "
+            "projektseitige Zuordnung zum sogenannten AfD-Datenleak."
+        )
     story: list[Any] = [
         _paragraph(
-            "Technischer Hinweis an eine Polizeidienststelle",
+            "Technische Dokumentation zur Strafanzeige gegen Unbekannt",
             styles["Title"],
             toolkit,
         ),
         _paragraph(
-            "ENTWURF - nicht automatisch versandt",
-            styles["EvidenceBox"],
+            f"Beobachteter BitTorrent-Endpunkt {aggregate.ip}",
+            styles["Heading1"],
             toolkit,
         ),
         _key_value_table(
             (
-                ("Adressat", config.recipient_name.strip() or "nicht angegeben"),
-                ("Anschrift", config.recipient_address.strip() or "nicht angegeben"),
-                ("E-Mail", config.recipient_email or "nicht angegeben"),
-                ("Meldende Person/Stelle", config.reporter_name.strip() or "nicht angegeben"),
-                ("Kontakt", config.reporter_contact.strip() or "nicht angegeben"),
-                ("Kontakt-E-Mail", config.reporter_email or "nicht angegeben"),
+                ("IP-Adresse", aggregate.ip),
                 ("Lauf-ID", result.run_id),
                 ("Bericht erstellt (UTC)", generated_at_utc),
             ),
             styles,
             toolkit,
         ),
-        _paragraph("Anlass des Hinweises", styles["Heading1"], toolkit),
+        _paragraph("Anlass der Strafanzeige", styles["Heading1"], toolkit),
         _paragraph(
-            "Bei einem begrenzten technischen Netzwerktest antwortete der "
-            f"öffentliche Endpunkt {aggregate.ip} auf mindestens einen "
-            "BitTorrent-Handshake für einen der dokumentierten Infohashes. "
-            "Es wird um eine eigenständige technische und rechtliche Prüfung "
-            "durch die zuständige Behörde gebeten.",
+            "Bei einer gezielten technischen Überprüfung des BitTorrent-Netzwerks "
+            f"antwortete der unter der öffentlichen IP-Adresse {aggregate.ip} "
+            "erreichbare Endpunkt für mindestens einen der dokumentierten "
+            "Infohashes. Dies gibt Anlass zu prüfen, ob über diesen Anschluss die "
+            "betreffenden Daten angeboten, übertragen oder bezogen wurden.",
             styles["BodyText"],
             toolkit,
+        ),
+        _paragraph(project_context, styles["BodyText"], toolkit),
+        *(
+            [
+                _paragraph(
+                    "Mögliche rechtliche Einordnung: behördlich zu prüfen",
+                    styles["Heading1"],
+                    toolkit,
+                ),
+                _paragraph(
+                    "Bitte prüfen Sie insbesondere einen möglichen Anfangsverdacht "
+                    "hinsichtlich folgender Vorschriften. Die jeweiligen gesetzlichen "
+                    "Voraussetzungen werden durch den Handshake allein nicht belegt.",
+                    styles["BodyText"],
+                    toolkit,
+                ),
+                _paragraph(
+                    "<br/>".join(
+                        f"- {_escape_text(point)}" for point in PROJECT_LEGAL_REVIEW_POINTS
+                    ),
+                    styles["BodyText"],
+                    toolkit,
+                    already_escaped=True,
+                ),
+            ]
+            if project_hashes
+            else []
         ),
         _paragraph("Aussagegrenze", styles["Heading1"], toolkit),
         _limitations_paragraph(styles["EvidenceBox"], toolkit),
@@ -865,11 +931,21 @@ def _write_notice_pdf(
         [
             _paragraph("Bitte um Prüfung", styles["Heading1"], toolkit),
             _paragraph(
-                "Es wird ausschließlich um behördliche Prüfung der technischen "
-                "Beobachtung und ihrer rechtlichen Bedeutung gebeten. Für eine "
-                "Zuordnung zu einem Anschluss oder einer Person sind eigenständige "
-                "Ermittlungen, insbesondere unter Beachtung dynamischer Adressen, "
-                "NAT, Proxies, VPNs und des genauen Zeitpunkts, erforderlich.",
+                "Diese Dokumentation ist eine Anlage zur Strafanzeige gegen Unbekannt. "
+                "Es wird um behördliche Prüfung gebeten, ob über den Anschluss Daten "
+                "angeboten, übertragen oder bezogen wurden. Für die Zuordnung zu "
+                "einem Anschluss oder einer Person sind eigenständige Ermittlungen "
+                "unter Beachtung des genauen Zeitpunkts erforderlich.",
+                styles["BodyText"],
+                toolkit,
+            ),
+            _paragraph("Open-Source-Nachprüfbarkeit", styles["Heading1"], toolkit),
+            _paragraph(
+                f"Der Quellcode der Messmethode ist öffentlich unter "
+                f"{PROJECT_REPOSITORY_URL} einsehbar. Er ermöglicht die Prüfung "
+                "der Funktionsweise, bestätigt aber nicht unabhängig die einzelne "
+                "lokale Beobachtung; diese ist in der Anlage und im zugehörigen "
+                "Integritätsjournal dokumentiert.",
                 styles["BodyText"],
                 toolkit,
             ),
@@ -877,7 +953,7 @@ def _write_notice_pdf(
     )
     _build_pdf(
         path,
-        f"Technischer Hinweis - {aggregate.ip}",
+        f"Technische Dokumentation zur Strafanzeige - {aggregate.ip}",
         story,
         config,
         generated_at_utc,
@@ -899,8 +975,8 @@ def _write_vpn_pdf(
         _paragraph(
             "Diese separate Liste enthält IP-Adressen, für die mindestens eine "
             "konservative Klassifikation als bekannter VPN-Endpunkt vorliegt. "
-            "Für diese Einträge werden keine Einzelhinweise und keine "
-            "E-Mail-Entwürfe erzeugt.",
+            "Für diese Einträge werden keine Einzelanlagen und keine "
+            "E-Mail-Dateien erzeugt.",
             styles["BodyText"],
             toolkit,
         ),
@@ -1257,7 +1333,14 @@ def _write_email_draft(
     notice_pdf: Path,
 ) -> None:
     message = EmailMessage(policy=SMTP)
-    message["Subject"] = f"Technischer Hinweis zu BitTorrent-Endpunkt {aggregate.ip}"
+    project_hashes = _project_leak_hashes(aggregate)
+    if project_hashes:
+        message["Subject"] = (
+            "Strafanzeige gegen Unbekannt - Verdacht im Zusammenhang mit dem "
+            f"AfD-Datenleak - IP {aggregate.ip}"
+        )
+    else:
+        message["Subject"] = f"Strafanzeige gegen Unbekannt - BitTorrent-Endpunkt {aggregate.ip}"
     message["Date"] = format_datetime(_timestamp_as_datetime(generated_at_utc), usegmt=True)
     message["X-Unsent"] = "1"
     message["X-Report-Run-ID"] = _single_line(result.run_id, "run_id")
@@ -1273,51 +1356,58 @@ def _write_email_draft(
             addr_spec=config.recipient_email.strip(),
         )
 
-    legal_text = ""
+    additional_legal_text = ""
     if config.legal_notes:
-        legal_text = (
-            "\n\nVom meldenden Nutzer angegebene Sachverhalts- und rechtliche Prüfhinweise "
-            "(nicht durch das Programm bewertet):\n"
+        additional_legal_text = (
+            "\n\nZusätzlich wird um Prüfung folgender angegebener Hinweise gebeten:\n"
             + "\n".join(f"- {note}" for note in config.legal_notes if note.strip())
         )
 
-    source_notes = _source_note_lines(aggregate.records)
-    source_text = ""
-    if source_notes:
-        source_text = (
-            "\n\nHashgebundene Sachverhaltshinweise (unbestätigte Nutzerangaben; "
-            "der bezeichnete Inhalt wurde vom Programm nicht abgerufen oder verifiziert):\n"
-            + "\n".join(f"- {note}" for note in source_notes)
-        )
-
     row = _aggregate_row(aggregate)
-    network_source_text = (
-        "\n\nÖffentliche Routing-/Registry-Angaben zum Adressbereich:\n"
-        "- Angefragte bzw. weitergeleitete Quellen: "
-        f"{row['angefragte_bzw_weitergeleitete_quellen']}\n"
-        "- Netzangaben zusammengestellt (UTC): "
-        f"{row['netzangaben_zusammengestellt_utc']}\n"
-        "- Quellenspezifische Abrufzeitpunkte (UTC): "
-        f"{row['netzregistrierung_quellen_abruf_utc']}\n"
-        f"- Aus lokalem Cache: {row['netzregistrierung_cache_quellen']}\n"
-        f"- Abruffehler: {row['netzregistrierungs_fehler']}"
-    )
+    if row["erste_beobachtung_utc"] == row["letzte_beobachtung_utc"]:
+        observation_period = f"Am {row['letzte_beobachtung_utc']}"
+    else:
+        observation_period = (
+            f"Zwischen {row['erste_beobachtung_utc']} und {row['letzte_beobachtung_utc']}"
+        )
+    if project_hashes:
+        case_context = (
+            "Mindestens einer der in der Anlage dokumentierten Infohashes wird "
+            "im Open-Source-Projekt AfDLeakercatcher dem als „AfD-Datenleak“ "
+            "bezeichneten Datenbestand zugeordnet. Die Messung selbst hat keine "
+            "Dateien heruntergeladen und diese Inhaltszuordnung daher nicht "
+            "überprüft.\n\n"
+            "Bitte prüfen Sie insbesondere einen möglichen Anfangsverdacht hinsichtlich:\n"
+            + "\n".join(f"- {point}" for point in PROJECT_LEGAL_REVIEW_POINTS)
+        )
+    else:
+        case_context = (
+            "Für diese Infohashes enthält die Software keine projektseitige "
+            "Zuordnung zum sogenannten AfD-Datenleak."
+        )
 
     body = (
         "Sehr geehrte Damen und Herren,\n\n"
-        "anbei erhalten Sie einen neutralen technischen Hinweis zu einer "
-        "BitTorrent-Netzwerkbeobachtung. Bitte prüfen Sie die technischen "
-        "Angaben und ihre rechtliche Bedeutung eigenständig.\n\n"
-        + "\n".join(f"- {text}" for text in EVIDENCE_LIMITATIONS)
-        + source_text
-        + legal_text
-        + network_source_text
-        + "\n\nDer angehängte Bericht enthält Zeitpunkte, Infohashes, "
-        "Endpunkte, Integritätshashes und öffentliche Netzregistrierungsdaten.\n\n"
-        "Mit freundlichen Grüßen\n"
-        f"{config.reporter_name.strip() or '[Absender nicht angegeben]'}\n\n"
-        "Hinweis: Dies ist ein lokal erzeugter Entwurf. Das Programm hat diese "
-        "E-Mail nicht versandt.\n"
+        "hiermit erstatte ich Strafanzeige gegen Unbekannt.\n\n"
+        f"{observation_period} wurde bei einer gezielten Überprüfung des "
+        "BitTorrent-Netzwerks festgestellt, dass der unter der öffentlichen "
+        f"IP-Adresse {aggregate.ip} erreichbare Endpunkt auf eine BitTorrent-Anfrage "
+        "zu mindestens einem der in der Anlage dokumentierten Infohashes "
+        "antwortete.\n\n"
+        f"{case_context}\n\n"
+        "Dies gibt Anlass zu prüfen, ob über diesen Anschluss die betreffenden "
+        "Daten angeboten, übertragen oder bezogen wurden. Die Messung allein "
+        "beweist weder einen vollständigen Download oder Upload noch die "
+        "Identität oder Schuld einer Person."
+        + additional_legal_text
+        + "\n\nDie Einzelheiten, Zeitpunkte und technischen Nachweise stehen "
+        "in der angehängten PDF. Der Quellcode der Messmethode kann unter "
+        f"{PROJECT_REPOSITORY_URL} geprüft werden.\n\n"
+        "Ich bitte um Eingangsbestätigung sowie um Mitteilung der Vorgangsnummer "
+        "oder des Aktenzeichens.\n\n"
+        "Mit freundlichen Grüßen"
+        + (f"\n{config.reporter_name.strip()}" if config.reporter_name.strip() else "")
+        + "\n"
     )
     message.set_content(body, subtype="plain", charset="utf-8")
     message.add_attachment(

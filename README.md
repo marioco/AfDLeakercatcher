@@ -13,7 +13,8 @@ Für gefundene Endpunkte führt sie eine eng begrenzte Prüfung durch:
 1. Ein DHT-Knoten nennt `IP:Port` für den konfigurierten Infohash.
 2. Die Anwendung sendet genau den standardisierten 68-Byte-BitTorrent-Handshake.
 3. Nur wenn der Endpunkt mit einem gültigen Handshake für denselben Infohash antwortet,
-   wird ein prüfbarer Entwurf erzeugt.
+   werden eine prüfbare technische Anlage und eine versandfertige Strafanzeige als
+   `.eml`-Datei erzeugt.
 4. Danach wird die Verbindung sofort geschlossen. Es folgen keine Protokollnachrichten.
 
 Das belegt ausschließlich, dass der angesprochene Netzwerkendpunkt zum protokollierten
@@ -70,8 +71,9 @@ jeweiligen Lauf-ID und erzeugen:
 
 - `<Lauf-ID>_laufbericht.pdf`: Umfang, Ergebnisse, Fehler und Aussagegrenzen;
 - `<Lauf-ID>_beobachtungen.csv`: tabellarische technische Beobachtungen;
-- pro bestätigter, nicht als bekannter VPN-Endpunkt eingestufter IP einen neutralen
-  `<Lauf-ID>_hinweis_<IP>.pdf` und `<Lauf-ID>_entwurf_<IP>.eml`;
+- pro bestätigter, nicht als bekannter VPN-Endpunkt eingestufter IP eine
+  `<Lauf-ID>_anlage_<IP>.pdf` und
+  `<Lauf-ID>_strafanzeige_<IP>.eml`;
 - `<Lauf-ID>_vpn_liste.pdf` und `<Lauf-ID>_vpn_liste.csv`: bekannte
   VPN-Endpunkte ausschließlich als Liste;
 - `<Lauf-ID>_SHA256SUMS.txt`: Prüfsummen aller Ausgabedateien;
@@ -81,8 +83,9 @@ Für Berichte und Evidenzjournal gelten feste lokale Kapazitätsgrenzen. Bei Ann
 bricht ein neuer Lauf vor dem Netzwerkzugriff mit einem Archivhinweis ab. Die Anwendung
 löscht Evidenz oder Berichte niemals automatisch.
 
-Die Anwendung sendet nie E-Mails. `.eml`-Dateien sind Entwürfe für die menschliche
-Prüfung. Wenn keine Empfängeradresse konfiguriert wurde, bleibt das Empfängerfeld leer.
+Die Anwendung sendet nie E-Mails. `.eml`-Dateien sind versandfertig formuliert, müssen
+aber von einem Menschen geprüft, geöffnet und bewusst versandt werden. Wenn keine
+Empfängeradresse konfiguriert wurde, bleibt das Empfängerfeld leer.
 
 „Nicht als VPN erkannt“ bedeutet immer nur **unbekannt**, niemals „sicher kein VPN“.
 Eine positive VPN-Einordnung erfolgt nur durch ein ausdrücklich konfiguriertes
@@ -117,9 +120,9 @@ Angaben zum Anschlussinhaber.
 
 Die Zuordnung eines Infohashes zu einem behaupteten Inhalt stammt aus der jeweiligen
 Konfiguration und wird wegen des absichtlich unterlassenen Inhaltsdownloads nicht
-verifiziert. Rechtliche Hinweise in einem Entwurf sind ausdrücklich nur eine Bitte um
-behördliche Prüfung. Vor einer Verwendung sollte eine sachkundige rechtliche und
-datenschutzrechtliche Prüfung erfolgen.
+verifiziert. Die in der Strafanzeige genannten Vorschriften sind ausdrücklich als Bitte
+um behördliche Prüfung formuliert. Vor einer Verwendung sollte eine sachkundige
+rechtliche und datenschutzrechtliche Prüfung erfolgen.
 
 ## Aus dem Quellcode starten
 
