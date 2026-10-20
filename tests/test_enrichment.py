@@ -6,6 +6,7 @@ import errno
 import json
 import os
 import stat
+import unicodedata
 import urllib.error
 import urllib.request
 from datetime import UTC, datetime, timedelta
@@ -18,6 +19,7 @@ import pytest
 import bittorrent_beobachter.enrichment as enrichment_module
 from bittorrent_beobachter.enrichment import (
     _REQUEST_IP_ATTRIBUTE,
+    _REQUEST_REDIRECT_URLS_ATTRIBUTE,
     _REQUEST_SOURCE_ATTRIBUTE,
     EXTERNAL_LOOKUP_DISCLOSURE,
     ExternalLookupDisabledError,
@@ -52,6 +54,8 @@ def _rdap_payload() -> dict[str, Any]:
         "name": "EXAMPLE-NET",
         "handle": "NET-8-8-8-0-1",
         "country": "US",
+        "startAddress": "8.8.8.0",
+        "endAddress": "8.8.8.255",
         "entities": [
             {
                 "roles": ["registrant"],
@@ -137,6 +141,7 @@ def test_redirect_policy_rejects_unsafe_targets(target: str) -> None:
     request = urllib.request.Request("https://rdap.org/ip/8.8.8.8", method="GET")
     setattr(request, _REQUEST_SOURCE_ATTRIBUTE, "rdap")
     setattr(request, _REQUEST_IP_ATTRIBUTE, "8.8.8.8")
+    setattr(request, _REQUEST_REDIRECT_URLS_ATTRIBUTE, [])
     with pytest.raises(RedirectPolicyError):
         _RestrictedRedirectHandler().redirect_request(
             request,
@@ -152,6 +157,8 @@ def test_redirect_policy_allows_authoritative_rir_https_target() -> None:
     request = urllib.request.Request("https://rdap.org/ip/8.8.8.8", method="GET")
     setattr(request, _REQUEST_SOURCE_ATTRIBUTE, "rdap")
     setattr(request, _REQUEST_IP_ATTRIBUTE, "8.8.8.8")
+    redirect_urls: list[str] = []
+    setattr(request, _REQUEST_REDIRECT_URLS_ATTRIBUTE, redirect_urls)
     redirected = _RestrictedRedirectHandler().redirect_request(
         request,
         None,
@@ -164,6 +171,8 @@ def test_redirect_policy_allows_authoritative_rir_https_target() -> None:
     assert redirected.full_url == "https://rdap.db.ripe.net/ip/8.8.8.8"
     assert getattr(redirected, _REQUEST_SOURCE_ATTRIBUTE) == "rdap"
     assert getattr(redirected, _REQUEST_IP_ATTRIBUTE) == "8.8.8.8"
+    assert redirect_urls == ["https://rdap.db.ripe.net/ip/8.8.8.8"]
+    assert getattr(redirected, _REQUEST_REDIRECT_URLS_ATTRIBUTE) is redirect_urls
     assert _RestrictedRedirectHandler.max_redirections == 5
 
 
@@ -210,6 +219,7 @@ def test_enrichment_projects_allowed_fields_and_caches_only_projection(
     assert "Abuse Team" not in cache_text
     assert "abuse@example.net" in cache_text
     assert "rdap.db.ripe.net" in cache_text
+    assert '"redirect_urls":["https://rdap.db.ripe.net/ip/8.8.8.8"]' in cache_text
     assert "https://rdap.db.ripe.net/ip/8.8.8.8" in result.source_urls
     cache_paths = sorted(tmp_path.glob("*.json"))
 
@@ -235,7 +245,8 @@ def test_enrichment_projects_allowed_fields_and_caches_only_projection(
         ).enrich("8.8.8.8")
     assert cached.holder == result.holder
     assert cached.abuse_email == result.abuse_email
-    assert cached.enriched_at_utc == result.enriched_at_utc
+    assert result.enriched_at_utc == "2026-10-20T12:00:00Z"
+    assert cached.enriched_at_utc == "2026-10-21T12:00:00Z"
     assert cached.source_fetched_at_utc == result.source_fetched_at_utc
     assert cached.cached_sources == ("rdap", "ripestat-prefix-overview")
     assert result.cached_sources == ()
@@ -250,6 +261,35 @@ def test_enrichment_projects_allowed_fields_and_caches_only_projection(
         ).enrich("8.8.8.8")
         assert hardened_cached.cached_sources == ("rdap", "ripestat-prefix-overview")
         assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in cache_paths)
+
+
+def test_external_text_strips_control_and_direction_override_characters(
+    tmp_path: Path,
+) -> None:
+    rdap = _rdap_payload()
+    rdap["name"] = "Safe\x00\u202eName"
+    ripestat = _ripestat_payload()
+    ripestat["data"]["holder"] = "Example\ud800 Network"
+
+    def fake_urlopen(request: Any, *, timeout: float) -> _JsonResponse:
+        del timeout
+        return _JsonResponse(rdap if "rdap.org" in request.full_url else ripestat)
+
+    result = NetworkEnricher(
+        tmp_path,
+        external_lookup_enabled=True,
+        max_retries=0,
+        urlopen=fake_urlopen,
+        now=lambda: FIXED_NOW,
+    ).enrich("8.8.8.8")
+
+    assert result.rdap_name == "Safe Name"
+    assert result.holder == "Example Network"
+    assert all(
+        not unicodedata.category(character).startswith("C")
+        for value in (result.rdap_name, result.holder)
+        for character in value or ""
+    )
 
 
 @pytest.mark.parametrize(
@@ -297,6 +337,7 @@ def test_store_cache_invokes_pruning_after_atomic_write(
         "rdap",
         "https://rdap.org/ip/8.8.8.8",
         "https://rdap.db.ripe.net/ip/8.8.8.8",
+        ("https://rdap.db.ripe.net/ip/8.8.8.8",),
         "2026-10-20T12:00:00Z",
         {"rdap_name": "Example"},
     )
@@ -429,6 +470,31 @@ def test_unrelated_source_networks_are_rejected(tmp_path: Path) -> None:
     assert "umfasst die abgefragte IP nicht" in (result.error or "")
 
 
+def test_rdap_without_verifiable_range_is_not_attributed_to_ip(tmp_path: Path) -> None:
+    rdap = _rdap_payload()
+    rdap.pop("startAddress")
+    rdap.pop("endAddress")
+
+    def fake_urlopen(request: Any, *, timeout: float) -> _JsonResponse:
+        del timeout
+        return _JsonResponse(rdap if "rdap.org" in request.full_url else _ripestat_payload())
+
+    result = NetworkEnricher(
+        tmp_path,
+        external_lookup_enabled=True,
+        max_retries=0,
+        urlopen=fake_urlopen,
+        now=lambda: FIXED_NOW,
+    ).enrich("8.8.8.8")
+
+    assert result.rdap_name is None
+    assert result.rdap_handle is None
+    assert result.country is None
+    assert result.abuse_email is None
+    assert result.prefix == "8.8.8.0/24"
+    assert "pruefbaren Netzbereich" in (result.error or "")
+
+
 @pytest.mark.parametrize(
     "value",
     [
@@ -449,6 +515,46 @@ def test_validate_public_ip_rejects_non_global_values(value: str) -> None:
 
 def test_validate_public_ip_normalizes_global_ipv6() -> None:
     assert validate_public_ip("2606:4700:4700:0:0:0:0:1111") == "2606:4700:4700::1111"
+
+
+def test_ipv6_lookup_keeps_ip_binding_and_uses_encoded_start_url(tmp_path: Path) -> None:
+    requests: list[str] = []
+    rdap = {
+        **_rdap_payload(),
+        "startAddress": "2606:4700:4700::",
+        "endAddress": "2606:4700:4700:ffff:ffff:ffff:ffff:ffff",
+    }
+    ripestat = {
+        "data": {
+            "prefix": "2606:4700:4700::/48",
+            "asns": [13335],
+            "holder": "IPv6 Example Network",
+        }
+    }
+
+    def fake_urlopen(request: Any, *, timeout: float) -> _JsonResponse:
+        del timeout
+        requests.append(request.full_url)
+        if "rdap.org" in request.full_url:
+            response = _JsonResponse(rdap)
+            response.geturl = lambda: "https://rdap.arin.net/registry/ip/2606:4700:4700::1111"
+            return response
+        return _JsonResponse(ripestat)
+
+    result = NetworkEnricher(
+        tmp_path,
+        external_lookup_enabled=True,
+        max_retries=0,
+        urlopen=fake_urlopen,
+        now=lambda: FIXED_NOW,
+    ).enrich("2606:4700:4700:0:0:0:0:1111")
+
+    assert result.ip == "2606:4700:4700::1111"
+    assert result.prefix == "2606:4700:4700::/48"
+    assert result.asns == (13335,)
+    assert result.error is None
+    assert requests[0] == "https://rdap.org/ip/2606%3A4700%3A4700%3A%3A1111"
+    assert "https://rdap.arin.net/registry/ip/2606:4700:4700::1111" in result.source_urls
 
 
 def test_vpn_classifier_uses_only_explicit_cidr_or_exact_marker() -> None:
@@ -474,6 +580,15 @@ def test_vpn_classifier_uses_only_explicit_cidr_or_exact_marker() -> None:
     assert substring.status == "unknown"
     assert substring.provider is None
     assert "keine Aussage" in (substring.reason or "")
+
+
+def test_vpn_classifier_supports_explicit_ipv6_ranges() -> None:
+    result = VpnClassifier(vpn_ranges={"Configured IPv6 VPN": ("2606:4700:4700::/48",)}).classify(
+        "2606:4700:4700::1111"
+    )
+
+    assert result.status == "known_vpn"
+    assert result.provider == "Configured IPv6 VPN"
 
 
 def test_vpn_classifier_accepts_enrichment_model() -> None:

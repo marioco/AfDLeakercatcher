@@ -46,6 +46,8 @@ EVIDENCE_LIMITATIONS = (
     "Die lokalen SHA-256-Hashes und die lokale Hash-Kette unterstützen nur "
     "die Integritätsprüfung der lokalen Aufzeichnung; sie sind keine digitale "
     "Signatur und kein vertrauenswürdiger externer Zeitstempel.",
+    "Die Hash-Kette bestätigt nicht die sachliche Richtigkeit der vor ihrer "
+    "Berechnung gespeicherten Angaben.",
     "Der SHA-256-Wert der DHT-Antwort ist nur ein lokal berechneter "
     "Fingerabdruck. Das Rohpaket wird datensparsam nicht gespeichert; der Wert "
     "ist deshalb später nicht unabhängig reproduzierbar oder extern bestätigt.",
@@ -79,10 +81,18 @@ CSV_FIELDNAMES = (
     "vpn_begruendung",
     "vpn_quellen",
     "angefragte_bzw_weitergeleitete_quellen",
+    "netzangaben_zusammengestellt_utc",
     "netzregistrierung_quellen_abruf_utc",
     "netzregistrierung_cache_quellen",
     "netzregistrierungs_fehler",
     "aussagegrenze",
+)
+
+VPN_CSV_FIELDNAMES = (
+    "ip",
+    "vpn_anbieter",
+    "vpn_begruendung",
+    "vpn_quellen",
 )
 
 
@@ -126,7 +136,12 @@ def safe_ip_filename(ip: str) -> str:
         parsed = ipaddress.ip_address(ip)
     except ValueError as exc:
         raise ValueError(f"Ungueltige IP-Adresse fuer Bericht: {ip!r}") from exc
-    safe_address = re.sub(r"[^a-z0-9]+", "_", parsed.compressed.lower()).strip("_")
+    if parsed.version == 6:
+        # Die ausgeschriebene Form verhindert Kollisionen, die beim blossen
+        # Ersetzen von ':' und '::' durch denselben Trenner entstehen koennten.
+        safe_address = parsed.exploded.lower().replace(":", "_")
+    else:
+        safe_address = parsed.compressed.replace(".", "_")
     return f"ipv{parsed.version}_{safe_address}"
 
 
@@ -140,10 +155,10 @@ def generate_reports(
     """Erzeugt den vollstaendigen Berichtssatz und gibt absolute Pfade zurueck.
 
     Ausschliesslich bestaetigte Eintraege aus ``result.records`` werden
-    ausgewertet. Bekannte VPN-Endpunkte erscheinen nur in der Gesamt- und
-    VPN-Liste; fuer sie werden weder Einzelhinweise noch E-Mail-Entwuerfe
-    erzeugt. Das SHA-256-Manifest wird zuletzt erstellt und hasht alle anderen
-    erzeugten Dateien.
+    ausgewertet. Bekannte VPN-Endpunkte erscheinen ausschliesslich in einer
+    datensparsamen VPN-Liste; fuer sie werden weder Einzelhinweise noch
+    E-Mail-Entwuerfe erzeugt. Das SHA-256-Manifest wird zuletzt erstellt und
+    hasht alle anderen erzeugten Dateien.
     """
 
     _validate_report_config(config)
@@ -182,11 +197,11 @@ def generate_reports(
         generated_files.append(summary_path)
 
         csv_path = staging_dir / f"{run_slug}_beobachtungen.csv"
-        _write_csv(csv_path, aggregates)
+        _write_csv(csv_path, reportable)
         generated_files.append(csv_path)
 
         vpn_csv_path = staging_dir / f"{run_slug}_vpn_liste.csv"
-        _write_csv(vpn_csv_path, vpn_only)
+        _write_vpn_csv(vpn_csv_path, vpn_only)
         generated_files.append(vpn_csv_path)
 
         vpn_pdf_path = staging_dir / f"{run_slug}_vpn_liste.pdf"
@@ -371,8 +386,8 @@ def _normalise_utc_timestamp(value: str) -> str:
         parsed = datetime.fromisoformat(candidate)
     except ValueError as exc:
         raise ValueError(f"Ungueltiger ISO-8601-Zeitpunkt: {value!r}") from exc
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"Zeitpunkt benoetigt einen eindeutigen UTC-Bezug: {value!r}")
     parsed = parsed.astimezone(UTC)
     timespec = "microseconds" if parsed.microsecond else "seconds"
     return parsed.isoformat(timespec=timespec).replace("+00:00", "Z")
@@ -387,12 +402,21 @@ def _publish_staged_files(files: Iterable[Path], output_dir: Path) -> list[Path]
     final_paths: list[Path] = []
     for source in files:
         target = output_dir / source.name
-        if os.name != "nt":
-            source.chmod(0o600)
+        _set_private_mode(source, 0o600)
         os.replace(source, target)
-        target.chmod(0o600)
+        _set_private_mode(target, 0o600)
         final_paths.append(target)
     return final_paths
+
+
+def _set_private_mode(path: Path, mode: int) -> None:
+    """Erzwinge POSIX-Rechte; unter Windows bleibt die geerbte Benutzer-ACL massgeblich."""
+
+    try:
+        path.chmod(mode)
+    except OSError:
+        if os.name != "nt":
+            raise
 
 
 def _styles(toolkit: SimpleNamespace) -> SimpleNamespace:
@@ -547,10 +571,14 @@ def _write_summary_pdf(
             styles["BodyText"],
             toolkit,
         ),
-        _paragraph("Übersicht nach IP-Adresse", styles["Heading1"], toolkit),
+        _paragraph(
+            "Übersicht der Einzelhinweise (ohne VPN-Liste)",
+            styles["Heading1"],
+            toolkit,
+        ),
     ]
 
-    if aggregates:
+    if reportable:
         table_rows: list[list[Any]] = [
             [
                 _paragraph("IP-Adresse", styles["SmallReportText"], toolkit),
@@ -560,7 +588,7 @@ def _write_summary_pdf(
                 _paragraph("Zeitraum UTC", styles["SmallReportText"], toolkit),
             ]
         ]
-        for aggregate in aggregates:
+        for aggregate in reportable:
             row = _aggregate_row(aggregate)
             table_rows.append(
                 [
@@ -590,14 +618,16 @@ def _write_summary_pdf(
     else:
         story.append(
             _paragraph(
-                "In diesem Lauf lagen keine bestätigten Evidenzdatensätze vor.",
+                "In diesem Lauf lagen keine bestätigten Nicht-VPN-Evidenzdatensätze "
+                "für Einzelhinweise vor. Bekannte VPN-Endpunkte stehen ausschließlich "
+                "in der gesonderten VPN-Liste.",
                 styles["BodyText"],
                 toolkit,
             )
         )
 
     source_notes = _source_note_lines(
-        record for aggregate in aggregates for record in aggregate.records
+        record for aggregate in reportable for record in aggregate.records
     )
     if source_notes:
         story.extend(
@@ -748,11 +778,18 @@ def _write_notice_pdf(
                 ),
                 ("RDAP-Name", row["rdap_namen"]),
                 ("RDAP-Handle", row["rdap_handles"]),
-                ("Land", row["laender"]),
+                (
+                    "Registrierungsland des Netzes (keine Standortbestimmung)",
+                    row["laender"],
+                ),
                 ("Öffentlicher Abuse-Kontakt", row["abuse_kontakte"]),
                 (
                     "Angefragte bzw. weitergeleitete Quellen",
                     row["angefragte_bzw_weitergeleitete_quellen"],
+                ),
+                (
+                    "Netzangaben zusammengestellt (UTC)",
+                    row["netzangaben_zusammengestellt_utc"],
                 ),
                 (
                     "Quellenspezifischer Abrufzeitpunkt (UTC)",
@@ -885,8 +922,6 @@ def _write_vpn_pdf(
             [
                 _paragraph("IP-Adresse", styles["SmallReportText"], toolkit),
                 _paragraph("Anbieter", styles["SmallReportText"], toolkit),
-                _paragraph("Ports", styles["SmallReportText"], toolkit),
-                _paragraph("Infohashes", styles["SmallReportText"], toolkit),
                 _paragraph("Grund / Quelle", styles["SmallReportText"], toolkit),
             ]
         ]
@@ -904,12 +939,10 @@ def _write_vpn_pdf(
                 [
                     _paragraph(aggregate.ip, styles["SmallReportText"], toolkit),
                     _paragraph(row["vpn_anbieter"], styles["SmallReportText"], toolkit),
-                    _paragraph(row["ports"], styles["SmallReportText"], toolkit),
-                    _paragraph(row["infohashes"], styles["SmallReportText"], toolkit),
                     _paragraph(reason_source, styles["SmallReportText"], toolkit),
                 ]
             )
-        story.append(_data_table(rows, (82, 82, 48, 136, 163), toolkit, repeat_rows=1))
+        story.append(_data_table(rows, (150, 130, 231), toolkit, repeat_rows=1))
     else:
         story.append(
             _paragraph(
@@ -963,7 +996,13 @@ def _key_value_table(
         ]
         for label, value in rows
     ]
-    table = toolkit.Table(rendered_rows, colWidths=(132, 379), hAlign="LEFT")
+    table = toolkit.Table(
+        rendered_rows,
+        colWidths=(132, 379),
+        hAlign="LEFT",
+        splitByRow=1,
+        splitInRow=1,
+    )
     table.setStyle(
         toolkit.TableStyle(
             [
@@ -987,7 +1026,14 @@ def _data_table(
     *,
     repeat_rows: int,
 ) -> Any:
-    table = toolkit.LongTable(rows, colWidths=widths, repeatRows=repeat_rows, hAlign="LEFT")
+    table = toolkit.LongTable(
+        rows,
+        colWidths=widths,
+        repeatRows=repeat_rows,
+        hAlign="LEFT",
+        splitByRow=1,
+        splitInRow=1,
+    )
     table.setStyle(
         toolkit.TableStyle(
             [
@@ -1040,6 +1086,24 @@ def _format_endpoint(ip: str | None, port: int | None) -> str:
             return f"[{ip}]:{port}"
         return f"{ip}:{port}"
     return ip or f"Port {port}"
+
+
+def _vpn_source_text(source: str | None) -> str | None:
+    """Uebersetze interne Klassifikationscodes fuer die Laienausgabe."""
+
+    if source == "configured_cidr":
+        return "lokal konfigurierte VPN-IP-Liste"
+    if source and source.startswith("configured_exact_marker:"):
+        fields = source.partition(":")[2].split(",")
+        labels = {
+            "holder": "Routing-Netzbetreiberangabe",
+            "rdap_name": "RDAP-Netzname",
+        }
+        matched = ", ".join(labels.get(field, field) for field in fields if field)
+        return "lokal konfigurierter exakter VPN-Anbietername" + (
+            f" ({matched})" if matched else ""
+        )
+    return source
 
 
 def _source_note_lines(records: Iterable[EvidenceRecord]) -> tuple[str, ...]:
@@ -1120,9 +1184,12 @@ def _aggregate_row(aggregate: _IpAggregate) -> dict[str, str]:
         "vpn_status": ("bekannter VPN" if aggregate.is_known_vpn else "kein bekannter VPN-Treffer"),
         "vpn_anbieter": values(record.vpn.provider for record in records),
         "vpn_begruendung": values(record.vpn.reason for record in records),
-        "vpn_quellen": values(record.vpn.source for record in records),
+        "vpn_quellen": values(_vpn_source_text(record.vpn.source) for record in records),
         "angefragte_bzw_weitergeleitete_quellen": values(
             source for record in records for source in record.enrichment.source_urls
+        ),
+        "netzangaben_zusammengestellt_utc": values(
+            record.enrichment.enriched_at_utc for record in records
         ),
         "netzregistrierung_quellen_abruf_utc": values(
             f"{source}: {timestamp}"
@@ -1151,6 +1218,24 @@ def _write_csv(path: Path, aggregates: Iterable[_IpAggregate]) -> None:
     for aggregate in aggregates:
         row = _aggregate_row(aggregate)
         writer.writerow({key: _csv_safe(row[key]) for key in CSV_FIELDNAMES})
+    path.write_text(buffer.getvalue(), encoding="utf-8", newline="")
+
+
+def _write_vpn_csv(path: Path, aggregates: Iterable[_IpAggregate]) -> None:
+    """Schreibe fuer bekannte VPNs bewusst nur die separate Minimalliste."""
+
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=VPN_CSV_FIELDNAMES,
+        delimiter=";",
+        lineterminator="\n",
+        quoting=csv.QUOTE_MINIMAL,
+    )
+    writer.writeheader()
+    for aggregate in aggregates:
+        row = _aggregate_row(aggregate)
+        writer.writerow({key: _csv_safe(row[key]) for key in VPN_CSV_FIELDNAMES})
     path.write_text(buffer.getvalue(), encoding="utf-8", newline="")
 
 
@@ -1210,6 +1295,8 @@ def _write_email_draft(
         "\n\nÖffentliche Routing-/Registry-Angaben zum Adressbereich:\n"
         "- Angefragte bzw. weitergeleitete Quellen: "
         f"{row['angefragte_bzw_weitergeleitete_quellen']}\n"
+        "- Netzangaben zusammengestellt (UTC): "
+        f"{row['netzangaben_zusammengestellt_utc']}\n"
         "- Quellenspezifische Abrufzeitpunkte (UTC): "
         f"{row['netzregistrierung_quellen_abruf_utc']}\n"
         f"- Aus lokalem Cache: {row['netzregistrierung_cache_quellen']}\n"

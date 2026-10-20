@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from bittorrent_beobachter.config import (
+    BUNDLED_PRESET_REVISION,
     DEFAULT_TARGETS,
     AppConfig,
     ConfigError,
@@ -73,7 +74,8 @@ def test_legacy_config_receives_presets_only_once() -> None:
 
     migrated = with_bundled_presets(legacy)
 
-    assert migrated.preset_revision == 1
+    assert migrated.preset_revision == BUNDLED_PRESET_REVISION
+    assert migrated.targets[0] == DEFAULT_TARGETS[0]
     assert [target.info_hash_hex for target in migrated.targets] == [
         DEFAULT_TARGETS[0].info_hash_hex,
         DEFAULT_TARGETS[1].info_hash_hex,
@@ -815,8 +817,9 @@ def test_external_enrichment_is_capped_and_rotated(
     ]
     assert len(skipped) == 5
     assert all("Mengenlimit" in (data.error or "") for data in skipped)
-    assert len(result.errors) == 1
-    assert "20" in result.errors[0]
+    assert result.errors == []
+    assert len(result.notices) == 1
+    assert "20" in result.notices[0]
     selections = {monitor._rotated_external_ips(public_ips, f"run-{index}") for index in range(12)}
     assert len(selections) > 1
     assert all(len(selection) == 20 for selection in selections)

@@ -3,9 +3,9 @@
 Die SHA-256-Kette erkennt nachtraegliche Aenderungen, Einfuegungen und
 Umordnungen innerhalb eines vorhandenen Journals. Sie ist keine digitale
 Signatur, kein vertrauenswuerdiger Zeitstempel und kein kryptographischer
-Nachweis der Urheberschaft oder Nichtabstreitbarkeit. Ohne einen separat
-gesicherten letzten Hash kann auch eine Verkuerzung am Dateiende nicht sicher
-erkannt werden.
+Nachweis der Urheberschaft, Nichtabstreitbarkeit oder sachlichen Richtigkeit.
+Ohne einen separat gesicherten letzten Hash kann auch eine Verkuerzung am
+Dateiende nicht sicher erkannt werden.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ MAX_JOURNAL_BYTES = 32 * 1024 * 1024
 INTEGRITY_LIMITATION = (
     "Die SHA-256-Kette macht Aenderungen am vorhandenen Journal sichtbar, "
     "ist aber keine Signatur, kein vertrauenswuerdiger Zeitstempel und kein "
-    "Beweis der Urheberschaft oder Nichtabstreitbarkeit."
+    "Beweis der Urheberschaft, Nichtabstreitbarkeit oder sachlichen Richtigkeit."
 )
 
 _JOURNAL_KEYS = {

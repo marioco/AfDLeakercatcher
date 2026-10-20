@@ -21,7 +21,7 @@ from .models import Target
 
 MAX_CONFIG_BYTES = 256_000
 MAX_CONFIG_TARGETS = 20
-BUNDLED_PRESET_REVISION = 1
+BUNDLED_PRESET_REVISION = 2
 DEFAULT_BOOTSTRAP_NODES = (
     ("router.bittorrent.com", 6881),
     ("router.utorrent.com", 6881),
@@ -109,20 +109,28 @@ def default_app_config() -> AppConfig:
 
 
 def with_bundled_presets(config: AppConfig) -> AppConfig:
-    """Ergänzt Projektvorgaben einmalig und respektiert spätere Löschungen."""
+    """Ergänzt und neutralisiert Projektvorgaben genau einmal je Revision."""
     if config.preset_revision >= BUNDLED_PRESET_REVISION:
         return config
 
-    existing_hashes = {target.info_hash for target in config.targets}
-    missing = tuple(target for target in DEFAULT_TARGETS if target.info_hash not in existing_hashes)
-    if len(config.targets) + len(missing) > MAX_CONFIG_TARGETS:
+    presets_by_hash = {target.info_hash: target for target in DEFAULT_TARGETS}
+    normalized_targets = tuple(
+        presets_by_hash.get(target.info_hash, target) for target in config.targets
+    )
+    existing_hashes = {target.info_hash for target in normalized_targets}
+    missing = (
+        tuple(target for target in DEFAULT_TARGETS if target.info_hash not in existing_hashes)
+        if config.preset_revision == 0
+        else ()
+    )
+    if len(normalized_targets) + len(missing) > MAX_CONFIG_TARGETS:
         raise ConfigError(
             "Die einmalige Voreinstellungs-Aktualisierung überschreitet das "
             f"Ziel-Limit von {MAX_CONFIG_TARGETS}."
         )
     return replace(
         config,
-        targets=(*config.targets, *missing),
+        targets=(*normalized_targets, *missing),
         preset_revision=BUNDLED_PRESET_REVISION,
     )
 
@@ -254,6 +262,26 @@ def _clean_optional_email(value: Any, field: str) -> str:
     if not parsed.username or not parsed.domain:
         raise ConfigError(f"{field} enthält keine vollständige E-Mail-Adresse.")
     return cleaned
+
+
+def validate_reporting_settings(settings: ReportingSettings) -> ReportingSettings:
+    """Validiert Entwurfsangaben, bevor ein Dialog sie übernimmt."""
+
+    if not isinstance(settings, ReportingSettings):
+        raise ConfigError("Entwurfsangaben haben ein ungültiges Format.")
+    if not isinstance(settings.legal_notes, (list, tuple)) or len(settings.legal_notes) > 20:
+        raise ConfigError("legal_notes muss eine Liste mit höchstens 20 Texten sein.")
+    return ReportingSettings(
+        reporter_name=_clean_optional_text(settings.reporter_name, "reporter_name", 120),
+        reporter_email=_clean_optional_email(settings.reporter_email, "reporter_email"),
+        police_recipient=_clean_optional_email(
+            settings.police_recipient,
+            "police_recipient",
+        ),
+        legal_notes=tuple(
+            _clean_optional_text(note, "legal_notes", 500) for note in settings.legal_notes
+        ),
+    )
 
 
 def config_from_dict(raw: dict[str, Any]) -> AppConfig:
@@ -414,17 +442,13 @@ def config_from_dict(raw: dict[str, Any]) -> AppConfig:
     legal_notes_raw = reporting_raw.get("legal_notes", [])
     if not isinstance(legal_notes_raw, list) or len(legal_notes_raw) > 20:
         raise ConfigError("reporting.legal_notes muss eine Liste mit höchstens 20 Texten sein.")
-    reporting = ReportingSettings(
-        reporter_name=_clean_optional_text(
-            reporting_raw.get("reporter_name"), "reporter_name", 120
-        ),
-        reporter_email=_clean_optional_email(reporting_raw.get("reporter_email"), "reporter_email"),
-        police_recipient=_clean_optional_email(
-            reporting_raw.get("police_recipient"), "police_recipient"
-        ),
-        legal_notes=tuple(
-            _clean_optional_text(note, "legal_notes", 500) for note in legal_notes_raw
-        ),
+    reporting = validate_reporting_settings(
+        ReportingSettings(
+            reporter_name=reporting_raw.get("reporter_name"),
+            reporter_email=reporting_raw.get("reporter_email"),
+            police_recipient=reporting_raw.get("police_recipient"),
+            legal_notes=tuple(legal_notes_raw),
+        )
     )
     return AppConfig(
         targets=tuple(targets),

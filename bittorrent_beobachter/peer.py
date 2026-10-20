@@ -127,9 +127,9 @@ class PeerVerifier:
 
         loop = asyncio.get_running_loop()
         peer_socket = socket.socket(family, socket.SOCK_STREAM)
-        peer_socket.setblocking(False)
-        response = bytearray()
         try:
+            peer_socket.setblocking(False)
+            response = bytearray()
             await loop.sock_connect(peer_socket, sockaddr)
             state.local_ip, state.local_port = _normalize_local_address(peer_socket.getsockname())
             await loop.sock_sendall(peer_socket, outgoing_handshake)

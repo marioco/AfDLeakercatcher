@@ -15,10 +15,10 @@ import os
 import secrets
 import sys
 import tempfile
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager, suppress
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import BinaryIO
@@ -26,6 +26,10 @@ from typing import BinaryIO
 from . import APP_NAME, VERSION
 from .config import AppConfig, config_from_dict, config_to_dict
 from .dht import (
+    BOOTSTRAP_ISSUE_DNS,
+    BOOTSTRAP_ISSUE_NO_GLOBAL_ADDRESS,
+    BOOTSTRAP_ISSUE_RESOLVER,
+    BOOTSTRAP_ISSUE_TIMEOUT,
     MAX_BOOTSTRAP_RESULTS,
     MAX_OVERALL_TIMEOUT_SECONDS,
     MAX_RESPONSE_BYTES,
@@ -50,6 +54,7 @@ from .reports import ReportConfig, generate_reports
 ProgressCallback = Callable[[str], None]
 NETWORK_PHASE_TIMEOUT_SECONDS = 600.0
 MAX_EXTERNAL_ENRICHMENTS_PER_RUN = 20
+MAX_CANDIDATES_PER_RUN = 10_000
 MAX_REPORT_STORAGE_BYTES = 1_000_000_000
 REPORT_RUN_RESERVE_BYTES = 100_000_000
 MAX_EVIDENCE_STORAGE_BYTES = 32 * 1024 * 1024
@@ -283,7 +288,12 @@ def _fair_handshake_candidates(
     """Waehlt reihum pro Ziel, damit ein grosser Schwarm andere nicht verdraengt."""
 
     grouped: defaultdict[str, list[PeerCandidate]] = defaultdict(list)
+    seen: set[tuple[str, str, int]] = set()
     for candidate in candidates:
+        key = (candidate.info_hash_hex, candidate.ip, candidate.port)
+        if key in seen:
+            continue
+        seen.add(key)
         grouped[candidate.info_hash_hex].append(candidate)
 
     target_hashes = [target.info_hash_hex for target in targets]
@@ -310,21 +320,66 @@ async def _discover_candidates(
     config: AppConfig,
     progress: ProgressCallback,
 ) -> tuple[list[PeerCandidate], list[str]]:
+    if not config.targets:
+        raise MonitorError("Mindestens ein Ziel ist für die DHT-Suche erforderlich.")
+
     dht_config = _dht_config(config)
+    per_target_candidate_limit = min(
+        dht_config.max_candidates,
+        max(1, MAX_CANDIDATES_PER_RUN // len(config.targets)),
+    )
+    target_dht_config = (
+        dht_config
+        if per_target_candidate_limit == dht_config.max_candidates
+        else replace(dht_config, max_candidates=per_target_candidate_limit)
+    )
+    notices: list[str] = []
+    if per_target_candidate_limit < dht_config.max_candidates:
+        notice = (
+            "Das laufweite Sicherheitslimit begrenzt die DHT-Kandidaten auf "
+            f"{per_target_candidate_limit} pro Ziel."
+        )
+        notices.append(notice)
+        progress(notice)
+
+    bootstrap_issues: Counter[str] = Counter()
+
+    def record_bootstrap_issue(category: str) -> None:
+        bootstrap_issues[category] += 1
+
     resolved = await resolve_bootstrap_nodes(
         config.dht.bootstrap_nodes,
         timeout=min(config.dht.timeout_seconds, 5.0),
         max_results=min(config.dht.max_nodes, MAX_BOOTSTRAP_RESULTS),
+        issue_hook=record_bootstrap_issue,
     )
     if not resolved:
         raise MonitorError("Kein globaler DHT-Bootstrap-Knoten konnte aufgeloest werden.")
 
+    if bootstrap_issues:
+        issue_labels = (
+            (BOOTSTRAP_ISSUE_DNS, "DNS-Fehler"),
+            (BOOTSTRAP_ISSUE_TIMEOUT, "Zeitlimit"),
+            (BOOTSTRAP_ISSUE_NO_GLOBAL_ADDRESS, "keine globale Adresse"),
+            (BOOTSTRAP_ISSUE_RESOLVER, "Resolver-Fehler"),
+        )
+        details = ", ".join(
+            f"{bootstrap_issues[category]} {label}"
+            for category, label in issue_labels
+            if bootstrap_issues[category]
+        )
+        notice = (
+            f"Bootstrap-Auflösung: {len(resolved)} globale Endpunkte nutzbar; "
+            f"{sum(bootstrap_issues.values())} Teilproblem(e) ({details})."
+        )
+        notices.append(notice)
+        progress(notice)
+
     candidates: list[PeerCandidate] = []
-    notices: list[str] = []
     responsive_targets = 0
     for index, target in enumerate(config.targets, start=1):
         progress(f"DHT-Suche {index}/{len(config.targets)}: {target.label}")
-        crawler = DHTCrawler(resolved, config=dht_config)
+        crawler = DHTCrawler(resolved, config=target_dht_config)
         discovered = await crawler.discover(target)
         if crawler.queries_completed == 0:
             notice = (
@@ -337,16 +392,21 @@ async def _discover_candidates(
 
         responsive_targets += 1
         crawler_errors = tuple(getattr(crawler, "errors", ()))
-        if crawler_errors:
+        crawler_issue_count = getattr(crawler, "issue_count", len(crawler_errors))
+        if type(crawler_issue_count) is not int or crawler_issue_count < 0:
+            crawler_issue_count = len(crawler_errors)
+        if crawler_issue_count:
             notice = (
                 f"DHT-Suche fuer {target.label}: {crawler.queries_completed} "
-                f"verwertbare Antwort(en); {len(crawler_errors)} technische "
+                f"verwertbare Antwort(en); {crawler_issue_count} technische "
                 "Teilmeldung(en) wurden protokolliert."
             )
             notices.append(notice)
             progress(notice)
         if any(candidate.info_hash_hex != target.info_hash_hex for candidate in discovered):
             raise MonitorError("Die DHT-Suche lieferte einen Kandidaten fuer ein falsches Ziel.")
+        if len(discovered) > target_dht_config.max_candidates:
+            raise MonitorError("Die DHT-Suche überschritt das feste Kandidatenlimit eines Ziels.")
         candidates.extend(discovered)
         progress(
             f"DHT-Suche {index}/{len(config.targets)} abgeschlossen: {len(discovered)} Kandidat(en)"
@@ -435,15 +495,36 @@ async def _bounded_network_phase(
     config: AppConfig,
     progress: ProgressCallback,
 ) -> tuple[list[PeerCandidate], list[HandshakeResult], list[str]]:
+    network_task = asyncio.create_task(_network_phase(config, progress))
     try:
-        return await asyncio.wait_for(
-            _network_phase(config, progress),
+        done, _pending = await asyncio.wait(
+            (network_task,),
             timeout=NETWORK_PHASE_TIMEOUT_SECONDS,
         )
-    except TimeoutError as exc:
+    except BaseException:
+        network_task.cancel()
+        await asyncio.gather(network_task, return_exceptions=True)
+        raise
+
+    if network_task not in done:
+        network_task.cancel()
+        await asyncio.gather(network_task, return_exceptions=True)
         raise MonitorError(
             "Die gesamte DHT- und Handshake-Netzwerkphase hat die harte "
             f"Zeitgrenze von {int(NETWORK_PHASE_TIMEOUT_SECONDS)} Sekunden erreicht."
+        )
+    if network_task.cancelled():
+        raise MonitorError("Die DHT- und Handshake-Netzwerkphase wurde unerwartet abgebrochen.")
+
+    try:
+        return network_task.result()
+    except TimeoutError as exc:
+        raise MonitorError(
+            "Eine einzelne Operation der DHT- oder Handshake-Phase überschritt ihr Zeitlimit."
+        ) from exc
+    except OSError as exc:
+        raise MonitorError(
+            "Die DHT- oder Handshake-Phase scheiterte wegen eines Netzwerkfehlers."
         ) from exc
 
 
@@ -490,7 +571,7 @@ def _enrich_confirmed_handshakes(
     )
     selected_external_ips = _rotated_external_ips(external_candidates, result.run_id)
     if config.enrichment.enabled and len(external_candidates) > MAX_EXTERNAL_ENRICHMENTS_PER_RUN:
-        result.errors.append(
+        result.notices.append(
             "Externe Netzauskunft wurde aus Datenschutz- und Laufzeitgründen auf "
             f"{MAX_EXTERNAL_ENRICHMENTS_PER_RUN} bestätigte IP-Adressen begrenzt; "
             f"{len(external_candidates) - MAX_EXTERNAL_ENRICHMENTS_PER_RUN} weitere "
@@ -548,12 +629,12 @@ def _enrich_confirmed_handshakes(
         except (EnrichmentError, OSError) as exc:
             error_text = _safe_error(exc)
             network_data = _empty_enrichment(ip, reason=error_text)
-            result.errors.append(
+            result.notices.append(
                 f"Netzauskunft für eine bestätigte IP fehlgeschlagen ({type(exc).__name__})."
             )
         else:
             if network_data.error:
-                result.errors.append(
+                result.notices.append(
                     "Netzauskunft für eine bestätigte IP war unvollständig; "
                     "Details stehen im privaten Bericht."
                 )

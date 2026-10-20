@@ -32,6 +32,7 @@ from .config import (
     load_config,
     parse_magnet,
     save_config,
+    validate_reporting_settings,
     with_bundled_presets,
 )
 from .desktop import open_directory
@@ -85,12 +86,19 @@ class SettingsDialog(Toplevel):
         self.focus_set()
 
     def _save(self) -> None:
-        self.result = replace(
-            self.settings,
-            reporter_name=self.name.get().strip(),
-            reporter_email=self.email.get().strip(),
-            police_recipient=self.recipient.get().strip(),
-        )
+        try:
+            self.result = validate_reporting_settings(
+                replace(
+                    self.settings,
+                    reporter_name=self.name.get().strip(),
+                    reporter_email=self.email.get().strip(),
+                    police_recipient=self.recipient.get().strip(),
+                )
+            )
+        except ConfigError as exc:
+            self.result = None
+            messagebox.showerror("Angaben prüfen", str(exc), parent=self)
+            return
         self.destroy()
 
 
@@ -131,8 +139,16 @@ class ObserverApp:
         try:
             config = load_config(self.config_path)
         except ConfigError as exc:
-            messagebox.showerror("Konfiguration fehlerhaft", str(exc))
-            return AppConfig(targets=())
+            messagebox.showerror(
+                "Gespeicherte Einstellungen unlesbar",
+                (
+                    f"Die gespeicherten Einstellungen konnten nicht geladen werden:\n\n{exc}\n\n"
+                    "Das Programm verwendet für dieses Fenster sichere Voreinstellungen. "
+                    "Es wurde kein Prüflauf gestartet."
+                ),
+                parent=self.root,
+            )
+            return default_app_config()
 
         try:
             migrated = with_bundled_presets(config)
@@ -252,7 +268,7 @@ class ObserverApp:
         self.scan_button.pack(side=LEFT)
         self.open_button = ttk.Button(
             action_bar,
-            text="Ergebnisordner öffnen",
+            text="Letzten Ergebnisordner öffnen",
             command=self._open_output,
             state="disabled",
         )
@@ -366,7 +382,7 @@ class ObserverApp:
         target = self.config.targets[index]
         if not messagebox.askyesno(
             "Ziel entfernen",
-            f"„{target.label}“ wirklich aus der Überwachung entfernen?",
+            f"„{target.label}“ wirklich aus der Liste entfernen?",
             parent=self.root,
         ):
             return
@@ -491,7 +507,8 @@ class ObserverApp:
             except queue.Empty:
                 break
             if event == "progress":
-                self.status_text.set(str(payload))
+                if not self.close_requested:
+                    self.status_text.set(str(payload))
             elif event == "error":
                 self._finish_running_state()
                 if not self.close_requested:
@@ -516,6 +533,8 @@ class ObserverApp:
         self.scan_button.configure(state="normal")
         for control in self.config_controls:
             control.configure(state="normal")
+        output_available = self.latest_output_dir is not None and self.latest_output_dir.is_dir()
+        self.open_button.configure(state="normal" if output_available else "disabled")
 
     def _request_close(self) -> None:
         if not self.running:

@@ -12,6 +12,7 @@ import pytest
 
 import bittorrent_beobachter.evidence as evidence_module
 from bittorrent_beobachter.evidence import (
+    INTEGRITY_LIMITATION,
     EvidenceJournal,
     EvidenceJournalError,
     _windows_region_lock,
@@ -54,6 +55,7 @@ def _confirmed_handshake(ip: str = "8.8.8.8") -> HandshakeResult:
 
 
 def test_append_creates_canonical_chained_jsonl(tmp_path: Path) -> None:
+    assert "sachlichen Richtigkeit" in INTEGRITY_LIMITATION
     path = tmp_path / "evidence.jsonl"
     journal = EvidenceJournal(path)
 

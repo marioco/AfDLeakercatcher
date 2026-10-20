@@ -16,6 +16,7 @@ import math
 import os
 import stat
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -38,7 +39,7 @@ MAX_RESPONSE_BYTES = 2_000_000
 MAX_CACHE_BYTES = 100_000
 MAX_CACHE_FILES = 512
 MAX_CACHE_TOTAL_BYTES = 32 * 1024 * 1024
-CACHE_FORMAT_VERSION = 2
+CACHE_FORMAT_VERSION = 3
 MAX_REDIRECTS = 5
 RDAP_REDIRECT_PATHS = {
     "rdap.org": ("/ip/",),
@@ -52,6 +53,7 @@ RIPESTAT_HOST = "stat.ripe.net"
 RIPESTAT_PATH = "/data/prefix-overview/data.json"
 _REQUEST_SOURCE_ATTRIBUTE = "_bittorrent_beobachter_source"
 _REQUEST_IP_ATTRIBUTE = "_bittorrent_beobachter_ip"
+_REQUEST_REDIRECT_URLS_ATTRIBUTE = "_bittorrent_beobachter_redirect_urls"
 EXTERNAL_LOOKUP_DISCLOSURE = (
     "Eine Aktivierung uebertraegt jede abgefragte Peer-IP an rdap.org. "
     "rdap.org leitet die Anfrage an das fuer die IP zustaendige autoritative "
@@ -181,7 +183,13 @@ class _RestrictedRedirectHandler(urllib.request.HTTPRedirectHandler):
     ) -> urllib.request.Request | None:
         source = getattr(request, _REQUEST_SOURCE_ATTRIBUTE, None)
         expected_ip = getattr(request, _REQUEST_IP_ATTRIBUTE, None)
-        if not isinstance(source, str) or not isinstance(expected_ip, str):
+        redirect_urls = getattr(request, _REQUEST_REDIRECT_URLS_ATTRIBUTE, None)
+        if (
+            not isinstance(source, str)
+            or not isinstance(expected_ip, str)
+            or not isinstance(redirect_urls, list)
+            or not all(isinstance(item, str) for item in redirect_urls)
+        ):
             raise RedirectPolicyError("Weiterleitung besitzt keinen geprueften Ausgangspunkt")
         try:
             absolute_url = urllib.parse.urljoin(request.full_url, new_url)
@@ -190,6 +198,7 @@ class _RestrictedRedirectHandler(urllib.request.HTTPRedirectHandler):
         redirected_ip = _validate_service_url(absolute_url, source, initial=False)
         if redirected_ip != expected_ip:
             raise RedirectPolicyError("Weiterleitungsziel veraendert die abgefragte Ressourcen-IP")
+        redirect_urls.append(absolute_url)
         redirected = super().redirect_request(
             request,
             file_pointer,
@@ -201,6 +210,7 @@ class _RestrictedRedirectHandler(urllib.request.HTTPRedirectHandler):
         if redirected is not None:
             setattr(redirected, _REQUEST_SOURCE_ATTRIBUTE, source)
             setattr(redirected, _REQUEST_IP_ATTRIBUTE, expected_ip)
+            setattr(redirected, _REQUEST_REDIRECT_URLS_ATTRIBUTE, redirect_urls)
         return redirected
 
 
@@ -223,6 +233,7 @@ class _VpnRangeRule:
 class _SourceResult:
     data: dict[str, Any]
     final_url: str
+    redirect_urls: tuple[str, ...]
     fetched_at_utc: str
     from_cache: bool
 
@@ -255,7 +266,13 @@ def validate_public_ip(ip: str) -> str:
 def _clean_text(value: Any, *, maximum_length: int = 512) -> str | None:
     if not isinstance(value, str):
         return None
-    cleaned = " ".join(value.split()).strip()
+    # Externe Registrytexte duerfen weder PDF/XML-Steuerzeichen noch
+    # unsichtbare Schreibrichtungswechsel in lokale Berichte einschleusen.
+    printable = "".join(
+        character if not unicodedata.category(character).startswith("C") else " "
+        for character in value
+    )
+    cleaned = " ".join(printable.split()).strip()
     if not cleaned:
         return None
     return cleaned[:maximum_length]
@@ -324,9 +341,11 @@ def _project_rdap(payload: Any, requested_ip: str | None = None) -> dict[str, An
         raise EnrichmentError("RDAP-Antwort ist kein JSON-Objekt")
     start_value = payload.get("startAddress")
     end_value = payload.get("endAddress")
-    if requested_ip is not None and (start_value is not None or end_value is not None):
+    if requested_ip is not None:
         if not isinstance(start_value, str) or not isinstance(end_value, str):
-            raise EnrichmentError("RDAP-Netzbereich ist unvollstaendig")
+            raise EnrichmentError(
+                "RDAP-Antwort enthaelt keinen vollstaendigen, pruefbaren Netzbereich"
+            )
         try:
             requested = ipaddress.ip_address(requested_ip)
             start_address = ipaddress.ip_address(start_value)
@@ -587,6 +606,8 @@ class NetworkEnricher:
                 or cached.get("source") != source
                 or cached.get("request_url") != url
                 or not isinstance(cached.get("final_url"), str)
+                or not isinstance(cached.get("redirect_urls"), list)
+                or not all(isinstance(item, str) for item in cached["redirect_urls"])
             ):
                 return None
             fetched_at_raw = cached.get("fetched_at_utc")
@@ -601,9 +622,18 @@ class NetworkEnricher:
             final_ip = _validate_service_url(final_url, source, initial=False)
             if final_ip != initial_ip:
                 return None
+            redirect_urls = tuple(dict.fromkeys(cached["redirect_urls"]))
+            for redirect_url in redirect_urls:
+                if _validate_service_url(redirect_url, source, initial=False) != initial_ip:
+                    return None
+            if redirect_urls and redirect_urls[-1] != final_url:
+                return None
+            if final_url != url and not redirect_urls:
+                return None
             return _SourceResult(
                 data=normalizer(cached.get("data")),
                 final_url=final_url,
+                redirect_urls=redirect_urls,
                 fetched_at_utc=_utc_text(fetched_at),
                 from_cache=True,
             )
@@ -615,6 +645,7 @@ class NetworkEnricher:
         source: str,
         request_url: str,
         final_url: str,
+        redirect_urls: tuple[str, ...],
         fetched_at_utc: str,
         data: Mapping[str, Any],
     ) -> None:
@@ -624,6 +655,7 @@ class NetworkEnricher:
             "source": source,
             "request_url": request_url,
             "final_url": final_url,
+            "redirect_urls": list(redirect_urls),
             "fetched_at_utc": fetched_at_utc,
             "data": data,
         }
@@ -651,7 +683,7 @@ class NetworkEnricher:
             return None
         return min(max(seconds, 0.0), 10.0)
 
-    def _request_json(self, source: str, url: str) -> tuple[Any, str]:
+    def _request_json(self, source: str, url: str) -> tuple[Any, str, tuple[str, ...]]:
         requested_ip = _validate_service_url(url, source, initial=True)
         last_error: BaseException | None = None
         attempts = self.max_retries + 1
@@ -663,6 +695,8 @@ class NetworkEnricher:
             )
             setattr(request, _REQUEST_SOURCE_ATTRIBUTE, source)
             setattr(request, _REQUEST_IP_ATTRIBUTE, requested_ip)
+            redirect_urls: list[str] = []
+            setattr(request, _REQUEST_REDIRECT_URLS_ATTRIBUTE, redirect_urls)
             retry_delay: float | None = None
             try:
                 with self._urlopen(request, timeout=self.timeout_seconds) as response:
@@ -689,7 +723,15 @@ class NetworkEnricher:
                         raise RedirectPolicyError(
                             "HTTP-Endziel veraendert die abgefragte Ressourcen-IP"
                         )
-                    return json.loads(raw.decode("utf-8")), final_url
+                    if final_url != url and final_url not in redirect_urls:
+                        # Auch ein injizierter/testbarer HTTP-Client ohne unseren
+                        # Redirect-Handler muss sein abweichendes Endziel offenlegen.
+                        redirect_urls.append(final_url)
+                    return (
+                        json.loads(raw.decode("utf-8")),
+                        final_url,
+                        tuple(dict.fromkeys(redirect_urls)),
+                    )
             except RedirectPolicyError:
                 raise
             except urllib.error.HTTPError as exc:
@@ -731,13 +773,21 @@ class NetworkEnricher:
         cached = self._load_cache(source, url, cache_normalizer)
         if cached is not None:
             return cached
-        payload, final_url = self._request_json(source, url)
+        payload, final_url, redirect_urls = self._request_json(source, url)
         projected = projector(payload)
         fetched_at_utc = _utc_text(self._current_time())
-        self._store_cache(source, url, final_url, fetched_at_utc, projected)
+        self._store_cache(
+            source,
+            url,
+            final_url,
+            redirect_urls,
+            fetched_at_utc,
+            projected,
+        )
         return _SourceResult(
             data=projected,
             final_url=final_url,
+            redirect_urls=redirect_urls,
             fetched_at_utc=fetched_at_utc,
             from_cache=False,
         )
@@ -784,22 +834,28 @@ class NetworkEnricher:
             errors.append("RIPEstat: Das gelieferte Praefix umfasst die abgefragte IP nicht")
             ripestat = {}
 
-        fetched_times = [result.fetched_at_utc for _, result in source_results]
-        rdap_final_urls = [
-            result.final_url for source, result in source_results if source == "rdap"
+        rdap_redirect_urls = [
+            url
+            for source, result in source_results
+            if source == "rdap"
+            for url in result.redirect_urls
         ]
-        ripestat_final_urls = [
-            result.final_url for source, result in source_results if source != "rdap"
+        ripestat_redirect_urls = [
+            url
+            for source, result in source_results
+            if source != "rdap"
+            for url in result.redirect_urls
         ]
         source_urls = tuple(
-            dict.fromkeys([rdap_url, *rdap_final_urls, ripestat_url, *ripestat_final_urls])
+            dict.fromkeys([rdap_url, *rdap_redirect_urls, ripestat_url, *ripestat_redirect_urls])
         )
+        assembled_at_utc = _utc_text(self._current_time())
 
         return NetworkEnrichment(
             ip=normalized_ip,
-            enriched_at_utc=min(fetched_times)
-            if fetched_times
-            else _utc_text(self._current_time()),
+            # Dies ist der Zeitpunkt der lokalen Zusammenstellung. Die moeglicherweise
+            # aelteren Abrufzeitpunkte der einzelnen Quellen stehen separat darunter.
+            enriched_at_utc=assembled_at_utc,
             prefix=ripestat.get("prefix"),
             asns=tuple(ripestat.get("asns", ())),
             holder=ripestat.get("holder"),

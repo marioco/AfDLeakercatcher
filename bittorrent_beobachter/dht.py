@@ -19,6 +19,7 @@ from .models import PeerCandidate, Target
 
 Endpoint = tuple[str, int]
 QueryHook = Callable[[Endpoint, bytes, bytes], Awaitable["DHTResponse"]]
+BootstrapIssueHook = Callable[[str], None]
 
 MAX_TIMEOUT_SECONDS = 30.0
 MAX_OVERALL_TIMEOUT_SECONDS = 300.0
@@ -30,6 +31,23 @@ MAX_RESPONSE_BYTES = 65_507
 MAX_BOOTSTRAP_NODES = 16
 MAX_BOOTSTRAP_RESULTS = 64
 
+BOOTSTRAP_ISSUE_DNS = "dns"
+BOOTSTRAP_ISSUE_NO_GLOBAL_ADDRESS = "no_global_address"
+BOOTSTRAP_ISSUE_RESOLVER = "resolver"
+BOOTSTRAP_ISSUE_TIMEOUT = "timeout"
+
+DHT_ISSUE_DEADLINE = "deadline"
+DHT_ISSUE_NETWORK = "network"
+DHT_ISSUE_PROTOCOL = "protocol"
+DHT_ISSUE_TIMEOUT = "timeout"
+
+_DHT_ISSUE_MESSAGES = {
+    DHT_ISSUE_DEADLINE: "Gesamtzeitlimit der DHT-Suche erreicht.",
+    DHT_ISSUE_NETWORK: "DHT-Anfrage scheiterte wegen eines Netzwerkfehlers.",
+    DHT_ISSUE_PROTOCOL: "DHT-Antwort verletzte das erwartete Protokollformat.",
+    DHT_ISSUE_TIMEOUT: "Zeitueberschreitung bei DHT-Anfrage.",
+}
+
 
 class DHTProtocolError(ValueError):
     """Ein DHT-Paket verletzt das erwartete, begrenzte Protokollformat."""
@@ -37,6 +55,12 @@ class DHTProtocolError(ValueError):
 
 class DHTQueryError(OSError):
     """Eine einzelne DHT-Anfrage konnte nicht sicher abgeschlossen werden."""
+
+    def __init__(self, message: str, *, category: str = DHT_ISSUE_NETWORK) -> None:
+        if category not in _DHT_ISSUE_MESSAGES:
+            raise ValueError("Unbekannte DHT-Fehlerkategorie.")
+        super().__init__(message)
+        self.category = category
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,29 +321,34 @@ async def resolve_bootstrap_nodes(
     *,
     timeout: float = 5.0,
     max_results: int = 32,
+    issue_hook: BootstrapIssueHook | None = None,
 ) -> list[Endpoint]:
     """Löst eine kleine Bootstrap-Liste auf und verwirft nichtglobale Ziele."""
     _require_bounded_number("timeout", timeout, 0.1, MAX_TIMEOUT_SECONDS)
     _require_bounded_integer("max_results", max_results, 1, MAX_BOOTSTRAP_RESULTS)
+    if issue_hook is not None and not callable(issue_hook):
+        raise TypeError("issue_hook muss aufrufbar sein.")
+
     requested: list[Endpoint] = []
     for raw in nodes:
         if len(requested) >= MAX_BOOTSTRAP_NODES:
             raise ValueError("Zu viele Bootstrap-Knoten.")
         if not isinstance(raw, tuple) or len(raw) != 2:
             raise ValueError("Bootstrap-Endpunkt muss ein Tupel aus Host und Port sein.")
-        requested.append(raw)
-    if not requested:
-        raise ValueError("Mindestens ein Bootstrap-Knoten ist erforderlich.")
-
-    loop = asyncio.get_running_loop()
-
-    async def resolve_one(host: str, port: int) -> list[Endpoint]:
+        host, port = raw
         if not isinstance(host, str) or not host or len(host) > 253:
             raise ValueError("Bootstrap-Host ist ungültig.")
         if any(character.isspace() for character in host):
             raise ValueError("Bootstrap-Host darf keine Leerzeichen enthalten.")
         if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65_535:
             raise ValueError("Bootstrap-Port ist ungültig.")
+        requested.append((host, port))
+    if not requested:
+        raise ValueError("Mindestens ein Bootstrap-Knoten ist erforderlich.")
+
+    loop = asyncio.get_running_loop()
+
+    async def resolve_one(host: str, port: int) -> list[Endpoint]:
         numeric = normalize_global_endpoint(host, port)
         if numeric is not None:
             return [numeric]
@@ -359,19 +388,34 @@ async def resolve_bootstrap_nodes(
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
-    resolved_groups: list[list[Endpoint] | BaseException] = []
+    def report_issue(category: str) -> None:
+        if issue_hook is not None:
+            issue_hook(category)
+
+    resolved_groups: list[list[Endpoint]] = []
     for task in tasks:
-        if task in completed:
-            try:
-                resolved_groups.append(task.result())
-            except (Exception, asyncio.CancelledError) as exc:
-                resolved_groups.append(exc)
+        if task not in completed:
+            report_issue(BOOTSTRAP_ISSUE_TIMEOUT)
+            continue
+        try:
+            group = task.result()
+        except socket.gaierror:
+            report_issue(BOOTSTRAP_ISSUE_DNS)
+            continue
+        except OSError:
+            report_issue(BOOTSTRAP_ISSUE_RESOLVER)
+            continue
+        except (Exception, asyncio.CancelledError):
+            report_issue(BOOTSTRAP_ISSUE_RESOLVER)
+            continue
+        if not group:
+            report_issue(BOOTSTRAP_ISSUE_NO_GLOBAL_ADDRESS)
+            continue
+        resolved_groups.append(group)
 
     resolved: list[Endpoint] = []
     seen: set[Endpoint] = set()
     for group in resolved_groups:
-        if isinstance(group, BaseException):
-            continue
         for endpoint in group:
             if endpoint not in seen:
                 seen.add(endpoint)
@@ -403,8 +447,22 @@ class DHTCrawler:
         self.transaction_id_factory = transaction_id_factory or (lambda: secrets.token_bytes(4))
         self.clock = clock
         self.errors: tuple[str, ...] = ()
+        self.issue_counts: dict[str, int] = {}
         self.queries_started = 0
         self.queries_completed = 0
+        self.queries_failed = 0
+
+    @property
+    def issue_count(self) -> int:
+        """Liefert die ungekürzte Zahl technischer DHT-Teilfehler."""
+        return sum(self.issue_counts.values())
+
+    def _record_issue(self, errors: list[str], category: str) -> None:
+        if category not in _DHT_ISSUE_MESSAGES:
+            category = DHT_ISSUE_PROTOCOL
+        self.issue_counts[category] = self.issue_counts.get(category, 0) + 1
+        if len(errors) < 100:
+            errors.append(_DHT_ISSUE_MESSAGES[category])
 
     def _validated_bootstrap(self, nodes: Iterable[Endpoint]) -> list[Endpoint]:
         normalized: list[Endpoint] = []
@@ -440,10 +498,16 @@ class DHTCrawler:
                     self.query_hook(endpoint, info_hash, transaction_id),
                     timeout=self.config.timeout_seconds,
                 )
+            except DHTQueryError:
+                raise
             except TimeoutError as exc:
-                raise DHTQueryError("Zeitüberschreitung bei DHT-Anfrage.") from exc
-            except (OSError, DHTProtocolError) as exc:
-                raise DHTQueryError(str(exc)) from exc
+                raise DHTQueryError(
+                    "DHT-Anfrage überschritt ihr Zeitlimit.", category=DHT_ISSUE_TIMEOUT
+                ) from exc
+            except DHTProtocolError as exc:
+                raise DHTQueryError("Ungültige DHT-Antwort.", category=DHT_ISSUE_PROTOCOL) from exc
+            except OSError as exc:
+                raise DHTQueryError("DHT-Netzwerkfehler.", category=DHT_ISSUE_NETWORK) from exc
 
         query = build_get_peers_query(self.node_id, info_hash, transaction_id)
         address = ipaddress.ip_address(endpoint[0])
@@ -454,8 +518,8 @@ class DHTCrawler:
         async def exchange() -> DHTResponse:
             loop = asyncio.get_running_loop()
             udp_socket = socket.socket(family, socket.SOCK_DGRAM)
-            udp_socket.setblocking(False)
             try:
+                udp_socket.setblocking(False)
                 await loop.sock_connect(udp_socket, sockaddr)
                 await loop.sock_sendall(udp_socket, query)
                 packet, source_address = await loop.sock_recvfrom(
@@ -478,9 +542,13 @@ class DHTCrawler:
         try:
             return await asyncio.wait_for(exchange(), self.config.timeout_seconds)
         except TimeoutError as exc:
-            raise DHTQueryError("Zeitüberschreitung bei DHT-Anfrage.") from exc
-        except (OSError, DHTProtocolError) as exc:
-            raise DHTQueryError(str(exc)) from exc
+            raise DHTQueryError(
+                "DHT-Anfrage überschritt ihr Zeitlimit.", category=DHT_ISSUE_TIMEOUT
+            ) from exc
+        except DHTProtocolError as exc:
+            raise DHTQueryError("Ungültige DHT-Antwort.", category=DHT_ISSUE_PROTOCOL) from exc
+        except OSError as exc:
+            raise DHTQueryError("DHT-Netzwerkfehler.", category=DHT_ISSUE_NETWORK) from exc
 
     def _new_transaction_id(self) -> bytes:
         transaction_id = self.transaction_id_factory()
@@ -497,6 +565,8 @@ class DHTCrawler:
 
         self.queries_started = 0
         self.queries_completed = 0
+        self.queries_failed = 0
+        self.issue_counts = {}
         errors: list[str] = []
         candidates: list[PeerCandidate] = []
         candidate_endpoints: set[Endpoint] = set()
@@ -537,7 +607,7 @@ class DHTCrawler:
                     break
                 remaining = deadline - loop.time()
                 if remaining <= 0:
-                    errors.append("Gesamtzeitlimit der DHT-Suche erreicht.")
+                    self._record_issue(errors, DHT_ISSUE_DEADLINE)
                     break
                 done, _pending = await asyncio.wait(
                     active,
@@ -545,7 +615,7 @@ class DHTCrawler:
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if not done:
-                    errors.append("Gesamtzeitlimit der DHT-Suche erreicht.")
+                    self._record_issue(errors, DHT_ISSUE_DEADLINE)
                     break
 
                 for task in done:
@@ -573,9 +643,17 @@ class DHTCrawler:
                             )
                         ):
                             raise DHTProtocolError("DHT-Antworthash ist ungültig.")
-                    except (DHTQueryError, DHTProtocolError, OSError) as exc:
-                        if len(errors) < 100:
-                            errors.append(f"{endpoint[0]}:{endpoint[1]}: {exc}")
+                    except DHTQueryError as exc:
+                        self.queries_failed += 1
+                        self._record_issue(errors, exc.category)
+                        continue
+                    except DHTProtocolError:
+                        self.queries_failed += 1
+                        self._record_issue(errors, DHT_ISSUE_PROTOCOL)
+                        continue
+                    except OSError:
+                        self.queries_failed += 1
+                        self._record_issue(errors, DHT_ISSUE_NETWORK)
                         continue
                     self.queries_completed += 1
 

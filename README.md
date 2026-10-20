@@ -161,10 +161,12 @@ Die Hash-Kette des Journals wird geprüft mit:
 Beim ersten Start legt die Oberfläche die beiden für dieses Projekt vorgesehenen
 Infohashes als sichtbare Voreinstellungen an. Beim ersten Start der Version 0.1.1
 werden fehlende Voreinstellungen auch in einer vorhandenen älteren Konfiguration
-einmalig ergänzt; vorhandene eigene Einträge bleiben unverändert und spätere bewusste
-Löschungen bleiben erhalten. Das bestätigt weder einen behaupteten Inhalt noch
-Echtheit, Rechtmäßigkeit, Besitz oder Übertragung und startet keinen Netzlauf. Bei
-einem zusätzlich eingefügten Magnet-Link speichert die Oberfläche
+einmalig ergänzt. Alte erzwungene Titel oder Beschreibungen dieser beiden Projekt-Hashes
+werden dabei durch neutrale Bezeichnungen ohne Inhaltsbehauptung ersetzt. Eigene Einträge
+mit anderen Hashes bleiben unverändert; spätere bewusste Löschungen bleiben erhalten.
+Das bestätigt weder einen behaupteten Inhalt noch Echtheit, Rechtmäßigkeit, Besitz oder
+Übertragung und startet keinen Netzlauf. Bei einem zusätzlich eingefügten Magnet-Link
+speichert die Oberfläche
 ausschließlich den v1-btih-Infohash; Name, Tracker und sonstige Angaben werden verworfen
 und nicht kontaktiert. Eine Konfiguration kann auch über `init --magnet ...` angelegt
 werden.

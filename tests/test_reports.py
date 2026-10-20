@@ -9,6 +9,7 @@ import os
 import stat
 import tempfile
 import unittest
+from dataclasses import replace
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
@@ -156,18 +157,21 @@ class ReportGenerationTests(unittest.TestCase):
             self.assertEqual(paths[-1].name, "run_42_SHA256SUMS.txt")
             self.assertIn("run_42_hinweis_ipv4_198_51_100_10.pdf", by_name)
             self.assertIn("run_42_entwurf_ipv4_198_51_100_10.eml", by_name)
-            self.assertNotIn("run_42_hinweis_ipv6_2001_db8_5.pdf", by_name)
-            self.assertNotIn("run_42_entwurf_ipv6_2001_db8_5.eml", by_name)
+            self.assertFalse(any("_hinweis_ipv6_" in name for name in by_name))
+            self.assertFalse(any("_entwurf_ipv6_" in name for name in by_name))
 
             with by_name["run_42_beobachtungen.csv"].open(encoding="utf-8", newline="") as handle:
                 all_rows = list(csv.DictReader(handle, delimiter=";"))
-            self.assertEqual([row["ip"] for row in all_rows], ["198.51.100.10", "2001:db8::5"])
+            self.assertEqual([row["ip"] for row in all_rows], ["198.51.100.10"])
             self.assertEqual(all_rows[0]["bestaetigte_handshakes"], "2")
             self.assertEqual(all_rows[0]["ports"], "51413 | 51414")
-            self.assertEqual(all_rows[1]["vpn_status"], "bekannter VPN")
             self.assertEqual(
                 all_rows[0]["lokaler_dht_antwort_fingerabdruck_sha256"],
                 f"{1:064x} | {2:064x}",
+            )
+            self.assertEqual(
+                all_rows[0]["netzangaben_zusammengestellt_utc"],
+                "2026-10-20T10:30:00Z",
             )
             self.assertIn(
                 "rdap: 2026-10-20T10:20:00Z",
@@ -185,6 +189,12 @@ class ReportGenerationTests(unittest.TestCase):
             self.assertEqual(len(vpn_rows), 1)
             self.assertEqual(vpn_rows[0]["ip"], "2001:db8::5")
             self.assertEqual(vpn_rows[0]["vpn_anbieter"], "Beispiel VPN")
+            self.assertEqual(
+                tuple(vpn_rows[0]),
+                ("ip", "vpn_anbieter", "vpn_begruendung", "vpn_quellen"),
+            )
+            self.assertNotIn("ports", vpn_rows[0])
+            self.assertNotIn("infohashes", vpn_rows[0])
 
             draft_path = by_name["run_42_entwurf_ipv4_198_51_100_10.eml"]
             message = BytesParser(policy=policy.default).parsebytes(draft_path.read_bytes())
@@ -196,9 +206,11 @@ class ReportGenerationTests(unittest.TestCase):
                 self.assertIn(limitation, plain_body)
             self.assertIn("keine digitale Signatur", plain_body)
             self.assertIn("kein vertrauenswürdiger externer Zeitstempel", plain_body)
+            self.assertIn("sachliche Richtigkeit", plain_body)
             self.assertIn("nicht unabhängig reproduzierbar", plain_body)
             self.assertIn("Quellenspezifische Abrufzeitpunkte", plain_body)
             self.assertIn("Angefragte bzw. weitergeleitete Quellen", plain_body)
+            self.assertIn("Netzangaben zusammengestellt", plain_body)
             self.assertIn("Aus lokalem Cache: rdap", plain_body)
             attachments = list(message.iter_attachments())
             self.assertEqual(len(attachments), 1)
@@ -337,11 +349,52 @@ class ReportGenerationTests(unittest.TestCase):
             names = {path.name for path in paths}
             self.assertFalse(any("_hinweis_" in name for name in names))
             self.assertFalse(any("_entwurf_" in name for name in names))
+            summary_pdf = next(path for path in paths if path.name.endswith("_laufbericht.pdf"))
+            self.assertNotIn(b"198.51.100.40", summary_pdf.read_bytes())
+            observations_csv = next(
+                path for path in paths if path.name.endswith("_beobachtungen.csv")
+            )
+            with observations_csv.open(encoding="utf-8", newline="") as handle:
+                self.assertEqual(list(csv.DictReader(handle, delimiter=";")), [])
             vpn_csv = next(path for path in paths if path.name.endswith("_vpn_liste.csv"))
             with vpn_csv.open(encoding="utf-8", newline="") as handle:
                 rows = list(csv.DictReader(handle, delimiter=";"))
             self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["bestaetigte_handshakes"], "2")
+            self.assertEqual(rows[0]["ip"], "198.51.100.40")
+            self.assertEqual(rows[0]["vpn_anbieter"], "Beispiel VPN")
+
+    def test_large_registry_provenance_can_split_across_pdf_pages(self) -> None:
+        records: list[EvidenceRecord] = []
+        for sequence in range(1, 31):
+            record = _evidence_record("198.51.100.70", 6_000 + sequence, sequence)
+            enrichment = replace(
+                record.enrichment,
+                enriched_at_utc=f"2026-10-20T11:{sequence:02d}:00Z",
+                source_urls=(
+                    f"https://rdap.example.invalid/object/{sequence}",
+                    f"https://stat.example.invalid/object/{sequence}",
+                ),
+                source_fetched_at_utc=(
+                    ("rdap", f"2026-10-20T10:{sequence:02d}:00Z"),
+                    (
+                        "ripestat-prefix-overview",
+                        f"2026-10-20T10:{sequence:02d}:30Z",
+                    ),
+                ),
+                error=f"Quelle {sequence}: " + ("x" * 480),
+            )
+            records.append(replace(record, enrichment=enrichment))
+        result = ScanResult(
+            run_id="long-provenance",
+            started_at_utc="2026-10-20T10:00:00Z",
+            completed_at_utc="2026-10-20T12:00:00Z",
+            records=records,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_name:
+            paths = generate_reports(result, Path(temp_name), ReportConfig())
+            self.assertTrue(paths)
+            self.assertTrue(all(path.stat().st_size > 0 for path in paths))
 
     def test_unconfirmed_record_is_not_reported(self) -> None:
         unconfirmed = _evidence_record(
@@ -374,7 +427,14 @@ class FilenameAndValidationTests(unittest.TestCase):
 
     def test_safe_ip_filename_handles_ipv4_and_ipv6(self) -> None:
         self.assertEqual(safe_ip_filename("198.51.100.7"), "ipv4_198_51_100_7")
-        self.assertEqual(safe_ip_filename("2001:0db8:0:0::1"), "ipv6_2001_db8_1")
+        self.assertEqual(
+            safe_ip_filename("2001:0db8:0:0::1"),
+            "ipv6_2001_0db8_0000_0000_0000_0000_0000_0001",
+        )
+        self.assertNotEqual(
+            safe_ip_filename("2001:db8:0:1::"),
+            safe_ip_filename("2001:db8:0::1"),
+        )
         with self.assertRaises(ValueError):
             safe_ip_filename("../../bericht")
         self.assertEqual(_format_endpoint("198.51.100.7", 6881), "198.51.100.7:6881")
@@ -388,6 +448,18 @@ class FilenameAndValidationTests(unittest.TestCase):
                     _scan_result(),
                     Path(temp_name),
                     ReportConfig(recipient_name="Polizei\nBcc: fremd@example.invalid"),
+                )
+            self.assertEqual(list(Path(temp_name).iterdir()), [])
+
+    @unittest.skipUnless(REPORTLAB_AVAILABLE, "ReportLab ist nicht installiert")
+    def test_naive_report_timestamp_is_rejected_instead_of_assumed_utc(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            with self.assertRaisesRegex(ValueError, "UTC-Bezug"):
+                generate_reports(
+                    _scan_result(),
+                    Path(temp_name),
+                    ReportConfig(),
+                    generated_at_utc="2026-10-20T11:05:00",
                 )
             self.assertEqual(list(Path(temp_name).iterdir()), [])
 
