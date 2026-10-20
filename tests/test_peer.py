@@ -23,6 +23,7 @@ from bittorrent_beobachter.peer import (
 INFO_HASH = b"h" * 20
 LOCAL_PEER_ID = b"-TEST00-123456789012"
 REMOTE_PEER_ID = b"-REMOTE-123456789012"
+TEST_OBSERVATION_SECONDS = 0.25
 
 
 def candidate(ip: str = "8.8.8.8", info_hash_hex: str = INFO_HASH.hex()) -> PeerCandidate:
@@ -95,7 +96,7 @@ async def run_verifier(
     *,
     close_when_empty: bool,
     remote_info_hash: bytes = INFO_HASH,
-    observation_seconds: float = 0.01,
+    observation_seconds: float = TEST_OBSERVATION_SECONDS,
 ) -> tuple[object, FakeSocket, FakeLoop]:
     incoming = build_handshake(remote_info_hash, REMOTE_PEER_ID) + incoming_after_handshake
     fake_socket = FakeSocket()
