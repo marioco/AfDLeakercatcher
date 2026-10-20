@@ -94,8 +94,10 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Inhaltsfreie Beobachtung ausdrücklich konfigurierter BitTorrent-Infohashes. "
             "Ohne Unterbefehl wird die Desktop-Oberfläche geöffnet. Nicht anonym: "
-            "DHT-Knoten und geprüfte Peer-Endpunkte sehen Quell-IP und Infohash; "
-            "es erfolgen kein announce und kein Inhalts- oder Metadatentransfer."
+            "DHT-Knoten, konfigurierte Tracker und geprüfte Peer-Endpunkte sehen "
+            "Quell-IP und Infohash; Tracker können die Messinstanz zwischen der "
+            "kurzen STARTED- und STOPPED-Meldung als Peer führen. Inhalts- oder "
+            "Metadatenblöcke werden nicht übertragen."
         ),
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -106,12 +108,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("gui", help="Desktop-Oberfläche öffnen")
     acknowledgement_help = (
-        "Pflichtbestätigung: DHT-Knoten und geprüfte Peer-Endpunkte sehen "
-        "öffentliche Quell-IP und Infohash und können dies protokollieren"
+        "Pflichtbestätigung: DHT-Knoten, konfigurierte Tracker und geprüfte "
+        "Peer-Endpunkte sehen öffentliche Quell-IP und Infohash; Tracker können "
+        "die Messinstanz bis zur STOPPED-Meldung kurz als Peer führen und alle "
+        "Stellen können die Anfrage protokollieren"
     )
     scan_parser = subparsers.add_parser(
         "scan",
-        help="Einen begrenzten Prüflauf ausführen",
+        help="Einen vollständigen Prüflauf ausführen",
     )
     scan_parser.add_argument(
         "--acknowledge-public-network",
@@ -212,14 +216,17 @@ def _initialize_config(args: argparse.Namespace, config_path: Path) -> int:
     save_config(config_path, config)
     print(f"Konfiguration gespeichert: {config_path}")
     print(
-        "Magnet-Name und Tracker wurden verworfen; gespeichert sind nur eine "
-        "neutrale oder ausdrücklich angegebene Bezeichnung und der Infohash."
+        "Der Magnet-Name wurde verworfen. Gespeichert sind die neutrale oder "
+        "ausdrücklich angegebene Bezeichnung, der Infohash und gültige UDP-Tracker "
+        "für die Endpunktsuche."
     )
     print(
-        "WICHTIG: Prüfläufe sind nicht anonym. DHT-Knoten und geprüfte "
-        "Peer-Endpunkte sehen Ihre öffentliche Quell-IP und den abgefragten "
-        "Infohash und können dies protokollieren. Es erfolgen kein announce "
-        "und kein Inhalts- oder Metadatentransfer."
+        "WICHTIG: Prüfläufe sind nicht anonym. DHT-Knoten, konfigurierte "
+        "Tracker und geprüfte Peer-Endpunkte sehen Ihre öffentliche Quell-IP und "
+        "den abgefragten Infohash und können dies protokollieren. Tracker können "
+        "die Messinstanz zwischen der kurzen STARTED- und STOPPED-Meldung als Peer "
+        "führen. Die Anfrage dient nur der Endpunktsuche; Inhalts- oder "
+        "Metadatenblöcke werden nicht übertragen."
     )
     if config.enrichment.enabled:
         print(
@@ -238,15 +245,31 @@ def _scan_once(config_path: Path, data_dir: Path, logger: logging.Logger) -> int
     logger.info("Prüflauf für %d Ziel(e) gestartet", len(config.targets))
     result = run_scan(config, data_dir, progress=logger.info)
     logger.info(
-        "Prüflauf beendet: %d DHT-Treffer, %d direkt geprüft, "
+        "Prüflauf beendet: %d Kandidaten gefunden, %d direkt geprüft, "
         "%d bestätigte Handshakes, %d positive Verfügbarkeitsprüfungen, "
         "%d VPN-Treffer",
-        len(result.candidates),
-        len(result.handshakes),
+        result.total_candidate_count,
+        result.total_handshake_count,
         result.confirmed_count,
         result.offering_count,
         result.known_vpn_count,
     )
+    for metric in result.target_metrics:
+        reasons = (
+            ", ".join(f"{reason}={count}" for reason, count in metric.failure_reasons) or "keine"
+        )
+        logger.info(
+            "Infohash %s (%s): %d Kandidaten, %d geprüft, %d Verbindungsversuche, "
+            "%d bestätigte Handshakes, %d positive Befunde, Fehlergründe: %s",
+            metric.info_hash_hex,
+            metric.target_label,
+            metric.candidates_discovered,
+            metric.candidates_checked,
+            metric.verification_attempts,
+            metric.confirmed_handshakes,
+            metric.positive_findings,
+            reasons,
+        )
     for path in result.report_paths:
         logger.info("Ausgabe: %s", path)
     for notice in result.notices:
@@ -320,16 +343,18 @@ def main(argv: list[str] | None = None) -> int:
             if not args.acknowledge_public_network:
                 raise ConfigError(
                     "scan benötigt --acknowledge-public-network als ausdrückliche "
-                    "Bestätigung: DHT-Knoten und Peer-Endpunkte sehen Quell-IP und "
-                    "Infohash und können dies protokollieren."
+                    "Bestätigung: DHT-Knoten, konfigurierte Tracker und "
+                    "Peer-Endpunkte sehen Quell-IP und Infohash und können dies "
+                    "protokollieren."
                 )
             return _scan_once(config_path, data_dir, logger)
         if command == "watch":
             if not args.acknowledge_public_network:
                 raise ConfigError(
                     "watch benötigt --acknowledge-public-network als ausdrückliche "
-                    "Bestätigung: DHT-Knoten und Peer-Endpunkte sehen Quell-IP und "
-                    "Infohash und können dies protokollieren."
+                    "Bestätigung: DHT-Knoten, konfigurierte Tracker und "
+                    "Peer-Endpunkte sehen Quell-IP und Infohash und können dies "
+                    "protokollieren."
                 )
             return _watch(config_path, data_dir, logger)
         if command == "verify-journal":

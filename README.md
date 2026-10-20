@@ -2,31 +2,49 @@
 
 Eine leicht bedienbare, quelloffene Python-Anwendung zur **inhaltsfreien** Prüfung
 ausdrücklich konfigurierter BitTorrent-v1-Infohashes. Die Anwendung fordert keine Datei-
-oder Torrent-Metadatenblöcke an, stellt nichts bereit und verschickt keine Meldung
+oder Torrent-Metadatenblöcke an, lädt keine davon hoch und verschickt keine Meldung
 automatisch.
 
 ## Was die Anwendung belastbar sagen kann
 
-Die Anwendung fragt das öffentliche BitTorrent-DHT ausschließlich mit `get_peers` ab.
-Für gefundene Endpunkte führt sie eine eng begrenzte Prüfung durch:
+Die Anwendung sucht Endpunkte im öffentlichen BitTorrent-DHT mit `get_peers` und fragt
+die für ein Ziel gespeicherten, validierten UDP-Tracker ab. Beides geschieht erst nach
+der ausdrücklichen Bestätigung vor dem Prüflauf. Für gefundene Endpunkte führt sie eine
+gezielte, inhaltsfreie Prüfung durch:
 
-1. Ein DHT-Knoten nennt `IP:Port` für den konfigurierten Infohash.
+1. Ein DHT-Knoten oder UDP-Tracker nennt `IP:Port` für den konfigurierten Infohash.
 2. Die Anwendung sendet den standardisierten 68-Byte-BitTorrent-Handshake.
 3. Nach einem gültigen Handshake für denselben Infohash meldet sie auf derselben
    Verbindung Interesse und beobachtet bis zu 60 Sekunden ausschließlich
    BitTorrent-Kontrollnachrichten.
-4. Ein positiver Verfügbarkeitsbefund erfordert das vollständige Beobachtungsfenster,
-   mindestens ein nicht leeres `bitfield`- oder gültiges `have`-Signal und mindestens
-   ein `unchoke`. Das bedeutet: Der Endpunkt meldete verfügbare Teile und teilte dem
-   Prüfprogramm mit, dass es Datenblöcke anfordern dürfe.
+4. Ein positiver Verfügbarkeitsbefund erfordert mindestens ein nicht leeres `bitfield`-,
+   gültiges `have`- oder `have_all`-Signal und mindestens ein `unchoke`. Das bedeutet:
+   Der Endpunkt meldete verfügbare Teile und teilte dem Prüfprogramm mit, dass es
+   Datenblöcke anfordern dürfe.
 5. Die Anwendung sendet niemals `request`-Nachrichten und fordert weder Dateiinhalte
-   noch Torrent-Metadaten an. Erst bei einem positiven Verfügbarkeitsbefund werden eine
-   technische Anlage und eine versandfertige Strafanzeige als `.eml` erzeugt.
+   noch Torrent-Metadaten an. Positive Befunde werden nach IP-Adresse gebündelt. Für jede
+   positive, nicht als bekannter VPN-Endpunkt eingestufte IP werden eine technische
+   Anlage und eine versandfertige Strafanzeige als `.eml` erzeugt.
 
-Bei den beiden voreingestellten Zielen werden alle gefundenen eindeutigen Endpunkte
-direkt geprüft, bis zu 300 je Ziel und damit bis zu 600 pro Lauf. Es gibt keine frühere
-Abschneidung nach 120 Endpunkten mehr. Exakte Doppelnennungen desselben Infohashes mit
-derselben IP und demselben Port werden nur einmal geprüft.
+Es gibt keine Mengenbegrenzung für gefundene oder direkt geprüfte Kandidaten. Die
+DHT-Suche läuft in wiederholten konvergierenden Runden weiter, bis während des
+konfigurierten Ruhefensters – standardmäßig 30 Sekunden – kein neuer eindeutiger
+Kandidat mehr gefunden wurde. Exakte Doppelnennungen desselben Infohashes mit derselben
+IP und demselben Port werden nur einmal geprüft. Jeder gefundene eindeutige Kandidat
+wird mit einer begrenzten Zahl von Verbindungsversuchen geprüft; standardmäßig sind es
+höchstens drei Versuche.
+
+Kandidaten und Ergebnisse werden fortlaufend in Fünferpaketen in einer privaten lokalen
+SQLite-Laufdatenbank gespeichert; die vollständige Treffermenge wird dadurch nicht im
+Arbeitsspeicher gehalten. Das letzte Paket darf weniger als fünf Einträge enthalten.
+Diese fortlaufende Speicherung ist keine automatische Wiederaufnahme: Nach einem
+Programmneustart beginnt ein neuer Prüflauf. Die private SQLite-Datenbank eines
+unterbrochenen Laufs bleibt lokal erhalten, wird derzeit aber nicht automatisch
+fortgesetzt oder in den neuen Lauf übernommen.
+Bei großen oder aktiven Schwärmen kann ein vollständiger Lauf deshalb viele Minuten
+oder Stunden dauern.
+Netzwerk-Zeitlimits begrenzen einzelne Anfragen und Verbindungsversuche, nicht die Anzahl
+der insgesamt gefundenen oder geprüften Endpunkte.
 
 Das ist ein stärkeres Protokollindiz als ein bloßer Eintrag in einer Teilnehmerliste oder
 ein Handshake. Die Kontrollsignale werden jedoch vom Gegenüber selbst erzeugt und ohne
@@ -83,8 +101,7 @@ jeweiligen Lauf-ID und erzeugen:
 
 - `<Lauf-ID>_laufbericht.pdf`: Umfang, Ergebnisse, Fehler und Aussagegrenzen;
 - `<Lauf-ID>_beobachtungen.csv`: tabellarische technische Beobachtungen;
-- pro positiver, nicht als bekannter VPN-Endpunkt eingestufter
-  Verfügbarkeitsprüfung eine
+- pro positiver, nicht als bekannter VPN-Endpunkt eingestufter IP eine
   `<Lauf-ID>_anlage_<IP>.pdf` und
   `<Lauf-ID>_strafanzeige_<IP>.eml`;
 - `<Lauf-ID>_vpn_liste.pdf` und `<Lauf-ID>_vpn_liste.csv`: bekannte
@@ -92,9 +109,10 @@ jeweiligen Lauf-ID und erzeugen:
 - `<Lauf-ID>_SHA256SUMS.txt`: Prüfsummen aller Ausgabedateien;
 - ein append-only JSONL-Journal mit SHA-256-Hash-Kette im Evidenzordner.
 
-Für Berichte und Evidenzjournal gelten feste lokale Kapazitätsgrenzen. Bei Annäherung
-bricht ein neuer Lauf vor dem Netzwerkzugriff mit einem Archivhinweis ab. Die Anwendung
-löscht Evidenz oder Berichte niemals automatisch.
+Für Kandidaten, Prüfungen und Berichte gelten keine festen Mengenlimits. Die tatsächlich
+verfügbare lokale Speicherkapazität bleibt die physische Grenze; Schreib- und
+Speicherfehler werden sichtbar gemeldet. Die Anwendung löscht Laufdaten, Evidenz oder
+Berichte niemals automatisch.
 
 Die Anwendung sendet nie E-Mails. `.eml`-Dateien sind versandfertig formuliert, müssen
 aber von einem Menschen geprüft, geöffnet und bewusst versandt werden. Wenn keine
@@ -112,14 +130,19 @@ Löschkonzept zu klären. Die Anwendung versucht keine Person zu deanonymisieren
 verarbeitet nur:
 
 - öffentlich im DHT genannte Endpunkte,
+- von validierten UDP-Trackern gemeldete Endpunkte,
 - den BitTorrent-Handshake sowie streng begrenzte `interested`-, `bitfield`-,
-  `have`-, `choke`- und `unchoke`-Kontrollnachrichten,
+  `have`-, `have_all`-, `choke`- und `unchoke`-Kontrollnachrichten,
 - öffentliche RDAP- und RIPEstat-Netzbetreiberangaben.
 
-Ein Prüflauf ist **nicht anonym**. Die kontaktierten DHT-Knoten und geprüften
+Ein Prüflauf ist **nicht anonym**. Die kontaktierten DHT-Knoten, UDP-Tracker und geprüften
 Peer-Endpunkte sehen die öffentliche Quell-IP der Messinstanz und den abgefragten
-Infohash und können diese Anfrage protokollieren. Die Anwendung führt trotzdem kein
-`announce` durch und lädt weder Inhalte noch Torrent-Metadaten herunter oder hoch.
+Infohash und können diese Anfrage protokollieren. Zur Endpunktsuche sendet die Anwendung
+nach der ausdrücklichen Bestätigung einen kurzlebigen UDP-Tracker-Announce mit `STARTED`,
+unbekannter Restmenge und einem nicht geöffneten Port; unmittelbar danach meldet sie
+`STOPPED`. Der Tracker kann die Messinstanz in dieser kurzen Zeit als Peer führen. Die
+Anwendung öffnet keinen Listener, meldet keinen Upload, fordert weder Dateistücke noch
+Torrent-Metadaten an und lädt beides auch nicht hoch.
 
 Die optionale öffentliche Netzauskunft ist standardmäßig ausgeschaltet. Nach einer
 ausdrücklichen Aktivierung werden bestätigte IP-Adressen an `stat.ripe.net`, `rdap.org`
@@ -163,9 +186,9 @@ mit:
   scan --acknowledge-public-network
 ```
 
-Der Pflichtschalter bestätigt ausdrücklich, dass DHT-Knoten und geprüfte
-Peer-Endpunkte die öffentliche Quell-IP und den Infohash sehen und protokollieren
-können. Er ist auch für `watch` erforderlich.
+Der Pflichtschalter bestätigt ausdrücklich, dass DHT-Knoten, konfigurierte UDP-Tracker
+und geprüfte Peer-Endpunkte die öffentliche Quell-IP und den Infohash sehen und
+protokollieren können. Er ist auch für `watch` erforderlich.
 
 Die Hash-Kette des Journals wird geprüft mit:
 
@@ -176,34 +199,36 @@ Die Hash-Kette des Journals wird geprüft mit:
 ## Konfiguration
 
 Beim ersten Start legt die Oberfläche die beiden für dieses Projekt vorgesehenen
-Infohashes als sichtbare Voreinstellungen an. Beim ersten Start der Version 0.1.1
-werden fehlende Voreinstellungen auch in einer vorhandenen älteren Konfiguration
-einmalig ergänzt. Alte erzwungene Titel oder Beschreibungen dieser beiden Projekt-Hashes
-werden dabei durch neutrale Bezeichnungen ohne Inhaltsbehauptung ersetzt. Eigene Einträge
-mit anderen Hashes bleiben unverändert; spätere bewusste Löschungen bleiben erhalten.
+Infohashes einschließlich ihrer ursprünglichen validierten UDP-Tracker als sichtbare
+Voreinstellungen an. Die Konfigurationsmigration von Version 0.3.0 ergänzt diese Tracker
+auch bei bereits vorhandenen voreingestellten Zielen, verändert aber keine eigenen
+Bezeichnungen und stellt bewusst gelöschte Ziele nicht wieder her. Eigene Einträge und
+eigene Tracker bleiben unverändert.
+
 Das bestätigt weder einen behaupteten Inhalt noch Echtheit, Rechtmäßigkeit, Besitz oder
 Übertragung und startet keinen Netzlauf. Bei einem zusätzlich eingefügten Magnet-Link
-speichert die Oberfläche
-ausschließlich den v1-btih-Infohash; Name, Tracker und sonstige Angaben werden verworfen
-und nicht kontaktiert. Eine Konfiguration kann auch über `init --magnet ...` angelegt
-werden.
+speichert die Oberfläche den v1-btih-Infohash und ausschließlich vollständig validierte
+UDP-Tracker. Der Magnetname und sonstige Angaben werden verworfen. Andere Protokolle,
+unsichere Zieladressen und ungültige Tracker-Angaben werden abgelehnt. Eine Konfiguration
+kann auch über `init --magnet ...` angelegt werden.
 
-Wichtige Schutzgrenzen sind fest im Programm angelegt:
+Wichtige Schutzgrenzen betreffen einzelne Operationen, nicht die Kandidatenmenge:
 
-- höchstens 20 Ziele;
-- höchstens 600 Sekunden für die gesamte DHT- und Peer-Netzphase sowie weitere
-  harte Zeitlimits und Grenzen für DHT-Knoten, Anfragen, Treffer und parallele
-  Peer-Prüfungen;
-- für die beiden voreingestellten Ziele bis zu 600 direkte Peer-Prüfungen pro Lauf,
-  davon bis zu 120 gleichzeitig; ältere Standardkonfigurationen werden automatisch
-  auf diese Werte aktualisiert;
-- höchstens 20 externe Netzauskünfte pro Lauf; weitere bestätigte Adressen bleiben in
-  diesem Lauf ohne externe Anreicherung;
+- höchstens 20 ausdrücklich konfigurierte Ziele;
+- Zeitlimits und Größenprüfungen pro DNS-, DHT-, Tracker- und Peer-Operation;
+- begrenzte Parallelität und fortlaufende Verarbeitung in Fünferpaketen, damit große
+  Treffermengen weder Arbeitsspeicher noch Netzwerk unkontrolliert belasten;
+- eine begrenzte Zahl von Wiederholungsversuchen pro Kandidat;
+- keine Gesamtfrist und keine Anzahlgrenze für DHT-Anfragen, gefundene Kandidaten oder
+  direkte Prüfungen; die DHT-Runden enden erst nach dem konfigurierten Ruhefenster;
 - nur global routbare öffentliche Adressen;
 - zufällige Knoten- und Peer-ID pro Lauf;
-- niemals `announce_peer`, Tracker-Announce, `request`, `piece`,
-  `ut_metadata`-Anforderung oder Peer Exchange; `interested` wird ausschließlich
-  innerhalb der beschriebenen Kontrollnachrichtenprüfung gesendet;
+- niemals DHT-`announce_peer`, `request`, `piece`, `ut_metadata`-Anforderung oder Peer
+  Exchange; der kurzlebige UDP-Tracker-Announce (`STARTED`, anschließend `STOPPED`) dient
+  nur der Endpunktsuche und
+  `interested` wird ausschließlich innerhalb der beschriebenen
+  Kontrollnachrichtenprüfung gesendet;
+- keine Anforderung und kein Hochladen von Dateistücken oder Torrent-Metadaten;
 - Single-Instance-Sperre gegen überlappende Läufe.
 
 ## Windows-Build selbst prüfen
@@ -224,7 +249,7 @@ Entpacken lässt sie sich mit der GitHub CLI prüfen:
 gh attestation verify BitTorrent-Beobachter.exe -R marioco/AfDLeakercatcher
 ```
 
-Ein Push eines passenden Versionstags wie `bittorrent-beobachter-v0.2.0` erzeugt nach
+Ein Push eines passenden Versionstags wie `bittorrent-beobachter-v0.3.0` erzeugt nach
 erfolgreichem Build automatisch ein GitHub-Release mit ZIP, SHA-256-Datei und generierten
 Versionshinweisen. Andere erfolgreiche Workflow-Läufe stellen den Build nur als
 Actions-Artefakt bereit.

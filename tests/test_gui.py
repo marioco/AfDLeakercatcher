@@ -6,6 +6,7 @@ import importlib
 import json
 import queue
 import sys
+import threading
 import types
 from dataclasses import replace
 from pathlib import Path
@@ -31,6 +32,7 @@ from bittorrent_beobachter.models import (
     PeerAvailabilityObservation,
     PeerCandidate,
     ScanResult,
+    TargetScanMetrics,
     VpnClassification,
 )
 
@@ -137,6 +139,8 @@ def _runtime_app(tmp_path: Path, config: AppConfig | None = None) -> Any:
     app = _bare_app(tmp_path / "config.json")
     app.data_dir = tmp_path / "data"
     app.events = queue.Queue()
+    app.progress_events = queue.Queue(maxsize=1)
+    app._progress_event_lock = threading.Lock()
     app.running = False
     app.scan_thread = None
     app.close_requested = False
@@ -336,7 +340,7 @@ def test_revision_one_empty_config_stays_empty_during_neutralization_upgrade(
     assert config.targets == ()
 
 
-def test_gui_migrates_old_peer_limits_without_restoring_targets(tmp_path: Path) -> None:
+def test_gui_discards_old_peer_caps_without_restoring_targets(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     raw = config_to_dict(AppConfig(targets=()))
     raw["bundled_preset_revision"] = 2
@@ -347,9 +351,12 @@ def test_gui_migrates_old_peer_limits_without_restoring_targets(tmp_path: Path) 
     config = _bare_app(config_path)._load_initial_config()
 
     assert config.targets == ()
-    assert config.peer.max_checks == 600
-    assert config.peer.observation_workers == 120
+    assert config.peer.retry_attempts == 3
+    assert config.peer.retry_backoff_seconds == 1.0
     assert load_config(config_path) == config
+    persisted = json.loads(config_path.read_text(encoding="utf-8"))
+    assert "max_checks" not in persisted["peer"]
+    assert "observation_workers" not in persisted["peer"]
 
 
 def test_refresh_targets_shows_both_presets_and_no_running_scan(tmp_path: Path) -> None:
@@ -366,7 +373,7 @@ def test_refresh_targets_shows_both_presets_and_no_running_scan(tmp_path: Path) 
     assert "es läuft kein Prüflauf" in app.status_text.value
 
 
-def test_add_target_uses_one_dialog_and_discards_name_and_tracker(
+def test_add_target_uses_one_dialog_discards_name_and_keeps_udp_tracker(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
@@ -395,7 +402,8 @@ def test_add_target_uses_one_dialog_and_discards_name_and_tracker(
     assert stored.targets[0].source_note == ""
     serialized = app.config_path.read_text(encoding="utf-8").casefold()
     assert "behaupteter" not in serialized
-    assert "tracker.example.invalid" not in serialized
+    assert stored.targets[0].trackers == ("udp://tracker.example.invalid:1337/announce",)
+    assert "tracker.example.invalid" in serialized
     assert "magnet:" not in serialized
 
 
@@ -648,6 +656,7 @@ def test_start_scan_is_explicit_and_disables_mutating_controls(
 ) -> None:
     app = _runtime_app(tmp_path)
     created_threads: list[Any] = []
+    confirmations: list[str] = []
 
     class _ThreadDouble:
         def __init__(self, **kwargs: Any) -> None:
@@ -658,7 +667,12 @@ def test_start_scan_is_explicit_and_disables_mutating_controls(
         def start(self) -> None:
             self.started = True
 
-    monkeypatch.setattr(gui.messagebox, "askyesno", lambda *_args, **_kwargs: True, raising=False)
+    monkeypatch.setattr(
+        gui.messagebox,
+        "askyesno",
+        lambda _title, message, **_kwargs: confirmations.append(message) or True,
+        raising=False,
+    )
     monkeypatch.setattr(gui.threading, "Thread", _ThreadDouble)
 
     app._start_scan()
@@ -672,6 +686,9 @@ def test_start_scan_is_explicit_and_disables_mutating_controls(
     assert created_threads[0].started is True
     assert created_threads[0].kwargs["args"] == (app.config,)
     assert load_config(app.config_path) == app.config
+    assert "STARTED" in confirmations[0]
+    assert "STOPPED" in confirmations[0]
+    assert "als Peer" in confirmations[0]
 
 
 def test_start_scan_cancel_or_missing_target_does_not_start_thread(
@@ -745,11 +762,61 @@ def test_progress_does_not_overwrite_pending_close_message(tmp_path: Path) -> No
     app.close_requested = True
     app.running = True
     app.status_text.set("Fenster schließt nach Abschluss.")
-    app.events.put(("progress", "DHT-Suche läuft"))
+    app._publish_progress("DHT-Suche läuft")
 
     app._poll_events()
 
     assert app.status_text.value == "Fenster schließt nach Abschluss."
+    assert app.root.after_calls
+
+
+def test_many_progress_updates_keep_only_latest_text(tmp_path: Path) -> None:
+    app = _runtime_app(tmp_path)
+    app.running = True
+    failures: list[Exception] = []
+
+    def publish(worker: int) -> None:
+        try:
+            for sequence in range(2_000):
+                app._publish_progress(f"Worker {worker}: {sequence}")
+        except Exception as exc:  # pragma: no cover - nur Diagnose bei Threadfehlern
+            failures.append(exc)
+
+    threads = [threading.Thread(target=publish, args=(worker,)) for worker in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    app._publish_progress("Neuester Fortschritt")
+
+    assert failures == []
+    assert app.progress_events.maxsize == 1
+    assert app.progress_events.qsize() == 1
+    assert app.events.qsize() == 0
+
+    app._poll_events()
+
+    assert app.status_text.value == "Neuester Fortschritt"
+    assert app.progress_events.empty()
+
+
+def test_terminal_event_is_not_blocked_by_progress_flood(tmp_path: Path) -> None:
+    app = _runtime_app(tmp_path)
+    app.running = True
+    app.status_text.set("Prüflauf läuft")
+    result = ScanResult(run_id="offline", started_at_utc="2026-10-20T10:00:00Z")
+    shown: list[ScanResult] = []
+    app._show_result = shown.append
+
+    for sequence in range(10_000):
+        app._publish_progress(f"Fortschritt {sequence}")
+    app.events.put_nowait(("done", result))
+
+    app._poll_events()
+
+    assert shown == [result]
+    assert app.status_text.value == "Prüflauf läuft"
+    assert app.progress_events.empty()
     assert app.root.after_calls
 
 
@@ -889,7 +956,120 @@ def test_result_table_uses_plain_language_and_ipv6_endpoint(tmp_path: Path) -> N
     assert values[3] == "Teile gemeldet; Anfragen erlaubt"
     assert values[4] == "Beispielnetz"
     assert values[5] == "VPN: Beispiel-VPN"
-    assert "1 DHT-Treffer, 1 direkt geprüft" in app.status_text.value
+    assert "1 Kandidaten gefunden, 1 direkt geprüft" in app.status_text.value
+
+
+def test_result_table_streams_only_positive_database_records_and_uses_totals(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    app = _runtime_app(tmp_path)
+    app._finish_running_state = lambda: None
+    positive_handshake = _handshake(ipv6=True)
+    positive_record = EvidenceRecord(
+        handshake=positive_handshake,
+        enrichment=NetworkEnrichment(
+            ip=positive_handshake.candidate.ip,
+            enriched_at_utc="2026-10-20T10:00:03Z",
+            holder="Datenbanknetz",
+        ),
+        vpn=VpnClassification(status="not_known_vpn"),
+        evidence_event_sha256="d" * 64,
+    )
+    failed_handshake = _handshake(confirmed=False)
+    batch_sizes: list[int] = []
+
+    class _RunStoreDouble:
+        def iter_evidence_records(self, *, batch_size: int) -> Any:
+            batch_sizes.append(batch_size)
+            yield positive_record
+
+    monkeypatch.setattr(gui, "RunStore", lambda _path: _RunStoreDouble())
+    result = ScanResult(
+        run_id="streaming",
+        started_at_utc="2026-10-20T10:00:00Z",
+        candidates=[failed_handshake.candidate],
+        handshakes=[failed_handshake],
+        candidate_count=307,
+        handshake_count=305,
+        confirmed_handshake_count=41,
+        offering_observation_count=9,
+        known_vpn_total=0,
+        run_store_path=tmp_path / "run.sqlite3",
+        target_metrics=(
+            TargetScanMetrics(
+                target_label="Ziel A",
+                info_hash_hex="a" * 40,
+                candidates_discovered=307,
+                candidates_checked=305,
+                verification_attempts=712,
+                confirmed_handshakes=41,
+                positive_findings=9,
+            ),
+            TargetScanMetrics(
+                target_label="Ziel B",
+                info_hash_hex="b" * 40,
+            ),
+        ),
+    )
+
+    app._show_result(result)
+
+    assert batch_sizes == [5]
+    assert len(app.result_tree.inserted) == 1
+    values = app.result_tree.inserted[0][1]["values"]
+    assert values[2] == "[2001:4860:4860::8888]:51413"
+    assert values[4] == "Datenbanknetz"
+    assert "307 Kandidaten gefunden, 305 direkt geprüft" in app.status_text.value
+    assert "0 bekannte VPN-Befunde" in app.status_text.value
+    assert "Ziel A (aaaaaaaaaaaa…): 307 gefunden" in app.status_text.value
+    assert "Ziel B (bbbbbbbbbbbb…): 0 gefunden" in app.status_text.value
+
+
+def test_result_table_bounds_database_rows_and_points_to_complete_reports(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    app = _runtime_app(tmp_path)
+    app._finish_running_state = lambda: None
+    handshake = _handshake()
+    record = EvidenceRecord(
+        handshake=handshake,
+        enrichment=NetworkEnrichment(
+            ip=handshake.candidate.ip,
+            enriched_at_utc="2026-10-20T10:00:03Z",
+            holder="Datenbanknetz",
+        ),
+        vpn=VpnClassification(status="not_known_vpn"),
+        evidence_event_sha256="e" * 64,
+    )
+    yielded = 0
+
+    class _RunStoreDouble:
+        def iter_evidence_records(self, *, batch_size: int) -> Any:
+            nonlocal yielded
+            assert batch_size == 5
+            for _ in range(150):
+                yielded += 1
+                yield record
+
+    monkeypatch.setattr(gui, "RunStore", lambda _path: _RunStoreDouble())
+    result = ScanResult(
+        run_id="bounded-gui",
+        started_at_utc="2026-10-20T10:00:00Z",
+        candidate_count=150,
+        handshake_count=150,
+        confirmed_handshake_count=150,
+        offering_observation_count=150,
+        run_store_path=tmp_path / "run.sqlite3",
+    )
+
+    app._show_result(result)
+
+    assert yielded == gui.MAX_GUI_RESULT_ROWS
+    assert len(app.result_tree.inserted) == gui.MAX_GUI_RESULT_ROWS
+    assert "100 von 150 positiven Befunden" in app.status_text.value
+    assert "die Berichte enthalten alle" in app.status_text.value
 
 
 def test_real_partial_result_errors_still_get_one_warning(

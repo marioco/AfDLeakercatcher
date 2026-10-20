@@ -92,10 +92,10 @@ def test_append_many_verifies_once_and_builds_one_hash_chain(
     original_read_entries = evidence_module._read_entries
     verification_calls = 0
 
-    def counting_read_entries(file_handle: object) -> object:
+    def counting_read_entries(file_handle: object, *, end_offset: int | None = None) -> object:
         nonlocal verification_calls
         verification_calls += 1
-        return original_read_entries(file_handle)
+        return original_read_entries(file_handle, end_offset=end_offset)
 
     monkeypatch.setattr(evidence_module, "_read_entries", counting_read_entries)
     entries = journal.append_many(
@@ -160,23 +160,137 @@ def test_journal_and_atomic_files_use_private_permissions(tmp_path: Path) -> Non
     assert stat.S_IMODE(cache_path.stat().st_mode) == 0o600
 
 
-def test_append_refuses_total_journal_limit_without_partial_write(
+def test_append_has_no_total_event_count_or_journal_size_cap(tmp_path: Path) -> None:
+    path = tmp_path / "evidence.jsonl"
+    journal = EvidenceJournal(path)
+    assert not hasattr(evidence_module, "MAX_JOURNAL_BYTES")
+
+    for batch_index in range(13):
+        entries = journal.append_many(
+            ({"batch": batch_index, "item": item} for item in range(5)),
+            recorded_at_utc="2026-10-20T10:01:00Z",
+        )
+        assert len(entries) == 5
+
+    verification = journal.verify()
+    assert verification.valid is True
+    assert verification.entries_count == 65
+
+
+def test_repeated_five_event_batches_scan_existing_chain_only_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = tmp_path / "evidence.jsonl"
     journal = EvidenceJournal(path)
-    journal.append({"kind": "first"}, recorded_at_utc="2026-10-20T10:00:00Z")
-    original = path.read_bytes()
-    monkeypatch.setattr(evidence_module, "MAX_JOURNAL_BYTES", len(original))
+    original_read_entries = evidence_module._read_entries
+    verification_calls = 0
 
-    with pytest.raises(EvidenceJournalError, match="Archivieren"):
-        journal.append_many(
-            ({"kind": "second"}, {"kind": "third"}),
+    def counting_read_entries(file_handle: object, *, end_offset: int | None = None) -> object:
+        nonlocal verification_calls
+        verification_calls += 1
+        return original_read_entries(file_handle, end_offset=end_offset)
+
+    monkeypatch.setattr(evidence_module, "_read_entries", counting_read_entries)
+    for batch_index in range(13):
+        entries = journal.append_many(
+            ({"batch": batch_index, "item": item} for item in range(5)),
             recorded_at_utc="2026-10-20T10:01:00Z",
         )
+        assert len(entries) == 5
 
-    assert path.read_bytes() == original
+    assert verification_calls == 1
+    assert len(path.read_bytes().splitlines()) == 65
+
+
+def test_verify_completes_exact_prepared_partial_batch_after_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "evidence.jsonl"
+    journal = EvidenceJournal(path)
+    journal.append(
+        {"kind": "existing"},
+        recorded_at_utc="2026-10-20T09:00:00Z",
+    )
+    original_size = path.stat().st_size
+    original_write_all = evidence_module._write_all
+    write_calls = 0
+
+    def interrupt_journal_write(file_descriptor: int, data: bytes) -> None:
+        nonlocal write_calls
+        write_calls += 1
+        if write_calls == 3:
+            original_write_all(file_descriptor, data[: max(1, len(data) // 2)])
+            raise OSError("simulierter Absturz beim Journal-Append")
+        original_write_all(file_descriptor, data)
+
+    monkeypatch.setattr(evidence_module, "_write_all", interrupt_journal_write)
+    with pytest.raises(EvidenceJournalError, match="konnte nicht erweitert"):
+        journal.append_many(
+            ({"batch": 1, "item": item} for item in range(5)),
+            recorded_at_utc="2026-10-20T10:00:00Z",
+        )
+
+    pending_path = path.with_name(f".{path.name}.pending")
+    assert pending_path.is_file()
+    assert path.stat().st_size > original_size
+    monkeypatch.setattr(evidence_module, "_write_all", original_write_all)
+
+    recovered_journal = EvidenceJournal(path)
+    verification = recovered_journal.verify()
+
+    assert verification.valid is True
+    assert verification.entries_count == 6
+    assert not pending_path.exists()
+    stored_events = [json.loads(line)["event"] for line in path.read_bytes().splitlines()]
+    assert stored_events[0] == {"kind": "existing"}
+    assert stored_events[1:] == [{"batch": 1, "item": item} for item in range(5)]
+    assert recovered_journal.append({"kind": "after-recovery"}).sequence == 7
+
+
+def test_verify_does_not_repair_tail_that_differs_from_prepared_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "evidence.jsonl"
+    journal = EvidenceJournal(path)
+    journal.append(
+        {"kind": "existing"},
+        recorded_at_utc="2026-10-20T09:00:00Z",
+    )
+    original_size = path.stat().st_size
+    original_write_all = evidence_module._write_all
+    write_calls = 0
+
+    def interrupt_journal_write(file_descriptor: int, data: bytes) -> None:
+        nonlocal write_calls
+        write_calls += 1
+        if write_calls == 3:
+            original_write_all(file_descriptor, data[: max(1, len(data) // 2)])
+            raise OSError("simulierter Absturz beim Journal-Append")
+        original_write_all(file_descriptor, data)
+
+    monkeypatch.setattr(evidence_module, "_write_all", interrupt_journal_write)
+    with pytest.raises(EvidenceJournalError):
+        journal.append_many(
+            ({"batch": 1, "item": item} for item in range(5)),
+            recorded_at_utc="2026-10-20T10:00:00Z",
+        )
+    monkeypatch.setattr(evidence_module, "_write_all", original_write_all)
+
+    tampered = bytearray(path.read_bytes())
+    tampered[original_size] ^= 1
+    path.write_bytes(tampered)
+    pending_path = path.with_name(f".{path.name}.pending")
+    before_verification = path.read_bytes()
+
+    verification = EvidenceJournal(path).verify()
+
+    assert verification.valid is False
+    assert "Journalende passt nicht" in (verification.error or "")
+    assert path.read_bytes() == before_verification
+    assert pending_path.is_file()
 
 
 def test_verification_detects_modified_event(tmp_path: Path) -> None:

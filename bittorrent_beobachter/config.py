@@ -21,15 +21,23 @@ from .models import Target
 
 MAX_CONFIG_BYTES = 256_000
 MAX_CONFIG_TARGETS = 20
-BUNDLED_PRESET_REVISION = 3
-DEFAULT_MAX_CHECKS = 600
-DEFAULT_OBSERVATION_WORKERS = 120
-LEGACY_MAX_CHECKS = 120
-LEGACY_OBSERVATION_WORKERS = 32
+BUNDLED_PRESET_REVISION = 4
 DEFAULT_BOOTSTRAP_NODES = (
     ("router.bittorrent.com", 6881),
     ("router.utorrent.com", 6881),
     ("dht.transmissionbt.com", 6881),
+)
+DEFAULT_TRACKERS = (
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.demonii.com:1337/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://exodus.desync.com:6969/announce",
+    "udp://tracker.openbittorrent.com:6969/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://explodie.org:6969/announce",
+    "udp://tracker.dler.org:6969/announce",
+    "udp://tracker.bittor.pw:1337/announce",
+    "udp://retracker01-msk-virt.corbina.net:80/announce",
 )
 DEFAULT_VPN_PROVIDER_MARKERS = (
     ("Mullvad", ("mullvad vpn ab", "mullvad vpn")),
@@ -53,20 +61,19 @@ class ConfigError(ValueError):
 @dataclass(frozen=True, slots=True)
 class DhtSettings:
     timeout_seconds: float = 2.5
-    max_queries: int = 80
-    alpha: int = 8
-    max_nodes: int = 1_000
-    max_candidates: int = 300
+    overall_timeout_seconds: float = 60.0
+    concurrency: int = 8
+    quiet_seconds: float = 30.0
+    refresh_interval_seconds: float = 2.0
     bootstrap_nodes: tuple[tuple[str, int], ...] = DEFAULT_BOOTSTRAP_NODES
 
 
 @dataclass(frozen=True, slots=True)
 class PeerSettings:
-    timeout_seconds: float = 4.0
+    timeout_seconds: float = 8.0
     observation_seconds: float = 60.0
-    max_checks: int = DEFAULT_MAX_CHECKS
-    workers: int = 8
-    observation_workers: int = DEFAULT_OBSERVATION_WORKERS
+    retry_attempts: int = 3
+    retry_backoff_seconds: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,10 +108,12 @@ DEFAULT_TARGETS = (
     Target(
         label="Voreingestellter Infohash 1",
         info_hash=bytes.fromhex("852795102149749ad91123af01ceac5da6f9eb5a"),
+        trackers=DEFAULT_TRACKERS,
     ),
     Target(
         label="Voreingestellter Infohash 2",
         info_hash=bytes.fromhex("db503db679f508aa31a9e07913b2aa8cf7aa6dff"),
+        trackers=DEFAULT_TRACKERS,
     ),
 )
 
@@ -120,11 +129,21 @@ def with_bundled_presets(config: AppConfig) -> AppConfig:
         return config
 
     presets_by_hash = {target.info_hash: target for target in DEFAULT_TARGETS}
-    normalized_targets = (
-        tuple(presets_by_hash.get(target.info_hash, target) for target in config.targets)
-        if config.preset_revision < 2
-        else config.targets
-    )
+    if config.preset_revision < 2:
+        normalized_targets = tuple(
+            presets_by_hash.get(target.info_hash, target) for target in config.targets
+        )
+    else:
+        normalized_targets = tuple(
+            replace(target, trackers=presets_by_hash[target.info_hash].trackers)
+            if (
+                target.info_hash in presets_by_hash
+                and not target.trackers
+                and config.preset_revision < 4
+            )
+            else target
+            for target in config.targets
+        )
     existing_hashes = {target.info_hash for target in normalized_targets}
     missing = (
         tuple(target for target in DEFAULT_TARGETS if target.info_hash not in existing_hashes)
@@ -136,15 +155,9 @@ def with_bundled_presets(config: AppConfig) -> AppConfig:
             "Die einmalige Voreinstellungs-Aktualisierung überschreitet das "
             f"Ziel-Limit von {MAX_CONFIG_TARGETS}."
         )
-    peer = config.peer
-    if peer.max_checks == LEGACY_MAX_CHECKS:
-        peer = replace(peer, max_checks=DEFAULT_MAX_CHECKS)
-    if peer.observation_workers == LEGACY_OBSERVATION_WORKERS:
-        peer = replace(peer, observation_workers=DEFAULT_OBSERVATION_WORKERS)
     return replace(
         config,
         targets=(*normalized_targets, *missing),
-        peer=peer,
         preset_revision=BUNDLED_PRESET_REVISION,
     )
 
@@ -193,13 +206,73 @@ def _decode_btih(value: str) -> bytes:
     return decoded
 
 
+def _validated_udp_tracker(value: Any, field: str) -> str:
+    """Validiert eine öffentliche UDP-Tracker-URL ohne sie aufzulösen."""
+    tracker = _clean_optional_text(value, field, 2_048)
+    if not tracker:
+        raise ConfigError(f"{field} darf nicht leer sein.")
+    try:
+        parts = urlsplit(tracker)
+        port = parts.port
+    except ValueError as exc:
+        raise ConfigError(f"{field} enthält keinen gültigen Port.") from exc
+    if parts.scheme.lower() != "udp":
+        raise ConfigError(f"{field} muss eine udp://-Tracker-Adresse sein.")
+    if parts.username is not None or parts.password is not None:
+        raise ConfigError(f"{field} darf keine Zugangsdaten enthalten.")
+    host = parts.hostname
+    if not host or port is None or not 1 <= port <= 65_535:
+        raise ConfigError(f"{field} benötigt Host und Port.")
+    if parts.query or parts.fragment:
+        raise ConfigError(f"{field} darf weder Abfrage noch Fragment enthalten.")
+    if parts.path not in {"", "/announce"}:
+        raise ConfigError(f"{field} darf nur den Pfad /announce enthalten.")
+    if any(character.isspace() for character in host):
+        raise ConfigError(f"{field} enthält einen ungültigen Host.")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            ascii_host = host.encode("idna").decode("ascii")
+        except UnicodeError as exc:
+            raise ConfigError(f"{field} enthält einen ungültigen Host.") from exc
+        labels = ascii_host.rstrip(".").split(".")
+        if len(ascii_host) > 253 or any(
+            not label
+            or len(label) > 63
+            or label.startswith("-")
+            or label.endswith("-")
+            or any(not (character.isalnum() or character == "-") for character in label)
+            for label in labels
+        ):
+            raise ConfigError(f"{field} enthält einen ungültigen Host.") from None
+    else:
+        if not address.is_global or address.is_multicast:
+            raise ConfigError(f"{field} muss auf eine öffentliche Adresse zeigen.")
+    return tracker
+
+
+def _validated_tracker_tuple(value: Any, field: str) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise ConfigError(f"{field} muss eine Liste sein.")
+    trackers: list[str] = []
+    seen: set[str] = set()
+    for index, item in enumerate(value):
+        tracker = _validated_udp_tracker(item, f"{field}[{index}]")
+        dedupe_key = tracker.casefold()
+        if dedupe_key not in seen:
+            seen.add(dedupe_key)
+            trackers.append(tracker)
+    return tuple(trackers)
+
+
 def parse_magnet(
     magnet: str,
     *,
     label_override: str | None = None,
     source_note: str = "",
 ) -> Target:
-    """Extrahiert nur den v1-Infohash; fremde Namen und Tracker werden ignoriert."""
+    """Extrahiert v1-Infohash und validierte UDP-Tracker, nie den fremden Namen."""
     if len(magnet) > 32_000:
         raise ConfigError("Der Magnet-Link ist ungewöhnlich lang.")
     parts = urlsplit(magnet.strip())
@@ -224,7 +297,13 @@ def parse_magnet(
         "Quellenhinweis",
         1_000,
     )
-    return Target(label=label, info_hash=info_hash, source_note=cleaned_source_note)
+    trackers = _validated_tracker_tuple(query.get("tr", []), "Magnet-Tracker")
+    return Target(
+        label=label,
+        info_hash=info_hash,
+        source_note=cleaned_source_note,
+        trackers=trackers,
+    )
 
 
 def _require_mapping(value: Any, field: str) -> dict[str, Any]:
@@ -337,6 +416,10 @@ def config_from_dict(raw: dict[str, Any]) -> AppConfig:
                 label=label or f"Infohash {info_hash.hex()[:12]}",
                 info_hash=info_hash,
                 source_note=source_note,
+                trackers=_validated_tracker_tuple(
+                    target_raw.get("trackers", []),
+                    f"targets[{index}].trackers",
+                ),
             )
         else:
             raise ConfigError(f"targets[{index}] benötigt magnet oder info_hash.")
@@ -363,23 +446,44 @@ def config_from_dict(raw: dict[str, Any]) -> AppConfig:
         port = _bounded_int(node[1], f"dht.bootstrap_nodes[{index}][1]", 1, 65_535)
         bootstrap.append((host, port))
 
+    quiet_seconds = _bounded_float(
+        dht_raw.get("quiet_seconds", 30.0), "dht.quiet_seconds", 1.0, 600.0
+    )
+    refresh_interval_seconds = _bounded_float(
+        dht_raw.get("refresh_interval_seconds", 2.0),
+        "dht.refresh_interval_seconds",
+        0.1,
+        60.0,
+    )
+    if refresh_interval_seconds > quiet_seconds:
+        raise ConfigError(
+            "dht.refresh_interval_seconds darf dht.quiet_seconds nicht überschreiten."
+        )
     dht = DhtSettings(
         timeout_seconds=_bounded_float(
             dht_raw.get("timeout_seconds", 2.5), "dht.timeout_seconds", 0.25, 30.0
         ),
-        max_queries=_bounded_int(dht_raw.get("max_queries", 80), "dht.max_queries", 1, 500),
-        alpha=_bounded_int(dht_raw.get("alpha", 8), "dht.alpha", 1, 32),
-        max_nodes=_bounded_int(dht_raw.get("max_nodes", 1_000), "dht.max_nodes", 8, 10_000),
-        max_candidates=_bounded_int(
-            dht_raw.get("max_candidates", 300), "dht.max_candidates", 1, 5_000
+        overall_timeout_seconds=_bounded_float(
+            dht_raw.get("overall_timeout_seconds", 60.0),
+            "dht.overall_timeout_seconds",
+            1.0,
+            300.0,
         ),
+        concurrency=_bounded_int(
+            dht_raw.get("concurrency", dht_raw.get("alpha", 8)),
+            "dht.concurrency",
+            1,
+            32,
+        ),
+        quiet_seconds=quiet_seconds,
+        refresh_interval_seconds=refresh_interval_seconds,
         bootstrap_nodes=tuple(bootstrap),
     )
 
     peer_raw = _require_mapping(raw.get("peer", {}), "peer")
     peer = PeerSettings(
         timeout_seconds=_bounded_float(
-            peer_raw.get("timeout_seconds", 4.0), "peer.timeout_seconds", 0.25, 30.0
+            peer_raw.get("timeout_seconds", 8.0), "peer.timeout_seconds", 0.25, 30.0
         ),
         observation_seconds=_bounded_float(
             peer_raw.get("observation_seconds", 60.0),
@@ -387,18 +491,14 @@ def config_from_dict(raw: dict[str, Any]) -> AppConfig:
             60.0,
             60.0,
         ),
-        max_checks=_bounded_int(
-            peer_raw.get("max_checks", DEFAULT_MAX_CHECKS),
-            "peer.max_checks",
-            1,
-            2_000,
+        retry_attempts=_bounded_int(
+            peer_raw.get("retry_attempts", 3), "peer.retry_attempts", 1, 10
         ),
-        workers=_bounded_int(peer_raw.get("workers", 8), "peer.workers", 1, 32),
-        observation_workers=_bounded_int(
-            peer_raw.get("observation_workers", DEFAULT_OBSERVATION_WORKERS),
-            "peer.observation_workers",
-            1,
-            128,
+        retry_backoff_seconds=_bounded_float(
+            peer_raw.get("retry_backoff_seconds", 1.0),
+            "peer.retry_backoff_seconds",
+            0.0,
+            30.0,
         ),
     )
 
@@ -518,7 +618,7 @@ def load_config(path: Path) -> AppConfig:
 
 
 def config_to_dict(config: AppConfig) -> dict[str, Any]:
-    """Serialisiert ohne Magnet-Tracker oder andere nicht benötigte Daten."""
+    """Serialisiert ausschließlich validierte Laufzeitkonfiguration."""
     return {
         "schema_version": 1,
         "bundled_preset_revision": config.preset_revision,
@@ -528,23 +628,23 @@ def config_to_dict(config: AppConfig) -> dict[str, Any]:
                 "label": target.label,
                 "info_hash": target.info_hash_hex,
                 "source_note": target.source_note,
+                "trackers": list(target.trackers),
             }
             for target in config.targets
         ],
         "dht": {
             "timeout_seconds": config.dht.timeout_seconds,
-            "max_queries": config.dht.max_queries,
-            "alpha": config.dht.alpha,
-            "max_nodes": config.dht.max_nodes,
-            "max_candidates": config.dht.max_candidates,
+            "overall_timeout_seconds": config.dht.overall_timeout_seconds,
+            "concurrency": config.dht.concurrency,
+            "quiet_seconds": config.dht.quiet_seconds,
+            "refresh_interval_seconds": config.dht.refresh_interval_seconds,
             "bootstrap_nodes": [list(node) for node in config.dht.bootstrap_nodes],
         },
         "peer": {
             "timeout_seconds": config.peer.timeout_seconds,
             "observation_seconds": config.peer.observation_seconds,
-            "max_checks": config.peer.max_checks,
-            "workers": config.peer.workers,
-            "observation_workers": config.peer.observation_workers,
+            "retry_attempts": config.peer.retry_attempts,
+            "retry_backoff_seconds": config.peer.retry_backoff_seconds,
         },
         "enrichment": {
             "enabled": config.enrichment.enabled,

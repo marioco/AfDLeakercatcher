@@ -42,6 +42,12 @@ MESSAGE_HAVE = 4
 MESSAGE_BITFIELD = 5
 MESSAGE_REQUEST = 6
 MESSAGE_PIECE = 7
+MESSAGE_PORT = 9
+MESSAGE_SUGGEST_PIECE = 13
+MESSAGE_HAVE_ALL = 14
+MESSAGE_HAVE_NONE = 15
+MESSAGE_REJECT_REQUEST = 16
+MESSAGE_ALLOWED_FAST = 17
 MESSAGE_EXTENSION = 20
 
 
@@ -243,6 +249,40 @@ async def _read_bitfield(
         set_bits += sum(value.bit_count() for value in chunk)
         remaining -= len(chunk)
     return digest.hexdigest(), set_bits
+
+
+async def _read_hashed_payload(
+    loop: asyncio.AbstractEventLoop,
+    peer_socket: socket.socket,
+    payload_length: int,
+    *,
+    deadline: float,
+    exchange_state: _ExchangeState,
+    observation_state: _ObservationState,
+    initial_payload: bytes = b"",
+) -> str:
+    """Verwirft eine begrenzte Kontrollnutzlast blockweise und liefert nur ihren Hash."""
+    if payload_length < 0:
+        raise ValueError("Kontrollnutzlast darf nicht negativ sein.")
+    if not isinstance(initial_payload, bytes):
+        raise TypeError("initial_payload muss eine Bytefolge sein.")
+    digest = hashlib.sha256()
+    digest.update(initial_payload)
+    remaining = payload_length
+    while remaining:
+        chunk = await _receive_exact(
+            loop,
+            peer_socket,
+            min(remaining, RECEIVE_CHUNK_BYTES),
+            deadline=deadline,
+            exchange_state=exchange_state,
+            observation_state=observation_state,
+        )
+        if chunk is None:
+            raise AssertionError("Kontrollnutzlast darf kein sauberes EOF liefern.")
+        digest.update(chunk)
+        remaining -= len(chunk)
+    return digest.hexdigest()
 
 
 def _availability_result(
@@ -481,10 +521,126 @@ async def _observe_control_messages(
                 )
                 continue
 
+            if message_id == MESSAGE_PORT:
+                if payload_length != 2:
+                    raise PeerProtocolError("PORT-Nachricht muss genau 3 Byte lang sein.")
+                port_bytes = await _receive_exact(
+                    loop,
+                    peer_socket,
+                    2,
+                    deadline=deadline,
+                    exchange_state=exchange_state,
+                    observation_state=state,
+                )
+                if port_bytes is None:
+                    raise AssertionError("PORT-Nutzlast darf kein sauberes EOF liefern.")
+                _record_event(state, "port", payload_length=2)
+                continue
+
+            if message_id in {MESSAGE_HAVE_ALL, MESSAGE_HAVE_NONE}:
+                if payload_length != 0:
+                    raise PeerProtocolError(
+                        f"Fast-Extension-Nachricht {message_id} darf keine Nutzlast haben."
+                    )
+                if message_id == MESSAGE_HAVE_ALL:
+                    state.have_announced = True
+                    event_kind = "have_all"
+                else:
+                    event_kind = "have_none"
+                _record_event(state, event_kind, payload_length=0)
+                continue
+
+            if message_id in {MESSAGE_SUGGEST_PIECE, MESSAGE_ALLOWED_FAST}:
+                if payload_length != 4:
+                    raise PeerProtocolError(
+                        f"Fast-Extension-Nachricht {message_id} muss genau 5 Byte lang sein."
+                    )
+                piece_bytes = await _receive_exact(
+                    loop,
+                    peer_socket,
+                    4,
+                    deadline=deadline,
+                    exchange_state=exchange_state,
+                    observation_state=state,
+                )
+                if piece_bytes is None:
+                    raise AssertionError("Fast-Extension-Nutzlast darf kein sauberes EOF liefern.")
+                _record_event(
+                    state,
+                    "suggest_piece" if message_id == MESSAGE_SUGGEST_PIECE else "allowed_fast",
+                    payload_length=4,
+                    piece_index=int.from_bytes(piece_bytes, "big"),
+                )
+                continue
+
+            if message_id == MESSAGE_REJECT_REQUEST:
+                if payload_length != 12:
+                    raise PeerProtocolError(
+                        "REJECT_REQUEST-Nachricht muss genau 13 Byte lang sein."
+                    )
+                rejected_request = await _receive_exact(
+                    loop,
+                    peer_socket,
+                    12,
+                    deadline=deadline,
+                    exchange_state=exchange_state,
+                    observation_state=state,
+                )
+                if rejected_request is None:
+                    raise AssertionError("REJECT_REQUEST-Nutzlast darf kein sauberes EOF liefern.")
+                _record_event(
+                    state,
+                    "reject_request",
+                    payload_length=12,
+                    piece_index=int.from_bytes(rejected_request[:4], "big"),
+                )
+                continue
+
+            if message_id == MESSAGE_EXTENSION:
+                if payload_length < 1:
+                    raise PeerProtocolError(
+                        "Extended-Nachricht benötigt mindestens eine Erweiterungs-ID."
+                    )
+                extension_id_bytes = await _receive_exact(
+                    loop,
+                    peer_socket,
+                    1,
+                    deadline=deadline,
+                    exchange_state=exchange_state,
+                    observation_state=state,
+                )
+                if extension_id_bytes is None:
+                    raise AssertionError("Erweiterungs-ID darf kein sauberes EOF liefern.")
+                extension_id = extension_id_bytes[0]
+                if extension_id != 0:
+                    _record_event(
+                        state,
+                        "extension_payload_rejected",
+                        payload_length=payload_length,
+                    )
+                    raise PeerProtocolError(
+                        "Nicht angeforderte Extended-Nutzlast wird nicht eingelesen."
+                    )
+                payload_sha256 = await _read_hashed_payload(
+                    loop,
+                    peer_socket,
+                    payload_length - 1,
+                    deadline=deadline,
+                    exchange_state=exchange_state,
+                    observation_state=state,
+                    initial_payload=extension_id_bytes,
+                )
+                _record_event(
+                    state,
+                    "extension_handshake",
+                    payload_length=payload_length,
+                    payload_sha256=payload_sha256,
+                )
+                continue
+
             rejected_kind = {
                 MESSAGE_REQUEST: "request_rejected",
                 MESSAGE_PIECE: "piece_rejected",
-                MESSAGE_EXTENSION: "extension_rejected",
             }.get(message_id, "unknown_message_rejected")
             _record_event(state, rejected_kind, payload_length=payload_length)
             raise PeerProtocolError(

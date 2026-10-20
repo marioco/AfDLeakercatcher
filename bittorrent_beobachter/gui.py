@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import logging
 import queue
+import sqlite3
 import threading
+from collections.abc import Iterable
+from contextlib import suppress
 from dataclasses import replace
+from itertools import islice
 from pathlib import Path
 from tkinter import (
     BOTH,
@@ -36,7 +40,10 @@ from .config import (
     with_bundled_presets,
 )
 from .desktop import open_directory
-from .models import ScanResult
+from .models import EvidenceRecord, ScanResult
+from .run_store import RunStore
+
+MAX_GUI_RESULT_ROWS = 100
 
 
 class SettingsDialog(Toplevel):
@@ -102,6 +109,37 @@ class SettingsDialog(Toplevel):
         self.destroy()
 
 
+def _iter_positive_evidence(result: ScanResult) -> Iterable[EvidenceRecord]:
+    """Liefert positive GUI-Zeilen aus der laufbezogenen Ablage."""
+
+    if result.run_store_path is None:
+        return (record for record in result.records if record.handshake.offering_observed)
+    return (
+        record
+        for record in RunStore(result.run_store_path).iter_evidence_records(batch_size=5)
+        if record.handshake.offering_observed
+    )
+
+
+def _target_status_text(result: ScanResult) -> str:
+    """Fasst die Bilanz jedes Infohashes kompakt und einschließlich Nullwerten zusammen."""
+
+    if not result.target_metrics:
+        return ""
+    details = "; ".join(
+        (
+            f"{metric.target_label} ({metric.info_hash_hex[:12]}…): "
+            f"{metric.candidates_discovered} gefunden, "
+            f"{metric.candidates_checked} geprüft, "
+            f"{metric.verification_attempts} Versuche, "
+            f"{metric.confirmed_handshakes} Handshakes, "
+            f"{metric.positive_findings} positiv"
+        )
+        for metric in result.target_metrics
+    )
+    return f" Pro Infohash: {details}."
+
+
 class ObserverApp:
     """Bedienoberfläche mit klarer Trennung von Beobachtung und Behauptung."""
 
@@ -109,7 +147,11 @@ class ObserverApp:
         self.root = root
         self.config_path = config_path
         self.data_dir = data_dir
+        # Abschlussereignisse bleiben in einer eigenen, unbegrenzten Queue. So kann
+        # eine hohe Fortschrittsrate weder "done" noch "error" verdrängen.
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self.progress_events: queue.Queue[str] = queue.Queue(maxsize=1)
+        self._progress_event_lock = threading.Lock()
         self.running = False
         self.scan_thread: threading.Thread | None = None
         self.close_requested = False
@@ -345,8 +387,8 @@ class ObserverApp:
         magnet = simpledialog.askstring(
             "Magnet-Link hinzufügen",
             (
-                "Magnet-Link einfügen. Gespeichert wird ausschließlich der "
-                "BitTorrent-v1-Infohash; Name, Tracker und sonstige Angaben werden verworfen:"
+                "Magnet-Link einfügen. Gespeichert werden der BitTorrent-v1-Infohash "
+                "und gültige UDP-Tracker für die Endpunktsuche; ein Titel ist nicht nötig:"
             ),
             parent=self.root,
         )
@@ -454,12 +496,16 @@ class ObserverApp:
         if not messagebox.askyesno(
             "Öffentlich sichtbaren Netzwerktest starten?",
             (
-                "Dieser Prüflauf ist nicht anonym: DHT-Knoten und geprüfte "
-                "Peer-Endpunkte sehen Ihre öffentliche Quell-IP und den abgefragten "
-                "Infohash und können dies protokollieren. Nach einem passenden Handshake "
-                "bleibt die direkte Verbindung bis zu einer Minute offen und das Programm "
-                "meldet Interesse, fordert aber keine Datei- oder Metadatenblöcke an. Es "
-                "führt kein announce durch und lädt nichts hoch. Möchten Sie den Prüflauf "
+                "Dieser Prüflauf ist nicht anonym: DHT-Knoten, konfigurierte Tracker "
+                "und geprüfte Peer-Endpunkte sehen Ihre öffentliche Quell-IP und den "
+                "abgefragten Infohash und können dies protokollieren. Zur Endpunktsuche "
+                "erhalten Tracker kurz eine STARTED-Meldung mit unbekannter Restmenge und "
+                "einem nicht geöffneten Port; unmittelbar danach sendet das Programm "
+                "STOPPED. Tracker können die Messinstanz in dieser kurzen Zeit als Peer "
+                "führen. Das Programm meldet keinen Upload. Nach einem passenden Handshake "
+                "bleibt die direkte Verbindung bis zu einer "
+                "Minute offen und das Programm meldet Interesse, fordert aber keine Datei- "
+                "oder Metadatenblöcke an und lädt nichts hoch. Möchten Sie den Prüflauf "
                 "trotzdem starten?"
             ),
             parent=self.root,
@@ -479,6 +525,7 @@ class ObserverApp:
         self.open_button.configure(state="disabled")
         self.progress.start(10)
         self.result_tree.delete(*self.result_tree.get_children())
+        self._discard_pending_progress()
         self.status_text.set("Prüflauf wird vorbereitet …")
         self.scan_thread = threading.Thread(
             target=self._scan_worker,
@@ -495,24 +542,37 @@ class ObserverApp:
             result = run_scan(
                 config_snapshot,
                 self.data_dir,
-                progress=lambda message: self.events.put(("progress", message)),
+                progress=self._publish_progress,
             )
         except Exception as exc:
             logging.getLogger("bittorrent_beobachter").exception("GUI-Prüflauf fehlgeschlagen")
-            self.events.put(("error", f"{type(exc).__name__}: {exc}"))
+            self.events.put_nowait(("error", f"{type(exc).__name__}: {exc}"))
         else:
-            self.events.put(("done", result))
+            self.events.put_nowait(("done", result))
+
+    def _publish_progress(self, message: str) -> None:
+        """Ersetzt einen alten Fortschritt atomar durch den neuesten Text."""
+
+        with self._progress_event_lock:
+            with suppress(queue.Empty):
+                self.progress_events.get_nowait()
+            self.progress_events.put_nowait(str(message))
+
+    def _discard_pending_progress(self) -> None:
+        """Entfernt den aktuell vorgemerkten Fortschritt, sofern vorhanden."""
+
+        with suppress(queue.Empty):
+            self.progress_events.get_nowait()
 
     def _poll_events(self) -> None:
+        terminal_event_seen = False
         while True:
             try:
                 event, payload = self.events.get_nowait()
             except queue.Empty:
                 break
-            if event == "progress":
-                if not self.close_requested:
-                    self.status_text.set(str(payload))
-            elif event == "error":
+            if event == "error":
+                terminal_event_seen = True
                 self._finish_running_state()
                 if not self.close_requested:
                     messagebox.showerror("Prüflauf fehlgeschlagen", str(payload), parent=self.root)
@@ -520,10 +580,23 @@ class ObserverApp:
                         "Der Prüflauf ist fehlgeschlagen. Details stehen im Protokoll."
                     )
             elif event == "done":
+                terminal_event_seen = True
                 if self.close_requested:
                     self._finish_running_state()
                 else:
                     self._show_result(payload)
+
+        try:
+            latest_progress = self.progress_events.get_nowait()
+        except queue.Empty:
+            latest_progress = None
+        if (
+            latest_progress is not None
+            and not terminal_event_seen
+            and self.running
+            and not self.close_requested
+        ):
+            self.status_text.set(latest_progress)
         if self.close_requested and not self.running:
             self.root.destroy()
             return
@@ -557,48 +630,42 @@ class ObserverApp:
 
     def _show_result(self, result: ScanResult) -> None:
         self._finish_running_state()
-        records_by_key = {
-            (
-                record.handshake.candidate.info_hash_hex,
-                record.handshake.candidate.ip,
-                record.handshake.candidate.port,
-            ): record
-            for record in result.records
-        }
-        for handshake in result.handshakes:
-            candidate = handshake.candidate
-            record = records_by_key.get((candidate.info_hash_hex, candidate.ip, candidate.port))
-            network = ""
-            classification = "nicht eingestuft"
-            if record is not None:
+        displayed_records = 0
+        records = iter(_iter_positive_evidence(result))
+        try:
+            for record in islice(records, MAX_GUI_RESULT_ROWS):
+                displayed_records += 1
+                handshake = record.handshake
+                candidate = handshake.candidate
                 network = record.enrichment.holder or record.enrichment.rdap_name or "unbekannt"
                 if record.vpn.status == "known_vpn":
                     classification = f"VPN: {record.vpn.provider or 'bekannt'}"
                 else:
                     classification = "VPN unbekannt"
-            endpoint = (
-                f"[{candidate.ip}]:{candidate.port}"
-                if ":" in candidate.ip
-                else f"{candidate.ip}:{candidate.port}"
-            )
-            self.result_tree.insert(
-                "",
-                END,
-                values=(
-                    handshake.completed_at_utc or handshake.attempted_at_utc,
-                    candidate.target_label,
-                    endpoint,
-                    (
-                        "Teile gemeldet; Anfragen erlaubt"
-                        if handshake.offering_observed
-                        else "nur Handshake"
-                        if handshake.confirmed
-                        else "nicht bestätigt"
+                endpoint = (
+                    f"[{candidate.ip}]:{candidate.port}"
+                    if ":" in candidate.ip
+                    else f"{candidate.ip}:{candidate.port}"
+                )
+                self.result_tree.insert(
+                    "",
+                    END,
+                    values=(
+                        handshake.completed_at_utc or handshake.attempted_at_utc,
+                        candidate.target_label,
+                        endpoint,
+                        "Teile gemeldet; Anfragen erlaubt",
+                        network,
+                        classification,
                     ),
-                    network,
-                    classification,
-                ),
-            )
+                )
+        except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+            result.errors.append(f"Laufdaten konnten nicht angezeigt werden: {exc}")
+        finally:
+            close_records = getattr(records, "close", None)
+            if callable(close_records):
+                close_records()
+
         if result.report_paths:
             self.latest_output_dir = result.report_paths[0].parent
             self.open_button.configure(state="normal")
@@ -609,19 +676,31 @@ class ObserverApp:
             notice_suffix = f" {notice_count} technische Laufhinweise stehen im Bericht."
         else:
             notice_suffix = ""
-        if not result.candidates and not result.errors:
+        positive_total = max(result.offering_count, displayed_records)
+        if positive_total > displayed_records:
+            display_suffix = (
+                f" Die Tabelle zeigt {displayed_records} von {positive_total} positiven "
+                "Befunden; die Berichte enthalten alle."
+            )
+        elif displayed_records:
+            display_suffix = f" Die Tabelle zeigt alle {displayed_records} positiven Befunde."
+        else:
+            display_suffix = " Die Ergebnistabelle enthält keine positiven Befunde."
+        target_suffix = _target_status_text(result)
+        if result.total_candidate_count == 0 and not result.errors:
             self.status_text.set(
                 "Fertig. Zurzeit wurden keine antwortenden Endpunkte gefunden. "
-                f"Das ist kein Programmfehler.{notice_suffix}"
+                f"Das ist kein Programmfehler.{display_suffix}{target_suffix}{notice_suffix}"
             )
         else:
             self.status_text.set(
-                f"Fertig: {len(result.candidates)} DHT-Treffer, "
-                f"{len(result.handshakes)} direkt geprüft, "
+                f"Fertig: {result.total_candidate_count} Kandidaten gefunden, "
+                f"{result.total_handshake_count} direkt geprüft, "
                 f"{result.confirmed_count} bestätigte Handshakes, "
                 f"{result.offering_count} positive Verfügbarkeitsprüfungen, "
-                f"{result.known_vpn_count} bekannte VPN-Endpunkte. "
-                f"{len(result.errors)} Hinweis(e)/Fehler.{notice_suffix}"
+                f"{result.known_vpn_count} bekannte VPN-Befunde. "
+                f"{len(result.errors)} Hinweis(e)/Fehler."
+                f"{display_suffix}{target_suffix}{notice_suffix}"
             )
         if result.errors:
             messagebox.showwarning(

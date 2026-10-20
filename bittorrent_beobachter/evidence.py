@@ -17,6 +17,7 @@ import json
 import math
 import os
 import re
+import stat
 import tempfile
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
@@ -28,10 +29,11 @@ from typing import Any, BinaryIO
 from .models import EvidenceRecord, HandshakeResult, NetworkEnrichment, VpnClassification
 
 JOURNAL_FORMAT_VERSION = 1
+JOURNAL_TRANSACTION_FORMAT_VERSION = 1
 GENESIS_SHA256 = "0" * 64
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 MAX_JOURNAL_LINE_BYTES = 4_000_000
-MAX_JOURNAL_BYTES = 32 * 1024 * 1024
+MAX_TRANSACTION_HEADER_BYTES = 4_096
 
 INTEGRITY_LIMITATION = (
     "Die SHA-256-Kette macht Aenderungen am vorhandenen Journal sichtbar, "
@@ -87,6 +89,28 @@ class JournalVerification:
     error: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _JournalHead:
+    """Verifizierter Kettenkopf samt Dateisignatur fuer inkrementelle Appends."""
+
+    entries_count: int
+    last_event_sha256: str
+    signature: tuple[int, int, int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingTransaction:
+    """Dauerhaft vorbereiteter Append, der nach einem Absturz fortgesetzt wird."""
+
+    base_size: int
+    base_entries_count: int
+    base_last_event_sha256: str
+    final_entries_count: int
+    final_event_sha256: str
+    payload: bytes
+    payload_sha256: str
+
+
 def _utc_now() -> str:
     """Erzeuge einen eindeutigen UTC-Zeitwert ohne lokale Zeitzonenannahme."""
 
@@ -134,6 +158,9 @@ def canonical_json_bytes(value: Any) -> bytes:
 def _set_private_mode(path: Path, mode: int) -> None:
     """Setze private Rechte; Windows darf fehlende chmod-Unterstuetzung melden."""
 
+    if os.name != "nt" and stat.S_IMODE(path.stat().st_mode) == mode:
+        return
+
     try:
         os.chmod(path, mode)
     except OSError:
@@ -165,6 +192,19 @@ def _write_all(file_descriptor: int, data: bytes) -> None:
         if written <= 0:
             raise OSError("Dateischreibvorgang wurde unerwartet abgebrochen")
         view = view[written:]
+
+
+def _file_signature(file_handle: BinaryIO) -> tuple[int, int, int, int, int]:
+    """Erkennt Aenderungen zwischen zwei Appends derselben Journalinstanz."""
+
+    metadata = os.fstat(file_handle.fileno())
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        int(metadata.st_ctime_ns),
+    )
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -301,16 +341,36 @@ def _entry_from_mapping(
     )
 
 
-def _read_entries(file_handle: BinaryIO) -> tuple[int, JournalEntry | None]:
+def _read_entries(
+    file_handle: BinaryIO,
+    *,
+    end_offset: int | None = None,
+) -> tuple[int, JournalEntry | None]:
     """Pruefe das Journal speicherschonend und liefere Zaehler sowie Kettenkopf."""
+
+    if end_offset is not None and (
+        isinstance(end_offset, bool) or not isinstance(end_offset, int) or end_offset < 0
+    ):
+        raise ValueError("end_offset muss eine nichtnegative Ganzzahl sein")
 
     file_handle.seek(0)
     entries_count = 0
     last_entry = None
     previous_hash = GENESIS_SHA256
     while True:
-        raw_line = file_handle.readline(MAX_JOURNAL_LINE_BYTES + 1)
+        if end_offset is not None:
+            position = file_handle.tell()
+            if position == end_offset:
+                break
+            if position > end_offset:
+                raise EvidenceJournalError("Der verifizierte Journalabschnitt ist ungueltig")
+            read_size = min(MAX_JOURNAL_LINE_BYTES + 1, end_offset - position)
+        else:
+            read_size = MAX_JOURNAL_LINE_BYTES + 1
+        raw_line = file_handle.readline(read_size)
         if not raw_line:
+            if end_offset is not None:
+                raise EvidenceJournalError("Der vorbereitete Journalabschnitt endet unerwartet")
             break
         line_number = entries_count + 1
         if len(raw_line) > MAX_JOURNAL_LINE_BYTES:
@@ -328,6 +388,235 @@ def _read_entries(file_handle: BinaryIO) -> tuple[int, JournalEntry | None]:
         )
         entries_count += 1
         previous_hash = last_entry.event_sha256
+    return entries_count, last_entry
+
+
+def _pending_transaction_path(journal_path: Path) -> Path:
+    return journal_path.with_name(f".{journal_path.name}.pending")
+
+
+def _write_pending_transaction(
+    journal_path: Path,
+    transaction: _PendingTransaction,
+) -> Path:
+    """Schreibt den vorbereiteten Append vor der Journalveraenderung dauerhaft."""
+
+    pending_path = _pending_transaction_path(journal_path)
+    if pending_path.exists():
+        raise EvidenceJournalError(
+            "Eine fruehere Journaltransaktion muss zuerst wiederhergestellt werden"
+        )
+    header = {
+        "transaction_format_version": JOURNAL_TRANSACTION_FORMAT_VERSION,
+        "base_size": transaction.base_size,
+        "base_entries_count": transaction.base_entries_count,
+        "base_last_event_sha256": transaction.base_last_event_sha256,
+        "final_entries_count": transaction.final_entries_count,
+        "final_event_sha256": transaction.final_event_sha256,
+        "payload_length": len(transaction.payload),
+        "payload_sha256": transaction.payload_sha256,
+    }
+    encoded_header = canonical_json_bytes(header) + b"\n"
+    if len(encoded_header) > MAX_TRANSACTION_HEADER_BYTES:
+        raise EvidenceJournalError("Journaltransaktions-Kopf ist unerwartet gross")
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{pending_path.name}.",
+        suffix=".tmp",
+        dir=journal_path.parent,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        _set_private_mode(temporary_path, 0o600)
+        _write_all(descriptor, encoded_header)
+        _write_all(descriptor, transaction.payload)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        if pending_path.exists():
+            raise EvidenceJournalError(
+                "Eine fruehere Journaltransaktion wurde gleichzeitig angelegt"
+            )
+        os.replace(temporary_path, pending_path)
+        _set_private_mode(pending_path, 0o600)
+        _fsync_directory(journal_path.parent)
+    except BaseException as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            exc.add_note(
+                f"Temporaere Journaltransaktion konnte nicht entfernt werden: {cleanup_error}"
+            )
+        raise
+    return pending_path
+
+
+def _read_pending_transaction(pending_path: Path) -> _PendingTransaction | None:
+    """Liest eine vollstaendige vorbereitete Transaktion ohne Symlink-Folgen."""
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(pending_path, flags)
+    except FileNotFoundError:
+        return None
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise EvidenceJournalError("Journaltransaktion ist keine regulaere Datei")
+        with os.fdopen(descriptor, "rb", buffering=0) as file_handle:
+            descriptor = -1
+            raw_header = file_handle.readline(MAX_TRANSACTION_HEADER_BYTES + 1)
+            if (
+                not raw_header
+                or len(raw_header) > MAX_TRANSACTION_HEADER_BYTES
+                or not raw_header.endswith(b"\n")
+            ):
+                raise EvidenceJournalError("Journaltransaktion hat keinen gueltigen Kopf")
+            encoded_header = raw_header[:-1]
+            try:
+                header = json.loads(
+                    encoded_header.decode("utf-8"),
+                    object_pairs_hook=_reject_duplicate_keys,
+                )
+            except (UnicodeError, TypeError, ValueError) as exc:
+                raise EvidenceJournalError(
+                    "Journaltransaktion enthaelt keinen eindeutigen JSON-Kopf"
+                ) from exc
+            expected_keys = {
+                "transaction_format_version",
+                "base_size",
+                "base_entries_count",
+                "base_last_event_sha256",
+                "final_entries_count",
+                "final_event_sha256",
+                "payload_length",
+                "payload_sha256",
+            }
+            if not isinstance(header, dict) or set(header) != expected_keys:
+                raise EvidenceJournalError("Journaltransaktion hat unerwartete Felder")
+            if canonical_json_bytes(header) != encoded_header:
+                raise EvidenceJournalError(
+                    "Journaltransaktions-Kopf ist nicht kanonisch serialisiert"
+                )
+
+            integer_fields = (
+                "transaction_format_version",
+                "base_size",
+                "base_entries_count",
+                "final_entries_count",
+                "payload_length",
+            )
+            if any(type(header[field]) is not int for field in integer_fields):
+                raise EvidenceJournalError("Journaltransaktion enthaelt ungueltige Ganzzahlfelder")
+            if header["transaction_format_version"] != JOURNAL_TRANSACTION_FORMAT_VERSION:
+                raise EvidenceJournalError("Journaltransaktion hat eine unbekannte Formatversion")
+            if (
+                header["base_size"] < 0
+                or header["base_entries_count"] < 0
+                or header["payload_length"] <= 0
+                or header["final_entries_count"] <= header["base_entries_count"]
+            ):
+                raise EvidenceJournalError(
+                    "Journaltransaktion enthaelt ungueltige Groessen- oder Sequenzwerte"
+                )
+            for field in (
+                "base_last_event_sha256",
+                "final_event_sha256",
+                "payload_sha256",
+            ):
+                value = header[field]
+                if not isinstance(value, str) or SHA256_PATTERN.fullmatch(value) is None:
+                    raise EvidenceJournalError(
+                        f"Journaltransaktion enthaelt keinen gueltigen Wert fuer {field}"
+                    )
+
+            payload = file_handle.read(header["payload_length"] + 1)
+            if len(payload) != header["payload_length"]:
+                raise EvidenceJournalError(
+                    "Journaltransaktion ist unvollstaendig oder enthaelt Zusatzdaten"
+                )
+            if not payload.endswith(b"\n"):
+                raise EvidenceJournalError(
+                    "Journaltransaktion endet mit einer unvollstaendigen Zeile"
+                )
+            if payload.count(b"\n") != (
+                header["final_entries_count"] - header["base_entries_count"]
+            ):
+                raise EvidenceJournalError(
+                    "Journaltransaktion enthaelt nicht die erwartete Ereigniszahl"
+                )
+            calculated_payload_hash = hashlib.sha256(payload).hexdigest()
+            if not hmac.compare_digest(
+                calculated_payload_hash,
+                header["payload_sha256"],
+            ):
+                raise EvidenceJournalError("Journaltransaktion hat einen unpassenden Nutzlast-Hash")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+    return _PendingTransaction(
+        base_size=header["base_size"],
+        base_entries_count=header["base_entries_count"],
+        base_last_event_sha256=header["base_last_event_sha256"],
+        final_entries_count=header["final_entries_count"],
+        final_event_sha256=header["final_event_sha256"],
+        payload=payload,
+        payload_sha256=header["payload_sha256"],
+    )
+
+
+def _recover_pending_transaction(
+    journal_path: Path,
+    file_handle: BinaryIO,
+) -> tuple[int, JournalEntry | None] | None:
+    """Rollt einen nachweisbar vorbereiteten, teilweise geschriebenen Batch vor."""
+
+    pending_path = _pending_transaction_path(journal_path)
+    transaction = _read_pending_transaction(pending_path)
+    if transaction is None:
+        return None
+
+    base_count, base_last_entry = _read_entries(
+        file_handle,
+        end_offset=transaction.base_size,
+    )
+    base_hash = base_last_entry.event_sha256 if base_last_entry is not None else GENESIS_SHA256
+    if base_count != transaction.base_entries_count or not hmac.compare_digest(
+        base_hash,
+        transaction.base_last_event_sha256,
+    ):
+        raise EvidenceJournalError("Journalbasis passt nicht zur vorbereiteten Transaktion")
+
+    current_size = os.fstat(file_handle.fileno()).st_size
+    final_size = transaction.base_size + len(transaction.payload)
+    if current_size < transaction.base_size or current_size > final_size:
+        raise EvidenceJournalError("Journalgroesse passt nicht zur vorbereiteten Transaktion")
+    file_handle.seek(transaction.base_size)
+    existing_tail = file_handle.read(current_size - transaction.base_size)
+    if existing_tail != transaction.payload[: len(existing_tail)]:
+        raise EvidenceJournalError("Journalende passt nicht zur vorbereiteten Transaktion")
+    if existing_tail != transaction.payload:
+        file_handle.truncate(transaction.base_size)
+        file_handle.seek(transaction.base_size)
+        _write_all(file_handle.fileno(), transaction.payload)
+        os.fsync(file_handle.fileno())
+
+    entries_count, last_entry = _read_entries(file_handle)
+    last_hash = last_entry.event_sha256 if last_entry is not None else GENESIS_SHA256
+    if entries_count != transaction.final_entries_count or not hmac.compare_digest(
+        last_hash,
+        transaction.final_event_sha256,
+    ):
+        raise EvidenceJournalError(
+            "Wiederhergestellte Journaltransaktion stimmt nicht mit ihrem Kettenkopf ueberein"
+        )
+    pending_path.unlink()
+    _fsync_directory(journal_path.parent)
     return entries_count, last_entry
 
 
@@ -391,6 +680,38 @@ class EvidenceJournal:
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
+        self._head: _JournalHead | None = None
+
+    def _remember_head(
+        self,
+        file_handle: BinaryIO,
+        entries_count: int,
+        last_event_sha256: str,
+    ) -> None:
+        self._head = _JournalHead(
+            entries_count=entries_count,
+            last_event_sha256=last_event_sha256,
+            signature=_file_signature(file_handle),
+        )
+
+    def _current_head(self, file_handle: BinaryIO) -> tuple[int, str]:
+        """Verifiziert einmal und nutzt danach nur einen unveraenderten Dateikopf."""
+
+        recovered = _recover_pending_transaction(self.path, file_handle)
+        if recovered is not None:
+            entries_count, last_entry = recovered
+            last_hash = last_entry.event_sha256 if last_entry is not None else GENESIS_SHA256
+            self._remember_head(file_handle, entries_count, last_hash)
+            return entries_count, last_hash
+
+        signature = _file_signature(file_handle)
+        if self._head is not None and self._head.signature == signature:
+            return self._head.entries_count, self._head.last_event_sha256
+
+        entries_count, last_entry = _read_entries(file_handle)
+        last_hash = last_entry.event_sha256 if last_entry is not None else GENESIS_SHA256
+        self._remember_head(file_handle, entries_count, last_hash)
+        return entries_count, last_hash
 
     def append(
         self,
@@ -425,10 +746,9 @@ class EvidenceJournal:
 
         try:
             with _locked_file(self.path, exclusive=True) as file_handle:
-                entries_count, last_entry = _read_entries(file_handle)
-                previous_hash = (
-                    last_entry.event_sha256 if last_entry is not None else GENESIS_SHA256
-                )
+                entries_count, previous_hash = self._current_head(file_handle)
+                base_size = os.fstat(file_handle.fileno()).st_size
+                base_last_hash = previous_hash
                 lines: list[bytes] = []
                 for offset, normalized_event in enumerate(normalized_events, start=1):
                     sequence = entries_count + offset
@@ -460,15 +780,30 @@ class EvidenceJournal:
                     previous_hash = event_hash
 
                 payload = b"".join(lines)
-                file_handle.seek(0, os.SEEK_END)
-                if file_handle.tell() > MAX_JOURNAL_BYTES - len(payload):
+                transaction = _PendingTransaction(
+                    base_size=base_size,
+                    base_entries_count=entries_count,
+                    base_last_event_sha256=base_last_hash,
+                    final_entries_count=entries_count + len(journal_entries),
+                    final_event_sha256=previous_hash,
+                    payload=payload,
+                    payload_sha256=hashlib.sha256(payload).hexdigest(),
+                )
+                pending_path = _write_pending_transaction(self.path, transaction)
+                if os.fstat(file_handle.fileno()).st_size != base_size:
                     raise EvidenceJournalError(
-                        "Beweisjournal wuerde das feste Limit von 32 MiB "
-                        "ueberschreiten. Archivieren Sie das bestehende Journal "
-                        "unveraendert und starten Sie danach ein neues Journal."
+                        "Journal wurde waehrend des vorbereiteten Appends veraendert"
                     )
+                file_handle.seek(0, os.SEEK_END)
                 _write_all(file_handle.fileno(), payload)
                 os.fsync(file_handle.fileno())
+                pending_path.unlink()
+                _fsync_directory(self.path.parent)
+                self._remember_head(
+                    file_handle,
+                    transaction.final_entries_count,
+                    transaction.final_event_sha256,
+                )
         except OSError as exc:
             raise EvidenceJournalError(
                 f"Beweisjournal konnte nicht erweitert werden: {self.path}"
@@ -513,18 +848,29 @@ class EvidenceJournal:
         )
 
     def verify(self) -> JournalVerification:
-        """Pruefe Format und Hash-Kette des gesamten Journals ohne Netzaufrufe."""
+        """Pruefe die ganze Hash-Kette und beende vorbereitete Crash-Appends."""
 
-        if not self.path.exists():
+        pending_path = _pending_transaction_path(self.path)
+        if not self.path.exists() and not pending_path.exists():
+            self._head = None
             return JournalVerification(
                 valid=True,
                 entries_count=0,
                 last_event_sha256=None,
             )
         try:
-            with _locked_file(self.path, exclusive=False) as file_handle:
-                entries_count, last_entry = _read_entries(file_handle)
+            # Die exklusive Sperre ist erforderlich, weil eine gueltige, vor dem
+            # Absturz vorbereitete Transaktion hier zu Ende geschrieben werden kann.
+            with _locked_file(self.path, exclusive=True) as file_handle:
+                recovered = _recover_pending_transaction(self.path, file_handle)
+                if recovered is None:
+                    entries_count, last_entry = _read_entries(file_handle)
+                else:
+                    entries_count, last_entry = recovered
+                last_hash = last_entry.event_sha256 if last_entry is not None else GENESIS_SHA256
+                self._remember_head(file_handle, entries_count, last_hash)
         except (EvidenceJournalError, OSError, TypeError, ValueError) as exc:
+            self._head = None
             return JournalVerification(
                 valid=False,
                 entries_count=0,

@@ -1,4 +1,4 @@
-"""Begrenzte, inhaltsfreie Peer-Suche über BEP 5 und BEP 32."""
+"""Konvergierende, inhaltsfreie Peer-Suche über BEP 5 und BEP 32."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import hmac
 import ipaddress
 import secrets
 import socket
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -20,16 +20,15 @@ from .models import PeerCandidate, Target
 Endpoint = tuple[str, int]
 QueryHook = Callable[[Endpoint, bytes, bytes], Awaitable["DHTResponse"]]
 BootstrapIssueHook = Callable[[str], None]
+CandidateBatchHook = Callable[[tuple[PeerCandidate, ...]], Awaitable[None]]
 
 MAX_TIMEOUT_SECONDS = 30.0
 MAX_OVERALL_TIMEOUT_SECONDS = 300.0
-MAX_QUERIES = 500
 MAX_CONCURRENCY = 32
-MAX_NODES = 10_000
-MAX_CANDIDATES = 5_000
 MAX_RESPONSE_BYTES = 65_507
 MAX_BOOTSTRAP_NODES = 16
-MAX_BOOTSTRAP_RESULTS = 64
+DHT_SHORTLIST_SIZE = 128
+CANDIDATE_BATCH_SIZE = 5
 
 BOOTSTRAP_ISSUE_DNS = "dns"
 BOOTSTRAP_ISSUE_NO_GLOBAL_ADDRESS = "no_global_address"
@@ -65,14 +64,11 @@ class DHTQueryError(OSError):
 
 @dataclass(frozen=True, slots=True)
 class DHTConfig:
-    """Harte Laufzeit- und Mengenbegrenzungen eines Suchlaufs."""
+    """Zeit-, Parallelitäts- und Paketgrenzen eines DHT-Suchlaufs."""
 
     timeout_seconds: float = 2.5
     overall_timeout_seconds: float = 30.0
-    max_queries: int = 80
     concurrency: int = 8
-    max_nodes: int = 1_000
-    max_candidates: int = 300
     max_response_bytes: int = MAX_RESPONSE_BYTES
 
     def __post_init__(self) -> None:
@@ -83,10 +79,7 @@ class DHTConfig:
             0.1,
             MAX_OVERALL_TIMEOUT_SECONDS,
         )
-        _require_bounded_integer("max_queries", self.max_queries, 1, MAX_QUERIES)
         _require_bounded_integer("concurrency", self.concurrency, 1, MAX_CONCURRENCY)
-        _require_bounded_integer("max_nodes", self.max_nodes, 1, MAX_NODES)
-        _require_bounded_integer("max_candidates", self.max_candidates, 1, MAX_CANDIDATES)
         _require_bounded_integer(
             "max_response_bytes", self.max_response_bytes, 512, MAX_RESPONSE_BYTES
         )
@@ -320,12 +313,10 @@ async def resolve_bootstrap_nodes(
     nodes: Iterable[Endpoint],
     *,
     timeout: float = 5.0,
-    max_results: int = 32,
     issue_hook: BootstrapIssueHook | None = None,
 ) -> list[Endpoint]:
-    """Löst eine kleine Bootstrap-Liste auf und verwirft nichtglobale Ziele."""
+    """Löst konfigurierte Bootstrap-Hosts vollständig zu globalen UDP-Zielen auf."""
     _require_bounded_number("timeout", timeout, 0.1, MAX_TIMEOUT_SECONDS)
-    _require_bounded_integer("max_results", max_results, 1, MAX_BOOTSTRAP_RESULTS)
     if issue_hook is not None and not callable(issue_hook):
         raise TypeError("issue_hook muss aufrufbar sein.")
 
@@ -348,16 +339,28 @@ async def resolve_bootstrap_nodes(
 
     loop = asyncio.get_running_loop()
 
-    async def resolve_one(host: str, port: int) -> list[Endpoint]:
+    def iter_global_udp_endpoints(
+        addresses: Iterable[tuple[int, int, int, str, tuple[Any, ...]]],
+    ) -> Iterator[Endpoint]:
+        for family, sock_type, protocol, _canonical_name, sockaddr in addresses:
+            if family not in {socket.AF_INET, socket.AF_INET6}:
+                continue
+            if sock_type != socket.SOCK_DGRAM or protocol not in {0, socket.IPPROTO_UDP}:
+                continue
+            endpoint = normalize_global_endpoint(str(sockaddr[0]), int(sockaddr[1]))
+            if endpoint is not None:
+                yield endpoint
+
+    async def resolve_one(host: str, port: int) -> Iterator[Endpoint]:
         numeric = normalize_global_endpoint(host, port)
         if numeric is not None:
-            return [numeric]
+            return iter((numeric,))
         try:
-            is_numeric_address = ipaddress.ip_address(host) is not None
+            ipaddress.ip_address(host)
         except ValueError:
-            is_numeric_address = False
-        if is_numeric_address:
-            return []
+            pass
+        else:
+            return iter(())
 
         addresses = await loop.getaddrinfo(
             host,
@@ -366,16 +369,11 @@ async def resolve_bootstrap_nodes(
             type=socket.SOCK_DGRAM,
             proto=socket.IPPROTO_UDP,
         )
-        results: list[Endpoint] = []
-        for _family, _type, _proto, _canonical_name, sockaddr in addresses:
-            endpoint = normalize_global_endpoint(str(sockaddr[0]), int(sockaddr[1]))
-            if endpoint is not None:
-                results.append(endpoint)
-        return results
+        return iter_global_udp_endpoints(addresses)
 
     tasks = [asyncio.create_task(resolve_one(host, port)) for host, port in requested]
-    completed: set[asyncio.Task[list[Endpoint]]] = set()
-    pending: set[asyncio.Task[list[Endpoint]]] = set(tasks)
+    completed: set[asyncio.Task[Iterator[Endpoint]]] = set()
+    pending: set[asyncio.Task[Iterator[Endpoint]]] = set(tasks)
     try:
         completed, pending = await asyncio.wait(
             tasks,
@@ -392,7 +390,8 @@ async def resolve_bootstrap_nodes(
         if issue_hook is not None:
             issue_hook(category)
 
-    resolved_groups: list[list[Endpoint]] = []
+    resolved: list[Endpoint] = []
+    seen: set[Endpoint] = set()
     for task in tasks:
         if task not in completed:
             report_issue(BOOTSTRAP_ISSUE_TIMEOUT)
@@ -408,25 +407,20 @@ async def resolve_bootstrap_nodes(
         except (Exception, asyncio.CancelledError):
             report_issue(BOOTSTRAP_ISSUE_RESOLVER)
             continue
-        if not group:
-            report_issue(BOOTSTRAP_ISSUE_NO_GLOBAL_ADDRESS)
-            continue
-        resolved_groups.append(group)
 
-    resolved: list[Endpoint] = []
-    seen: set[Endpoint] = set()
-    for group in resolved_groups:
+        has_global_address = False
         for endpoint in group:
+            has_global_address = True
             if endpoint not in seen:
                 seen.add(endpoint)
                 resolved.append(endpoint)
-                if len(resolved) >= max_results:
-                    return resolved
+        if not has_global_address:
+            report_issue(BOOTSTRAP_ISSUE_NO_GLOBAL_ADDRESS)
     return resolved
 
 
 class DHTCrawler:
-    """Iterative, mengenbegrenzte Suche nach Peers eines einzelnen Infohashes."""
+    """Iterative Suche bis zur Konvergenz des DHT-Nahbereichs."""
 
     def __init__(
         self,
@@ -467,9 +461,7 @@ class DHTCrawler:
     def _validated_bootstrap(self, nodes: Iterable[Endpoint]) -> list[Endpoint]:
         normalized: list[Endpoint] = []
         seen: set[Endpoint] = set()
-        for index, raw in enumerate(nodes):
-            if index >= MAX_BOOTSTRAP_RESULTS:
-                raise ValueError("Zu viele aufgelöste Bootstrap-Endpunkte.")
+        for raw in nodes:
             if not isinstance(raw, tuple) or len(raw) != 2:
                 raise ValueError("Bootstrap-Endpunkt muss ein Tupel aus IP und Port sein.")
             endpoint = normalize_global_endpoint(raw[0], raw[1])
@@ -480,10 +472,6 @@ class DHTCrawler:
                 normalized.append(endpoint)
         if not normalized:
             raise ValueError("Mindestens ein globaler Bootstrap-Endpunkt ist erforderlich.")
-        if len(normalized) > MAX_BOOTSTRAP_RESULTS:
-            raise ValueError("Zu viele aufgelöste Bootstrap-Endpunkte.")
-        if len(normalized) > self.config.max_nodes:
-            raise ValueError("Mehr Bootstrap-Endpunkte als erlaubte DHT-Knoten.")
         return normalized
 
     async def _query_node(
@@ -556,12 +544,31 @@ class DHTCrawler:
             raise ValueError("transaction_id_factory muss eine Bytefolge mit 1 bis 8 Byte liefern.")
         return transaction_id
 
-    async def discover(self, target: Target) -> list[PeerCandidate]:
-        """Durchläuft zurückgelieferte Knoten nach XOR-Nähe, ohne etwas anzukündigen."""
+    async def discover(
+        self,
+        target: Target,
+        *,
+        candidate_callback: CandidateBatchHook | None = None,
+        collect: bool = True,
+    ) -> list[PeerCandidate]:
+        """Durchsucht den XOR-Nahbereich und liefert neue Peers in Fünferbatches.
+
+        Die feste Shortlist ist die Arbeitsbreite der konvergierenden Kademlia-
+        Suche und kein Peer-, Knoten- oder Anfragelimit. Im kompatiblen
+        Sammelmodus wird jeder eindeutige Peer aufgenommen. ``collect=False``
+        streamt dagegen jede gültige Peer-Nennung direkt weiter, damit weder
+        Kandidatenliste noch laufweites Deduplizierungsset im Speicher wachsen.
+        """
         if not isinstance(target, Target):
             raise TypeError("target muss ein Target sein.")
         if not isinstance(target.info_hash, bytes) or len(target.info_hash) != 20:
             raise ValueError("BitTorrent-v1-Infohash muss genau 20 Byte lang sein.")
+        if candidate_callback is not None and not callable(candidate_callback):
+            raise TypeError("candidate_callback muss aufrufbar sein.")
+        if not isinstance(collect, bool):
+            raise TypeError("collect muss ein boolescher Wert sein.")
+        if not collect and candidate_callback is None:
+            raise ValueError("collect=False erfordert einen candidate_callback.")
 
         self.queries_started = 0
         self.queries_completed = 0
@@ -569,10 +576,11 @@ class DHTCrawler:
         self.issue_counts = {}
         errors: list[str] = []
         candidates: list[PeerCandidate] = []
-        candidate_endpoints: set[Endpoint] = set()
-        known_nodes: set[Endpoint] = set(self.bootstrap_nodes)
-        queued_nodes: set[Endpoint] = set(self.bootstrap_nodes)
+        callback_batch: list[PeerCandidate] = []
+        candidate_endpoints: set[Endpoint] | None = set() if collect else None
+        seen_node_endpoints: set[Endpoint] = set(self.bootstrap_nodes)
         queried_nodes: set[Endpoint] = set()
+        shortlist: dict[Endpoint, int] = {}
         queue: list[tuple[int, int, Endpoint]] = []
         serial = 0
         for endpoint in self.bootstrap_nodes:
@@ -582,18 +590,15 @@ class DHTCrawler:
         active: dict[asyncio.Task[DHTResponse], tuple[Endpoint, bytes]] = {}
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.config.overall_timeout_seconds
+        target_id = int.from_bytes(target.info_hash, "big")
 
         try:
             while queue or active:
-                while (
-                    queue
-                    and len(active) < self.config.concurrency
-                    and self.queries_started < self.config.max_queries
-                    and len(candidates) < self.config.max_candidates
-                ):
-                    _distance, _serial, endpoint = heapq.heappop(queue)
-                    queued_nodes.discard(endpoint)
+                while queue and len(active) < self.config.concurrency:
+                    distance, _serial, endpoint = heapq.heappop(queue)
                     if endpoint in queried_nodes:
+                        continue
+                    if distance >= 0 and shortlist.get(endpoint) != distance:
                         continue
                     queried_nodes.add(endpoint)
                     transaction_id = self._new_transaction_id()
@@ -631,7 +636,8 @@ class DHTCrawler:
                         if not isinstance(
                             response.transaction_id, bytes
                         ) or not hmac.compare_digest(
-                            response.transaction_id, expected_transaction_id
+                            response.transaction_id,
+                            expected_transaction_id,
                         ):
                             raise DHTProtocolError("DHT-Transaktions-ID stimmt nicht überein.")
                         if (
@@ -659,35 +665,35 @@ class DHTCrawler:
 
                     observed_at = self.clock()
                     for peer_ip, peer_port in response.peers:
-                        if len(candidates) >= self.config.max_candidates:
-                            break
                         peer_endpoint = normalize_global_endpoint(peer_ip, peer_port)
                         if peer_endpoint is None:
                             continue
+                        if candidate_endpoints is not None:
+                            if peer_endpoint in candidate_endpoints:
+                                continue
+                            candidate_endpoints.add(peer_endpoint)
                         peer_ip, peer_port = peer_endpoint
-                        if peer_endpoint in candidate_endpoints:
-                            continue
-                        candidate_endpoints.add(peer_endpoint)
-                        candidates.append(
-                            PeerCandidate(
-                                target_label=target.label,
-                                info_hash_hex=target.info_hash_hex,
-                                ip=peer_ip,
-                                port=peer_port,
-                                discovered_at_utc=observed_at,
-                                dht_node_ip=response.source[0],
-                                dht_node_port=response.source[1],
-                                transaction_id_hex=response.transaction_id.hex(),
-                                response_sha256=response.response_sha256,
-                                source_note=target.source_note,
-                            )
+                        candidate = PeerCandidate(
+                            target_label=target.label,
+                            info_hash_hex=target.info_hash_hex,
+                            ip=peer_ip,
+                            port=peer_port,
+                            discovered_at_utc=observed_at,
+                            dht_node_ip=response.source[0],
+                            dht_node_port=response.source[1],
+                            transaction_id_hex=response.transaction_id.hex(),
+                            response_sha256=response.response_sha256,
+                            source_note=target.source_note,
                         )
-                        if len(candidates) >= self.config.max_candidates:
-                            break
+                        if collect:
+                            candidates.append(candidate)
+                        if candidate_callback is not None:
+                            callback_batch.append(candidate)
+                            if len(callback_batch) == CANDIDATE_BATCH_SIZE:
+                                await candidate_callback(tuple(callback_batch))
+                                callback_batch.clear()
 
                     for node in response.nodes:
-                        if len(known_nodes) >= self.config.max_nodes:
-                            break
                         if (
                             not isinstance(node, DHTNode)
                             or not isinstance(node.node_id, bytes)
@@ -695,26 +701,28 @@ class DHTCrawler:
                         ):
                             continue
                         node_endpoint = normalize_global_endpoint(node.ip, node.port)
-                        if node_endpoint is None:
+                        if node_endpoint is None or node_endpoint in seen_node_endpoints:
                             continue
-                        if (
-                            node_endpoint in known_nodes
-                            or node_endpoint in queried_nodes
-                            or node_endpoint in queued_nodes
-                        ):
-                            continue
-                        known_nodes.add(node_endpoint)
-                        queued_nodes.add(node_endpoint)
-                        distance = int.from_bytes(node.node_id, "big") ^ int.from_bytes(
-                            target.info_hash, "big"
-                        )
+                        seen_node_endpoints.add(node_endpoint)
+                        distance = int.from_bytes(node.node_id, "big") ^ target_id
+                        if len(shortlist) >= DHT_SHORTLIST_SIZE:
+                            farthest_endpoint, farthest_distance = max(
+                                shortlist.items(),
+                                key=lambda item: (item[1], item[0]),
+                            )
+                            if (distance, node_endpoint) >= (
+                                farthest_distance,
+                                farthest_endpoint,
+                            ):
+                                continue
+                            del shortlist[farthest_endpoint]
+                        shortlist[node_endpoint] = distance
                         heapq.heappush(queue, (distance, serial, node_endpoint))
                         serial += 1
 
-                if (self.queries_started >= self.config.max_queries and not active) or len(
-                    candidates
-                ) >= self.config.max_candidates:
-                    break
+            if candidate_callback is not None and callback_batch:
+                await candidate_callback(tuple(callback_batch))
+                callback_batch.clear()
         finally:
             for task in active:
                 task.cancel()
@@ -731,15 +739,20 @@ async def discover_peers(
     *,
     node_id: bytes | None = None,
     config: DHTConfig | None = None,
+    candidate_callback: CandidateBatchHook | None = None,
+    collect: bool = True,
 ) -> list[PeerCandidate]:
-    """Löst Bootstrap-Hosts auf und führt genau einen begrenzten Suchlauf aus."""
+    """Löst Bootstrap-Hosts auf und durchsucht den konvergierenden Nahbereich."""
     active_config = config or DHTConfig()
     resolved = await resolve_bootstrap_nodes(
         bootstrap_nodes,
         timeout=min(active_config.timeout_seconds, 5.0),
-        max_results=min(active_config.max_nodes, MAX_BOOTSTRAP_RESULTS),
     )
     if not resolved:
         raise DHTQueryError("Kein global erreichbarer Bootstrap-Endpunkt auflösbar.")
     crawler = DHTCrawler(resolved, node_id=node_id, config=active_config)
-    return await crawler.discover(target)
+    return await crawler.discover(
+        target,
+        candidate_callback=candidate_callback,
+        collect=collect,
+    )

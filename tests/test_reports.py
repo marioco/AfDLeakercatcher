@@ -9,6 +9,7 @@ import os
 import stat
 import tempfile
 import unittest
+from collections.abc import Iterable, Iterator
 from dataclasses import replace
 from email import policy
 from email.parser import BytesParser
@@ -23,6 +24,7 @@ from bittorrent_beobachter.models import (
     PeerAvailabilityObservation,
     PeerCandidate,
     ScanResult,
+    TargetScanMetrics,
     VpnClassification,
 )
 from bittorrent_beobachter.reports import (
@@ -34,6 +36,7 @@ from bittorrent_beobachter.reports import (
     generate_reports,
     safe_ip_filename,
 )
+from bittorrent_beobachter.run_store import RunStoreIpGroup
 
 REPORTLAB_AVAILABLE = importlib.util.find_spec("reportlab") is not None
 
@@ -215,13 +218,26 @@ class ReportGenerationTests(unittest.TestCase):
                 config,
                 generated_at_utc="2026-10-20T11:05:00Z",
             )
-            by_name = {path.name: path for path in paths}
+            by_name = {path.name: path for path in Path(temp_name).iterdir()}
+            self.assertEqual(len(paths), 5)
 
             self.assertEqual(paths, result.report_paths)
+            self.assertEqual(
+                [path.name for path in paths],
+                [
+                    "run_42_laufbericht.pdf",
+                    "run_42_beobachtungen.csv",
+                    "run_42_vpn_liste.csv",
+                    "run_42_vpn_liste.pdf",
+                    "run_42_SHA256SUMS.txt",
+                ],
+            )
             self.assertTrue(all(path.is_absolute() and path.is_file() for path in paths))
             if os.name != "nt":
                 self.assertEqual(stat.S_IMODE(Path(temp_name).stat().st_mode), 0o700)
-                self.assertTrue(all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in paths))
+                self.assertTrue(
+                    all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in by_name.values())
+                )
             self.assertEqual(paths[-1].name, "run_42_SHA256SUMS.txt")
             self.assertIn("run_42_anlage_ipv4_198_51_100_10.pdf", by_name)
             self.assertIn("run_42_strafanzeige_ipv4_198_51_100_10.eml", by_name)
@@ -230,35 +246,33 @@ class ReportGenerationTests(unittest.TestCase):
 
             with by_name["run_42_beobachtungen.csv"].open(encoding="utf-8", newline="") as handle:
                 all_rows = list(csv.DictReader(handle, delimiter=";"))
-            self.assertEqual([row["ip"] for row in all_rows], ["198.51.100.10"])
-            self.assertEqual(all_rows[0]["bestaetigte_handshakes"], "2")
-            self.assertEqual(all_rows[0]["ports"], "51413 | 51414")
+            self.assertEqual(len(all_rows), 2)
+            self.assertEqual({row["ip"] for row in all_rows}, {"198.51.100.10"})
+            self.assertEqual({row["ports"] for row in all_rows}, {"51413", "51414"})
+            self.assertEqual({row["bestaetigte_handshakes"] for row in all_rows}, {"1"})
             self.assertEqual(
-                all_rows[0]["erste_beobachtung_utc"],
-                "2026-10-20T10:01:00Z",
+                {row["lokaler_fundantwort_fingerabdruck_sha256"] for row in all_rows},
+                {f"{1:064x}", f"{2:064x}"},
             )
-            self.assertEqual(
-                all_rows[0]["letzte_beobachtung_utc"],
-                "2026-10-20T10:10:02Z",
-            )
-            self.assertEqual(
-                all_rows[0]["lokaler_dht_antwort_fingerabdruck_sha256"],
-                f"{1:064x} | {2:064x}",
-            )
-            self.assertEqual(
-                all_rows[0]["netzangaben_zusammengestellt_utc"],
-                "2026-10-20T10:30:00Z",
-            )
-            self.assertIn(
-                "rdap: 2026-10-20T10:20:00Z",
-                all_rows[0]["netzregistrierung_quellen_abruf_utc"],
-            )
-            self.assertEqual(all_rows[0]["netzregistrierung_cache_quellen"], "rdap")
-            self.assertEqual(
-                all_rows[0]["angefragte_bzw_weitergeleitete_quellen"],
-                "https://rdap.example.invalid/object",
-            )
-            self.assertNotIn("netzregistrierungs_quellen", all_rows[0])
+            for row in all_rows:
+                self.assertEqual(
+                    row["letzte_beobachtung_utc"],
+                    "2026-10-20T10:10:02Z",
+                )
+                self.assertEqual(
+                    row["netzangaben_zusammengestellt_utc"],
+                    "2026-10-20T10:30:00Z",
+                )
+                self.assertIn(
+                    "rdap: 2026-10-20T10:20:00Z",
+                    row["netzregistrierung_quellen_abruf_utc"],
+                )
+                self.assertEqual(row["netzregistrierung_cache_quellen"], "rdap")
+                self.assertEqual(
+                    row["angefragte_bzw_weitergeleitete_quellen"],
+                    "https://rdap.example.invalid/object",
+                )
+                self.assertNotIn("netzregistrierungs_quellen", row)
 
             with by_name["run_42_vpn_liste.csv"].open(encoding="utf-8", newline="") as handle:
                 vpn_rows = list(csv.DictReader(handle, delimiter=";"))
@@ -304,7 +318,7 @@ class ReportGenerationTests(unittest.TestCase):
                 by_name["run_42_SHA256SUMS.txt"].read_text(encoding="utf-8").splitlines()
             )
             manifest_entries = [line for line in manifest_lines if not line.startswith("#")]
-            self.assertEqual(len(manifest_entries), len(paths) - 1)
+            self.assertEqual(len(manifest_entries), len(by_name) - 1)
             for entry in manifest_entries:
                 expected_hash, filename = entry.split(" *", maxsplit=1)
                 actual_hash = hashlib.sha256(by_name[filename].read_bytes()).hexdigest()
@@ -335,7 +349,8 @@ class ReportGenerationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_name:
             paths = generate_reports(result, Path(temp_name), ReportConfig())
-            by_name = {path.name: path for path in paths}
+            by_name = {path.name: path for path in Path(temp_name).iterdir()}
+            self.assertEqual(len(paths), 5)
             email_path = by_name["project-case_strafanzeige_ipv4_198_51_100_80.eml"]
             message = BytesParser(policy=policy.default).parsebytes(email_path.read_bytes())
             self.assertEqual(
@@ -479,6 +494,43 @@ class ReportGenerationTests(unittest.TestCase):
         self.assertNotIn("nicht gerichtlich bewiesen", paragraph_text)
         self.assertNotIn("belegt nicht für sich allein die konkrete Beobachtung", paragraph_text)
 
+    def test_tracker_finding_is_never_described_as_dht_response(self) -> None:
+        record = _evidence_record("198.51.100.87", 6017, 17)
+        tracker_candidate = replace(
+            record.handshake.candidate,
+            discovery_source="tracker",
+            dht_node_ip="203.0.113.53",
+            dht_node_port=6969,
+            transaction_id_hex="01020304",
+        )
+        tracker_record = replace(
+            record,
+            handshake=replace(record.handshake, candidate=tracker_candidate),
+        )
+        aggregate = reports_module._aggregate_reportable_records((tracker_record,))[0]
+
+        statement = reports_module._discovery_method_statement(aggregate)
+        self.assertIn("öffentlichen UDP-Tracker", statement)
+        self.assertIn("Tracker-Antwort", statement)
+        self.assertNotIn("BitTorrent-DHT", statement)
+        self.assertNotIn("DHT-Antwort", statement)
+
+        detail_rows = dict(reports_module._discovery_detail_rows(tracker_candidate))
+        self.assertEqual(detail_rows["Fundquelle"], "UDP-Tracker")
+        self.assertEqual(
+            detail_rows["UDP-Tracker-Antwort von"],
+            "203.0.113.53:6969",
+        )
+        self.assertEqual(detail_rows["Tracker-Transaktions-ID"], "01020304")
+        self.assertFalse(any("DHT" in label for label in detail_rows))
+
+        aggregate_row = reports_module._aggregate_row(aggregate)
+        self.assertEqual(aggregate_row["fundquellen"], "UDP-Tracker")
+        self.assertEqual(
+            aggregate_row["lokaler_fundantwort_fingerabdruck_sha256"],
+            tracker_candidate.response_sha256,
+        )
+
     def test_custom_hash_attachment_does_not_claim_afd_case(self) -> None:
         result = ScanResult(
             run_id="custom-attachment",
@@ -549,7 +601,8 @@ class ReportGenerationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_name:
             paths = generate_reports(result, Path(temp_name), ReportConfig())
-            by_name = {path.name: path for path in paths}
+            by_name = {path.name: path for path in Path(temp_name).iterdir()}
+            self.assertEqual(len(paths), 5)
             positive_message = BytesParser(policy=policy.default).parsebytes(
                 by_name["availability-gate_strafanzeige_ipv4_198_51_100_81.eml"].read_bytes()
             )
@@ -559,14 +612,321 @@ class ReportGenerationTests(unittest.TestCase):
             self.assertIn("vollständig durchgeführten Beobachtungszeit", positive_body)
             self.assertIn("forderte diese Teile nicht an", positive_body)
 
-            self.assertNotIn(
-                "availability-gate_strafanzeige_ipv4_198_51_100_82.eml",
-                by_name,
+            incomplete_message = BytesParser(policy=policy.default).parsebytes(
+                by_name["availability-gate_strafanzeige_ipv4_198_51_100_82.eml"].read_bytes()
+            )
+            incomplete_body = incomplete_message.get_body(preferencelist=("plain",)).get_content()
+            self.assertIn(
+                "Die Verbindung endete nach der bereits positiven Beobachtung",
+                incomplete_body,
+            )
+            self.assertIn(
+                "Beendigungsgrund: Gegenstelle schloss die Verbindung",
+                incomplete_body,
+            )
+            self.assertIn(
+                "(12.0 Sekunden; vorgesehen: 60.0 Sekunden)",
+                incomplete_body,
             )
             self.assertNotIn(
-                "availability-gate_anlage_ipv4_198_51_100_82.pdf",
-                by_name,
+                "vollständig durchgeführten Beobachtungszeit",
+                incomplete_body,
             )
+            detail_rows = dict(reports_module._availability_detail_rows(result.records[1]))
+            self.assertEqual(
+                detail_rows["Vollständige Beobachtungszeit erreicht"],
+                "nein",
+            )
+
+    def test_run_store_records_take_precedence_and_use_five_item_reads(self) -> None:
+        database_record = _evidence_record("198.51.100.85", 6015, 15)
+        in_memory_record = _evidence_record("198.51.100.86", 6016, 16)
+        result = ScanResult(
+            run_id="streaming",
+            started_at_utc="2026-10-20T10:00:00Z",
+            records=[in_memory_record],
+            run_store_path=Path("/private/run.sqlite3"),
+        )
+        store = mock.Mock()
+        store.iter_evidence_records.return_value = iter((database_record,))
+
+        with mock.patch.object(reports_module, "RunStore", return_value=store) as run_store:
+            records = list(reports_module._iter_evidence_records(result))
+
+        self.assertEqual(records, [database_record])
+        run_store.assert_called_once_with(Path("/private/run.sqlite3"))
+        store.iter_evidence_records.assert_called_once_with(batch_size=5)
+
+    def test_generate_reports_uses_small_database_ip_handles(self) -> None:
+        first_group = tuple(
+            _evidence_record("198.51.100.85", 6100 + sequence, sequence) for sequence in range(1, 8)
+        )
+        second_group = tuple(
+            _evidence_record("198.51.100.86", 6100 + sequence, sequence)
+            for sequence in range(8, 12)
+        )
+        records_by_ip = {
+            "198.51.100.85": first_group,
+            "198.51.100.86": second_group,
+        }
+        result = ScanResult(
+            run_id="group-streaming",
+            started_at_utc="2026-10-20T10:00:00Z",
+            completed_at_utc="2026-10-20T11:00:00Z",
+            records=[_evidence_record("198.51.100.99", 6199, 12)],
+            run_store_path=Path("/private/run.sqlite3"),
+        )
+        store = mock.Mock()
+
+        def database_groups(*, batch_size: int) -> Iterator[RunStoreIpGroup]:
+            self.assertEqual(batch_size, 5)
+            return iter(
+                (
+                    RunStoreIpGroup("198.51.100.85", 7, False),
+                    RunStoreIpGroup("198.51.100.86", 4, False),
+                )
+            )
+
+        def database_records(ip: str, *, batch_size: int) -> Iterator[EvidenceRecord]:
+            self.assertEqual(batch_size, 5)
+            return iter(records_by_ip[ip])
+
+        store.iter_positive_ip_groups.side_effect = database_groups
+        store.iter_positive_evidence_for_ip.side_effect = database_records
+
+        with tempfile.TemporaryDirectory() as temp_name:
+            with (
+                mock.patch.object(reports_module, "RunStore", return_value=store) as run_store,
+                mock.patch.object(
+                    reports_module,
+                    "_aggregate_reportable_records",
+                    side_effect=AssertionError(
+                        "Datenbankbefunde dürfen nicht materialisiert werden"
+                    ),
+                ),
+            ):
+                paths = generate_reports(result, Path(temp_name), ReportConfig())
+
+            observations_path = next(
+                path for path in paths if path.name.endswith("_beobachtungen.csv")
+            )
+            with observations_path.open(encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle, delimiter=";"))
+
+        self.assertGreater(run_store.call_count, 1)
+        self.assertGreater(store.iter_positive_ip_groups.call_count, 1)
+        self.assertTrue(
+            all(
+                call.kwargs == {"batch_size": 5}
+                for call in store.iter_positive_ip_groups.call_args_list
+            )
+        )
+        self.assertTrue(
+            all(
+                call.kwargs == {"batch_size": 5}
+                for call in store.iter_positive_evidence_for_ip.call_args_list
+            )
+        )
+        self.assertEqual(len(rows), 11)
+        self.assertEqual({row["ip"] for row in rows}, set(records_by_ip))
+        self.assertNotIn("198.51.100.99", {row["ip"] for row in rows})
+
+    def test_many_ports_for_one_ip_keep_pdf_buffer_bounded(self) -> None:
+        ip = "198.51.100.90"
+        record_count = 80
+        base = _evidence_record(ip, 10_000, 20)
+        result = ScanResult(
+            run_id="bounded-same-ip",
+            started_at_utc="2026-10-20T10:00:00Z",
+            completed_at_utc="2026-10-20T11:00:00Z",
+            run_store_path=Path("/private/run.sqlite3"),
+        )
+        store = mock.Mock()
+
+        def database_groups(*, batch_size: int) -> Iterator[RunStoreIpGroup]:
+            self.assertEqual(batch_size, 5)
+            return iter((RunStoreIpGroup(ip, record_count, False),))
+
+        def database_records(selected_ip: str, *, batch_size: int) -> Iterator[EvidenceRecord]:
+            self.assertEqual(selected_ip, ip)
+            self.assertEqual(batch_size, 5)
+            for index in range(record_count):
+                candidate = replace(
+                    base.handshake.candidate,
+                    port=10_000 + index,
+                    transaction_id_hex=f"{index:04x}",
+                    response_sha256=f"{index:064x}",
+                )
+                yield replace(
+                    base,
+                    handshake=replace(base.handshake, candidate=candidate),
+                    evidence_event_sha256=f"{index + 1000:064x}",
+                )
+
+        store.iter_positive_ip_groups.side_effect = database_groups
+        store.iter_positive_evidence_for_ip.side_effect = database_records
+        streaming_buffers: list[reports_module._StreamingFlowables] = []
+        original_streaming_flowables = reports_module._StreamingFlowables
+
+        class TrackingFlowables(original_streaming_flowables):
+            def __init__(self, flowables: Iterable[object]) -> None:
+                super().__init__(flowables)
+                streaming_buffers.append(self)
+
+        with tempfile.TemporaryDirectory() as temp_name:
+            with (
+                mock.patch.object(reports_module, "RunStore", return_value=store),
+                mock.patch.object(reports_module, "_StreamingFlowables", TrackingFlowables),
+            ):
+                paths = generate_reports(result, Path(temp_name), ReportConfig())
+
+            observations_path = next(
+                path for path in paths if path.name.endswith("_beobachtungen.csv")
+            )
+            with observations_path.open(encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle, delimiter=";"))
+            generated_names = {item.name for item in Path(temp_name).iterdir()}
+
+        self.assertEqual(len(rows), record_count)
+        self.assertEqual(
+            {row["ports"] for row in rows}, {str(10_000 + i) for i in range(record_count)}
+        )
+        self.assertTrue(streaming_buffers)
+        self.assertLessEqual(max(item.peak_buffered for item in streaming_buffers), 10)
+        self.assertIn("bounded-same-ip_anlage_ipv4_198_51_100_90.pdf", generated_names)
+        self.assertIn("bounded-same-ip_strafanzeige_ipv4_198_51_100_90.eml", generated_names)
+        self.assertTrue(
+            all(
+                call.kwargs == {"batch_size": 5}
+                for call in store.iter_positive_evidence_for_ip.call_args_list
+            )
+        )
+
+    def test_report_index_keeps_only_a_bounded_ip_preview(self) -> None:
+        base = _evidence_record("8.8.4.1", 6200, 20)
+        yielded = 0
+
+        def positive_ip_groups(*, batch_size: int) -> Iterator[RunStoreIpGroup]:
+            nonlocal yielded
+            self.assertEqual(batch_size, 5)
+            for index in range(105):
+                yielded += 1
+                yield RunStoreIpGroup(f"8.8.4.{index + 1}", 1, False)
+
+        def positive_records(ip: str, *, batch_size: int) -> Iterator[EvidenceRecord]:
+            self.assertEqual(batch_size, 5)
+            index = int(ip.rpartition(".")[2]) - 1
+            candidate = replace(base.handshake.candidate, ip=ip, port=6200 + index)
+            handshake = replace(base.handshake, candidate=candidate)
+            yield replace(
+                base,
+                handshake=handshake,
+                enrichment=replace(base.enrichment, ip=ip),
+                evidence_event_sha256=f"{index:064x}",
+            )
+
+        store = mock.Mock()
+        store.iter_positive_ip_groups.side_effect = positive_ip_groups
+        store.iter_positive_evidence_for_ip.side_effect = positive_records
+        result = ScanResult(
+            run_id="bounded-index",
+            started_at_utc="2026-10-20T10:00:00Z",
+            run_store_path=Path("/private/run.sqlite3"),
+        )
+
+        with mock.patch.object(reports_module, "RunStore", return_value=store):
+            index = reports_module._build_report_index(result)
+
+        self.assertEqual(yielded, 105)
+        self.assertEqual(index.positive_ip_count, 105)
+        self.assertEqual(index.reportable_ip_count, 105)
+        self.assertEqual(index.vpn_ip_count, 0)
+        self.assertEqual(len(index.reportable_preview), reports_module.MAX_SUMMARY_PDF_ROWS)
+        store.iter_positive_ip_groups.assert_called_once_with(batch_size=5)
+        self.assertTrue(
+            all(
+                call.kwargs == {"batch_size": 5}
+                for call in store.iter_positive_evidence_for_ip.call_args_list
+            )
+        )
+
+    def test_csv_writers_write_each_row_without_collecting_all_rows(self) -> None:
+        ordinary_record = _evidence_record("198.51.100.88", 6188, 18)
+        vpn_record = _evidence_record(
+            "198.51.100.89",
+            6189,
+            19,
+            vpn_status="known_vpn",
+            vpn_provider="Beispiel VPN",
+        )
+        ordinary = reports_module._record_row(ordinary_record, ip_is_known_vpn=False)
+        vpn = reports_module._record_row(vpn_record, ip_is_known_vpn=True)
+
+        def interrupted(row: dict[str, str]) -> Iterator[dict[str, str]]:
+            yield row
+            raise RuntimeError("simulierter Abbruch nach erster Zeile")
+
+        with tempfile.TemporaryDirectory() as temp_name:
+            for writer, row, filename in (
+                (reports_module._write_csv, ordinary, "normal.csv"),
+                (reports_module._write_vpn_csv, vpn, "vpn.csv"),
+            ):
+                path = Path(temp_name) / filename
+                with self.assertRaisesRegex(RuntimeError, "simulierter Abbruch"):
+                    writer(path, interrupted(row))
+                self.assertIn(row["ip"], path.read_text(encoding="utf-8"))
+
+    def test_target_metrics_show_every_hash_including_zero_values_and_reasons(
+        self,
+    ) -> None:
+        result = ScanResult(
+            run_id="metrics",
+            started_at_utc="2026-10-20T10:00:00Z",
+            target_metrics=(
+                TargetScanMetrics(
+                    target_label="Infohash ohne Treffer",
+                    info_hash_hex="a" * 40,
+                ),
+                TargetScanMetrics(
+                    target_label="Infohash mit Fehlschlag",
+                    info_hash_hex="b" * 40,
+                    candidates_discovered=7,
+                    candidates_checked=7,
+                    verification_attempts=18,
+                    confirmed_handshakes=2,
+                    positive_findings=1,
+                    terminal_failures=6,
+                    failure_reasons=(("availability:no_unchoke", 6),),
+                ),
+            ),
+        )
+        toolkit = reports_module._load_reportlab()
+        styles = reports_module._styles(toolkit)
+        story = reports_module._target_metrics_story(result, styles, toolkit)
+
+        self.assertEqual(story[0].getPlainText(), f"Infohash ohne Treffer - {'a' * 40}")
+        zero_rows = {row[0].getPlainText(): row[1].getPlainText() for row in story[1]._cellvalues}
+        self.assertEqual(zero_rows["Gefundene Kandidaten"], "0")
+        self.assertEqual(zero_rows["Direkt geprüfte Kandidaten"], "0")
+        self.assertEqual(zero_rows["Verbindungsversuche"], "0")
+        self.assertEqual(zero_rows["Positive Gesamtbefunde"], "0")
+        self.assertEqual(zero_rows["Fehlergründe"], "keine")
+
+        self.assertEqual(
+            story[2].getPlainText(),
+            f"Infohash mit Fehlschlag - {'b' * 40}",
+        )
+        failure_rows = {
+            row[0].getPlainText(): row[1].getPlainText() for row in story[3]._cellvalues
+        }
+        self.assertEqual(failure_rows["Gefundene Kandidaten"], "7")
+        self.assertEqual(failure_rows["Verbindungsversuche"], "18")
+        self.assertEqual(failure_rows["Bestätigte Handshakes"], "2")
+        self.assertEqual(failure_rows["Positive Gesamtbefunde"], "1")
+        self.assertEqual(
+            failure_rows["Fehlergründe"],
+            "kein UNCHOKE empfangen: 6",
+        )
 
     @unittest.skipIf(os.name == "nt", "POSIX-Dateimodi sind unter Windows anders")
     def test_staged_report_is_private_before_atomic_publish(self) -> None:
@@ -586,7 +946,7 @@ class ReportGenerationTests(unittest.TestCase):
                 ),
                 self.assertRaises(OSError),
             ):
-                _publish_staged_files((source,), output_dir)
+                _publish_staged_files(source.parent, output_dir)
 
             self.assertTrue(source.exists())
             self.assertEqual(stat.S_IMODE(source.stat().st_mode), 0o600)
@@ -615,8 +975,10 @@ class ReportGenerationTests(unittest.TestCase):
                 generated_at_utc="2026-10-20T11:05:00Z",
             )
 
-            first_bytes = {path.name: path.read_bytes() for path in first}
-            second_bytes = {path.name: path.read_bytes() for path in second}
+            self.assertEqual(len(first), 5)
+            self.assertEqual(len(second), 5)
+            first_bytes = {path.name: path.read_bytes() for path in Path(first_name).iterdir()}
+            second_bytes = {path.name: path.read_bytes() for path in Path(second_name).iterdir()}
             self.assertEqual(first_bytes, second_bytes)
 
     def test_source_notes_are_isolated_per_confirmed_ip(self) -> None:
@@ -641,7 +1003,8 @@ class ReportGenerationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_name:
             paths = generate_reports(result, Path(temp_name), ReportConfig())
-            by_name = {path.name: path for path in paths}
+            by_name = {path.name: path for path in Path(temp_name).iterdir()}
+            self.assertEqual(len(paths), 5)
             alpha_pdf = by_name["source-isolation_anlage_ipv4_198_51_100_21.pdf"].read_bytes()
             beta_pdf = by_name["source-isolation_anlage_ipv4_198_51_100_22.pdf"].read_bytes()
             self.assertIn(b"SOURCE_NOTE_ALPHA_ONLY", alpha_pdf)
@@ -703,6 +1066,8 @@ class ReportGenerationTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["ip"], "198.51.100.40")
             self.assertEqual(rows[0]["vpn_anbieter"], "Beispiel VPN")
+            vpn_pdf = next(path for path in paths if path.name.endswith("_vpn_liste.pdf"))
+            self.assertIn(b"Beispiel VPN", vpn_pdf.read_bytes())
 
     def test_large_registry_provenance_can_split_across_pdf_pages(self) -> None:
         records: list[EvidenceRecord] = []

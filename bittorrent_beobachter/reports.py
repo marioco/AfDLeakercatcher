@@ -8,16 +8,16 @@ optionale PDF-Abhaengigkeit importierbar bleiben.
 
 from __future__ import annotations
 
+import base64
 import csv
 import hashlib
 import html
-import io
 import ipaddress
 import os
 import re
 import tempfile
-from collections import defaultdict
-from collections.abc import Iterable
+import textwrap
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.headerregistry import Address
@@ -26,9 +26,10 @@ from email.policy import SMTP
 from email.utils import format_datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, TextIO
 
-from .models import EvidenceRecord, ScanResult
+from .models import EvidenceRecord, PeerCandidate, ScanResult
+from .run_store import RunStore
 
 PROJECT_REPOSITORY_URL = "https://github.com/marioco/AfDLeakercatcher"
 PUBLISHED_SOURCE_URL = "https://hexane.cc/"
@@ -106,8 +107,9 @@ EVIDENCE_LIMITATIONS = (
     "Signatur und kein vertrauenswürdiger externer Zeitstempel.",
     "Die Hash-Kette bestätigt nicht die sachliche Richtigkeit der vor ihrer "
     "Berechnung gespeicherten Angaben.",
-    "Der SHA-256-Wert der DHT-Antwort ist nur ein lokal berechneter "
-    "Fingerabdruck. Das Rohpaket wird datensparsam nicht gespeichert; der Wert "
+    "Der SHA-256-Wert der DHT- oder UDP-Tracker-Antwort ist nur ein lokal "
+    "berechneter Fingerabdruck. Das Rohpaket wird datensparsam nicht gespeichert; "
+    "der Wert "
     "ist deshalb später nicht unabhängig reproduzierbar oder extern bestätigt.",
     "Die rechtliche Bewertung und alle weiteren Ermittlungen obliegen "
     "ausschließlich den zuständigen Behörden.",
@@ -122,7 +124,8 @@ CSV_FIELDNAMES = (
     "erste_beobachtung_utc",
     "letzte_beobachtung_utc",
     "bestaetigte_handshakes",
-    "lokaler_dht_antwort_fingerabdruck_sha256",
+    "fundquellen",
+    "lokaler_fundantwort_fingerabdruck_sha256",
     "beweisereignis_sha256",
     "remote_peer_ids",
     "bytes_gesendet_summe",
@@ -153,6 +156,9 @@ VPN_CSV_FIELDNAMES = (
     "vpn_quellen",
 )
 
+MAX_SUMMARY_PDF_ROWS = 100
+MAX_SUMMARY_SOURCE_NOTES = 50
+
 
 @dataclass(frozen=True, slots=True)
 class ReportConfig:
@@ -173,16 +179,54 @@ class ReportConfig:
 
 @dataclass(frozen=True, slots=True)
 class _IpAggregate:
-    """Positive Gesamtbefunde für eine kanonische IP-Adresse."""
+    """Kleiner IP-Handle, der Evidenz bei jedem Durchlauf batchweise neu liest."""
 
     ip: str
-    records: tuple[EvidenceRecord, ...]
+    record_count: int
+    is_known_vpn: bool
+    records_factory: Callable[[], Iterator[EvidenceRecord]]
 
-    @property
-    def is_known_vpn(self) -> bool:
-        """Wertet eine IP konservativ als VPN, sobald ein Datensatz so lautet."""
+    def iter_records(self) -> Iterator[EvidenceRecord]:
+        """Liefert exakt die positive Evidenz dieser IP ohne Gruppentupel."""
 
-        return any(record.vpn.status == "known_vpn" for record in self.records)
+        yielded = 0
+        for record in self.records_factory():
+            candidate = record.handshake.candidate
+            if _canonical_ip(candidate.ip) != self.ip:
+                raise ValueError(
+                    f"Evidenz-Iterator für {self.ip} lieferte abweichende IP {candidate.ip}."
+                )
+            if not record.handshake.offering_observed:
+                raise ValueError("IP-Aggregat enthält keinen positiven Gesamtbefund.")
+            yielded += 1
+            yield record
+        if yielded != self.record_count:
+            raise ValueError(
+                f"Evidenzanzahl für {self.ip} ist inkonsistent: "
+                f"{self.record_count} erwartet, {yielded} gelesen."
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class _IpSummary:
+    """Kleine IP-Bilanz ohne die zugrunde liegenden Evidenzobjekte."""
+
+    ip: str
+    is_known_vpn: bool
+    row: dict[str, str]
+    source_notes: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _ReportIndex:
+    """Begrenzter Laufindex ohne eine mit der Trefferzahl wachsende IP-Liste."""
+
+    positive_ip_count: int
+    reportable_ip_count: int
+    vpn_ip_count: int
+    reportable_preview: tuple[_IpSummary, ...]
+    source_notes: tuple[str, ...]
+    source_notes_truncated: bool
 
 
 def _project_leak_hashes(aggregate: _IpAggregate) -> tuple[str, ...]:
@@ -192,46 +236,159 @@ def _project_leak_hashes(aggregate: _IpAggregate) -> tuple[str, ...]:
         sorted(
             {
                 record.handshake.candidate.info_hash_hex
-                for record in aggregate.records
+                for record in aggregate.iter_records()
                 if record.handshake.candidate.info_hash_hex in PROJECT_LEAK_INFO_HASHES
             }
         )
     )
 
 
-def _availability_statements(aggregate: _IpAggregate) -> tuple[str, ...]:
-    """Formuliert einen Angebotsbefund nur über das zentrale Gesamt-Gate."""
+def _discovery_source_label(candidate: PeerCandidate) -> str:
+    """Bezeichnet die protokollierte Fundquelle ohne DHT/Tracker-Verwechslung."""
 
-    statements: list[str] = []
-    for record in aggregate.records:
-        handshake = record.handshake
-        observation = handshake.availability
-        if observation is None:
-            continue
-        if not handshake.offering_observed:
-            statements.append(
-                "Die direkte Verfügbarkeitsprüfung ergab keinen vollständigen "
-                "positiven Gesamtbefund. Daher wird nicht behauptet, dass der "
-                "Peer Stückverfügbarkeit meldete oder ein UNCHOKE-Signal sendete. "
-                "Es wurden keine Inhaltsblöcke angefordert oder heruntergeladen."
-            )
-            continue
+    if candidate.discovery_source == "tracker":
+        return "UDP-Tracker"
+    return "BitTorrent-DHT"
 
-        statements.append(
-            "Das Prüfprogramm stellte eine direkte Verbindung zum BitTorrent-Client "
-            "her. Der Client bestätigte die eindeutige digitale Kennung (Infohash). "
-            "Er meldete, dass bei ihm Teile verfügbar seien; außerdem teilte er dem "
-            "Prüfprogramm mit, dass es diese Teile nun anfordern dürfe (technische "
-            "Nachricht: UNCHOKE). Der Client blieb während "
-            "der vollständig durchgeführten Beobachtungszeit erreichbar. "
-            "Beobachtet wurde von "
-            f"{observation.started_at_utc} bis {observation.ended_at_utc} "
-            f"({observation.duration_seconds:.1f} Sekunden; vorgesehen: "
-            f"{observation.requested_duration_seconds:.1f} Sekunden). Das "
-            "Prüfprogramm forderte diese Teile nicht an und lud keine Inhalte "
-            "herunter."
+
+def _discovery_method_statement(aggregate: _IpAggregate) -> str:
+    """Erklaert die fuer diese IP tatsaechlich protokollierten Fundwege."""
+
+    sources = {record.handshake.candidate.discovery_source for record in aggregate.iter_records()}
+    if sources == {"tracker"}:
+        return (
+            "Das Prüfprogramm fragte die konfigurierten öffentlichen UDP-Tracker "
+            "gezielt nach den dokumentierten Infohashes ab. Dabei nannte mindestens "
+            f"eine Tracker-Antwort den Endpunkt mit der IP-Adresse {aggregate.ip} "
+            "als Peer. Antwortender UDP-Tracker, Transaktions-ID, Empfangszeitpunkt "
+            "und lokaler SHA-256-Fingerabdruck jeder Antwort sind in den technischen "
+            "Einzelbeobachtungen aufgeführt."
         )
-    return tuple(statements)
+    if sources == {"dht"}:
+        return (
+            "Das Prüfprogramm fragte das öffentliche BitTorrent-DHT gezielt nach "
+            "den dokumentierten Infohashes ab. Dabei nannten DHT-Antworten den "
+            f"Endpunkt mit der IP-Adresse {aggregate.ip} als Peer. Antwortender "
+            "DHT-Knoten, Transaktions-ID, Empfangszeitpunkt und lokaler "
+            "SHA-256-Fingerabdruck jeder Antwort sind in den technischen "
+            "Einzelbeobachtungen aufgeführt."
+        )
+    return (
+        "Das Prüfprogramm fragte sowohl das öffentliche BitTorrent-DHT als auch "
+        "die konfigurierten öffentlichen UDP-Tracker gezielt nach den dokumentierten "
+        f"Infohashes ab. Beide Fundwege nannten die IP-Adresse {aggregate.ip} als "
+        "Peer-Endpunkt. Fundquelle, antwortender DHT-Knoten oder UDP-Tracker, "
+        "Transaktions-ID, Empfangszeitpunkt und lokaler SHA-256-Fingerabdruck "
+        "jeder Antwort sind in den technischen Einzelbeobachtungen aufgeführt."
+    )
+
+
+def _discovery_detail_rows(
+    candidate: PeerCandidate,
+) -> tuple[tuple[str, str], ...]:
+    """Formatiert DHT- und Tracker-Nachweise mit eindeutig passenden Feldnamen."""
+
+    if candidate.discovery_source == "tracker":
+        return (
+            ("Fundquelle", "UDP-Tracker"),
+            ("Vom UDP-Tracker genannt (UTC)", candidate.discovered_at_utc),
+            (
+                "UDP-Tracker-Antwort von",
+                _format_endpoint(candidate.dht_node_ip, candidate.dht_node_port),
+            ),
+            ("Tracker-Transaktions-ID", candidate.transaction_id_hex),
+            (
+                "Lokaler SHA-256-Fingerabdruck der UDP-Tracker-Antwort",
+                candidate.response_sha256,
+            ),
+        )
+    return (
+        ("Fundquelle", "BitTorrent-DHT"),
+        ("Von DHT genannt (UTC)", candidate.discovered_at_utc),
+        (
+            "DHT-Antwort von",
+            _format_endpoint(candidate.dht_node_ip, candidate.dht_node_port),
+        ),
+        ("DHT-Transaktions-ID", candidate.transaction_id_hex),
+        (
+            "Lokaler SHA-256-Fingerabdruck der DHT-Antwort",
+            candidate.response_sha256,
+        ),
+    )
+
+
+def _availability_statement(record: EvidenceRecord) -> str:
+    """Formuliert den vollständigen Angebotsbefund genau eines Records."""
+
+    handshake = record.handshake
+    observation = handshake.availability
+    if observation is None or not handshake.offering_observed:
+        raise ValueError("Verfügbarkeitstext erfordert einen positiven Gesamtbefund.")
+    if observation.completed_full_window:
+        duration_statement = (
+            "Der Client blieb während der vollständig durchgeführten Beobachtungszeit erreichbar. "
+        )
+    else:
+        duration_statement = (
+            "Die Verbindung endete nach der bereits positiven Beobachtung; "
+            f"Beendigungsgrund: {observation.termination_reason}. "
+        )
+    return (
+        "Das Prüfprogramm stellte eine direkte Verbindung zum BitTorrent-Client "
+        "her. Der Client bestätigte die eindeutige digitale Kennung (Infohash). "
+        "Er meldete, dass bei ihm Teile verfügbar seien; außerdem teilte er dem "
+        "Prüfprogramm mit, dass es diese Teile nun anfordern dürfe (technische "
+        "Nachricht: UNCHOKE). "
+        f"{duration_statement}"
+        "Beobachtet wurde von "
+        f"{observation.started_at_utc} bis {observation.ended_at_utc} "
+        f"({observation.duration_seconds:.1f} Sekunden; vorgesehen: "
+        f"{observation.requested_duration_seconds:.1f} Sekunden). Das "
+        "Prüfprogramm forderte diese Teile nicht an und lud keine Inhalte herunter."
+    )
+
+
+def _availability_overview(aggregate: _IpAggregate) -> str:
+    """Verdichtet beliebig viele positive Prüfungen in konstantem Speicher."""
+
+    first_record: EvidenceRecord | None = None
+    first_seen: tuple[datetime, str] | None = None
+    last_seen: tuple[datetime, str] | None = None
+    full_windows = 0
+    early_endings = 0
+    for record in aggregate.iter_records():
+        if first_record is None:
+            first_record = record
+        observation = record.handshake.availability
+        if observation is None or not record.handshake.offering_observed:
+            raise ValueError("IP-Aggregat enthält keinen positiven Gesamtbefund.")
+        full_windows += int(observation.completed_full_window)
+        early_endings += int(not observation.completed_full_window)
+        for timestamp in (observation.started_at_utc, observation.ended_at_utc):
+            parsed = _timestamp_as_datetime(timestamp)
+            if first_seen is None or parsed < first_seen[0]:
+                first_seen = (parsed, timestamp)
+            if last_seen is None or parsed > last_seen[0]:
+                last_seen = (parsed, timestamp)
+
+    if first_record is None or first_seen is None or last_seen is None:
+        raise ValueError(f"IP-Aggregat {aggregate.ip} ist leer.")
+    if aggregate.record_count == 1:
+        return _availability_statement(first_record)
+    first_statement = _availability_statement(first_record)
+    return (
+        f"Das Prüfprogramm führte {aggregate.record_count} direkte Prüfungen von "
+        f"BitTorrent-Endpunkten unter der IP-Adresse {aggregate.ip} durch. Bei jeder "
+        "protokollierten positiven Prüfung bestätigte der Client den jeweiligen "
+        "Infohash, meldete verfügbare Teile und gab mit UNCHOKE das Anfordern dieser "
+        "Teile frei. Eine der Prüfungen ist wie folgt dokumentiert: "
+        f"{first_statement} "
+        f"Insgesamt erreichten {full_windows} Prüfung(en) die vollständig vorgesehene "
+        f"Beobachtungszeit; {early_endings} Verbindung(en) endeten erst nach dem "
+        "bereits positiven Befund. Der gesamte Beobachtungszeitraum reichte von "
+        f"{first_seen[1]} bis {last_seen[1]}. Alle weiteren Einzelzeiten und "
+        "Beendigungsgründe stehen vollständig in den technischen Einzelbeobachtungen."
+    )
 
 
 def _availability_detail_rows(record: EvidenceRecord) -> tuple[tuple[str, str], ...]:
@@ -266,7 +423,10 @@ def _availability_detail_rows(record: EvidenceRecord) -> tuple[tuple[str, str], 
             f"{observation.duration_seconds:.1f} von vorgesehenen "
             f"{observation.requested_duration_seconds:.1f} Sekunden",
         ),
-        ("Vollständige Beobachtungszeit erreicht", "ja"),
+        (
+            "Vollständige Beobachtungszeit erreicht",
+            "ja" if observation.completed_full_window else "nein",
+        ),
         ("Peer meldete Stückverfügbarkeit", "ja"),
         ("Peer sendete UNCHOKE", "ja"),
         ("Empfangene Protokollnachrichten", str(observation.messages_received)),
@@ -276,7 +436,7 @@ def _availability_detail_rows(record: EvidenceRecord) -> tuple[tuple[str, str], 
         ("Gesendete Metadatenanfragen", str(observation.metadata_requests_sent)),
         ("Beendigungsgrund", observation.termination_reason),
         ("Protokollierte Steuerereignisse", control_events),
-        ("Fehler der Verfügbarkeitsprüfung", "keiner"),
+        ("Fehler der Verfügbarkeitsprüfung", observation.error or "keiner"),
         ("Angeforderte oder geladene Inhaltsblöcke", "keine"),
     )
 
@@ -306,20 +466,17 @@ def generate_reports(
     *,
     generated_at_utc: str | None = None,
 ) -> list[Path]:
-    """Erzeugt den vollstaendigen Berichtssatz und gibt absolute Pfade zurueck.
+    """Erzeugt alle Dateien streamend und merkt nur fünf feste Kernpfade.
 
-    Ausschliesslich bestaetigte Eintraege aus ``result.records`` werden
-    ausgewertet. Bekannte VPN-Endpunkte erscheinen ausschliesslich in einer
-    datensparsamen VPN-Liste; fuer sie werden weder Einzelanlagen noch
-    E-Mail-Dateien erzeugt. Das SHA-256-Manifest wird zuletzt erstellt und
-    hasht alle anderen erzeugten Dateien.
+    Die vollständige Dateiliste mit SHA-256-Werten steht im Manifest. Im
+    ScanResult verbleiben nur Laufbericht, beide CSV-Dateien, VPN-PDF und
+    Manifest, damit GUI und CLI den Ergebnisordner ohne wachsende Pfadliste
+    finden. Ohne Laufdatenbank bleibt result.records nur für ältere Ergebnisse.
     """
 
     _validate_report_config(config)
     _single_line(result.run_id, "run_id")
-    aggregates = _aggregate_reportable_records(result.records)
-    reportable = tuple(item for item in aggregates if not item.is_known_vpn)
-    vpn_only = tuple(item for item in aggregates if item.is_known_vpn)
+    report_index = _build_report_index(result)
     generated_timestamp = _normalise_utc_timestamp(
         generated_at_utc or result.completed_at_utc or result.started_at_utc
     )
@@ -335,79 +492,96 @@ def generate_reports(
 
     with tempfile.TemporaryDirectory(prefix=".berichte-", dir=output_dir) as temp_name:
         staging_dir = Path(temp_name)
-        generated_files: list[Path] = []
-
-        summary_path = staging_dir / f"{run_slug}_laufbericht.pdf"
-        _write_summary_pdf(
-            summary_path,
-            result,
-            aggregates,
-            reportable,
-            vpn_only,
-            config,
+        manifest_path = staging_dir / f"{run_slug}_SHA256SUMS.txt"
+        manifest_handle = _start_manifest(
+            manifest_path,
+            result.run_id,
             generated_timestamp,
-            toolkit,
         )
-        generated_files.append(summary_path)
+        manifest_entry_count = 0
 
-        csv_path = staging_dir / f"{run_slug}_beobachtungen.csv"
-        _write_csv(csv_path, reportable)
-        generated_files.append(csv_path)
+        def record_generated(path: Path) -> None:
+            nonlocal manifest_entry_count
+            _append_manifest_entry(manifest_handle, path)
+            manifest_entry_count += 1
 
-        vpn_csv_path = staging_dir / f"{run_slug}_vpn_liste.csv"
-        _write_vpn_csv(vpn_csv_path, vpn_only)
-        generated_files.append(vpn_csv_path)
-
-        vpn_pdf_path = staging_dir / f"{run_slug}_vpn_liste.pdf"
-        _write_vpn_pdf(
-            vpn_pdf_path,
-            result,
-            vpn_only,
-            config,
-            generated_timestamp,
-            toolkit,
-        )
-        generated_files.append(vpn_pdf_path)
-
-        for aggregate in reportable:
-            ip_slug = safe_ip_filename(aggregate.ip)
-            attachment_path = staging_dir / f"{run_slug}_anlage_{ip_slug}.pdf"
-            _write_complaint_attachment_pdf(
-                attachment_path,
+        try:
+            summary_path = staging_dir / f"{run_slug}_laufbericht.pdf"
+            _write_summary_pdf(
+                summary_path,
                 result,
-                aggregate,
+                report_index,
                 config,
                 generated_timestamp,
                 toolkit,
             )
-            generated_files.append(attachment_path)
+            record_generated(summary_path)
 
-            complaint_path = staging_dir / f"{run_slug}_strafanzeige_{ip_slug}.eml"
-            _write_complaint_email(
-                complaint_path,
+            csv_path = staging_dir / f"{run_slug}_beobachtungen.csv"
+            _write_csv(csv_path, _iter_csv_rows(result, known_vpn=False))
+            record_generated(csv_path)
+
+            vpn_csv_path = staging_dir / f"{run_slug}_vpn_liste.csv"
+            _write_vpn_csv(vpn_csv_path, _iter_csv_rows(result, known_vpn=True))
+            record_generated(vpn_csv_path)
+
+            vpn_pdf_path = staging_dir / f"{run_slug}_vpn_liste.pdf"
+            _write_vpn_pdf(
+                vpn_pdf_path,
                 result,
-                aggregate,
+                _iter_ip_summaries(result, known_vpn=True),
+                report_index.vpn_ip_count,
                 config,
                 generated_timestamp,
-                attachment_path,
+                toolkit,
             )
-            generated_files.append(complaint_path)
+            record_generated(vpn_pdf_path)
 
-        manifest_path = staging_dir / f"{run_slug}_SHA256SUMS.txt"
-        _write_manifest(
-            manifest_path,
-            generated_files,
-            result.run_id,
-            generated_timestamp,
-        )
-        generated_files.append(manifest_path)
+            for aggregate in _iter_ip_aggregates(result):
+                if aggregate.is_known_vpn:
+                    continue
+                ip_slug = safe_ip_filename(aggregate.ip)
+                attachment_path = staging_dir / f"{run_slug}_anlage_{ip_slug}.pdf"
+                _write_complaint_attachment_pdf(
+                    attachment_path,
+                    result,
+                    aggregate,
+                    config,
+                    generated_timestamp,
+                    toolkit,
+                )
+                record_generated(attachment_path)
 
-        final_paths = _publish_staged_files(generated_files, output_dir)
+                complaint_path = staging_dir / f"{run_slug}_strafanzeige_{ip_slug}.eml"
+                _write_complaint_email(
+                    complaint_path,
+                    result,
+                    aggregate,
+                    config,
+                    generated_timestamp,
+                    attachment_path,
+                )
+                record_generated(complaint_path)
+        finally:
+            manifest_handle.close()
 
-    for path in final_paths:
-        if path not in result.report_paths:
-            result.report_paths.append(path)
-    return final_paths
+        published_count = _publish_staged_files(staging_dir, output_dir)
+        if published_count != manifest_entry_count + 1:
+            raise RuntimeError(
+                "Anzahl veröffentlichter Berichtsdateien stimmt nicht mit dem Manifest überein."
+            )
+
+    core_paths = [
+        output_dir / f"{run_slug}_laufbericht.pdf",
+        output_dir / f"{run_slug}_beobachtungen.csv",
+        output_dir / f"{run_slug}_vpn_liste.csv",
+        output_dir / f"{run_slug}_vpn_liste.pdf",
+        output_dir / f"{run_slug}_SHA256SUMS.txt",
+    ]
+    if not all(path.is_file() for path in core_paths):
+        raise RuntimeError("Mindestens eine Kern-Berichtsdatei fehlt nach der Veröffentlichung.")
+    result.report_paths[:] = core_paths
+    return core_paths
 
 
 def _load_reportlab() -> SimpleNamespace:
@@ -479,13 +653,43 @@ def _validate_report_config(config: ReportConfig) -> None:
             raise ValueError(f"Ungueltige E-Mail-Adresse in {label}") from exc
 
 
+def _iter_evidence_records(result: ScanResult) -> Iterable[EvidenceRecord]:
+    """Liest Laufbefunde bevorzugt in Fünferbatches aus der privaten Datenbank."""
+
+    if result.run_store_path is None:
+        yield from result.records
+        return
+    store = RunStore(result.run_store_path)
+    yield from store.iter_evidence_records(batch_size=5)
+
+
+def _iter_ip_aggregates(result: ScanResult) -> Iterator[_IpAggregate]:
+    """Liefert kleine IP-Handles; Evidenz bleibt in SQLite oder der Legacy-Liste."""
+
+    if result.run_store_path is not None:
+        store_path = result.run_store_path
+        for group in RunStore(store_path).iter_positive_ip_groups(batch_size=5):
+            yield _IpAggregate(
+                ip=group.ip,
+                record_count=group.record_count,
+                is_known_vpn=group.is_known_vpn,
+                records_factory=lambda ip=group.ip: RunStore(
+                    store_path
+                ).iter_positive_evidence_for_ip(ip, batch_size=5),
+            )
+        return
+
+    yield from _aggregate_reportable_records(result.records)
+
+
 def _aggregate_reportable_records(
     records: Iterable[EvidenceRecord],
 ) -> tuple[_IpAggregate, ...]:
-    """Gruppiert ausschließlich positive Gesamtbefunde nach kanonischer IP."""
+    """Baut Legacy-IP-Handles ohne eine zweite Records-Liste je IP."""
 
-    grouped: defaultdict[str, list[EvidenceRecord]] = defaultdict(list)
-    for record in records:
+    source_records = records if isinstance(records, (list, tuple)) else list(records)
+    group_state: dict[str, tuple[int, bool]] = {}
+    for record in source_records:
         if not record.handshake.offering_observed:
             continue
         candidate_ip = _canonical_ip(record.handshake.candidate.ip)
@@ -495,13 +699,98 @@ def _aggregate_reportable_records(
                 "IP-Adresse der Netzregistrierung passt nicht zum Handshake: "
                 f"{enrichment_ip} != {candidate_ip}"
             )
-        grouped[candidate_ip].append(record)
+        count, is_known_vpn = group_state.get(candidate_ip, (0, False))
+        group_state[candidate_ip] = (
+            count + 1,
+            is_known_vpn or record.vpn.status == "known_vpn",
+        )
 
     aggregates: list[_IpAggregate] = []
-    for ip, ip_records in grouped.items():
-        ordered_records = tuple(sorted(ip_records, key=_record_sort_key))
-        aggregates.append(_IpAggregate(ip=ip, records=ordered_records))
-    return tuple(sorted(aggregates, key=lambda item: _ip_sort_key(item.ip)))
+    for ip in sorted(group_state, key=_ip_sort_key):
+        count, is_known_vpn = group_state[ip]
+
+        def records_for_ip(
+            selected_ip: str = ip,
+            source: Iterable[EvidenceRecord] = source_records,
+        ) -> Iterator[EvidenceRecord]:
+            for record in source:
+                if (
+                    record.handshake.offering_observed
+                    and _canonical_ip(record.handshake.candidate.ip) == selected_ip
+                ):
+                    yield record
+
+        aggregates.append(
+            _IpAggregate(
+                ip=ip,
+                record_count=count,
+                is_known_vpn=is_known_vpn,
+                records_factory=records_for_ip,
+            )
+        )
+    return tuple(aggregates)
+
+
+def _summarize_aggregate(aggregate: _IpAggregate) -> _IpSummary:
+    """Verdichtet eine IP-Gruppe, bevor ihre Evidenzobjekte freigegeben werden."""
+
+    return _IpSummary(
+        ip=aggregate.ip,
+        is_known_vpn=aggregate.is_known_vpn,
+        row=_aggregate_row(aggregate),
+        source_notes=_source_note_lines(aggregate.iter_records()),
+    )
+
+
+def _build_report_index(result: ScanResult) -> _ReportIndex:
+    """Zaehlt IP-Gruppen und behaelt nur eine fest begrenzte PDF-Vorschau."""
+
+    positive_ip_count = 0
+    reportable_ip_count = 0
+    vpn_ip_count = 0
+    preview: list[_IpSummary] = []
+    source_notes: list[str] = []
+    seen_source_notes: set[str] = set()
+    source_notes_truncated = False
+
+    for aggregate in _iter_ip_aggregates(result):
+        positive_ip_count += 1
+        if aggregate.is_known_vpn:
+            vpn_ip_count += 1
+            continue
+
+        reportable_ip_count += 1
+        if len(preview) < MAX_SUMMARY_PDF_ROWS:
+            preview.append(_summarize_aggregate(aggregate))
+        for note in _source_note_lines(aggregate.iter_records()):
+            if note in seen_source_notes:
+                continue
+            if len(source_notes) >= MAX_SUMMARY_SOURCE_NOTES:
+                source_notes_truncated = True
+                continue
+            seen_source_notes.add(note)
+            source_notes.append(note)
+
+    return _ReportIndex(
+        positive_ip_count=positive_ip_count,
+        reportable_ip_count=reportable_ip_count,
+        vpn_ip_count=vpn_ip_count,
+        reportable_preview=tuple(preview),
+        source_notes=tuple(source_notes),
+        source_notes_truncated=source_notes_truncated,
+    )
+
+
+def _iter_ip_summaries(
+    result: ScanResult,
+    *,
+    known_vpn: bool,
+) -> Iterable[_IpSummary]:
+    """Verdichtet beim Lesen jeweils nur die aktuelle IP-Gruppe."""
+
+    for aggregate in _iter_ip_aggregates(result):
+        if aggregate.is_known_vpn == known_vpn:
+            yield _summarize_aggregate(aggregate)
 
 
 def _canonical_ip(value: str) -> str:
@@ -552,15 +841,27 @@ def _safe_component(value: str, *, fallback: str) -> str:
     return safe or fallback
 
 
-def _publish_staged_files(files: Iterable[Path], output_dir: Path) -> list[Path]:
-    final_paths: list[Path] = []
-    for source in files:
+def _iter_staged_files(staging_dir: Path) -> Iterable[Path]:
+    """Liest Staging-Dateien ohne eine mit der Dateizahl wachsende Pfadliste."""
+
+    with os.scandir(staging_dir) as entries:
+        for entry in entries:
+            if not entry.is_file(follow_symlinks=False):
+                raise RuntimeError(f"Unerwarteter Eintrag im Berichts-Staging: {entry.name}")
+            yield Path(entry.path)
+
+
+def _publish_staged_files(staging_dir: Path, output_dir: Path) -> int:
+    """Veröffentlicht Staging-Dateien iteratorbasiert und liefert nur ihre Anzahl."""
+
+    published_count = 0
+    for source in _iter_staged_files(staging_dir):
         target = output_dir / source.name
         _set_private_mode(source, 0o600)
         os.replace(source, target)
         _set_private_mode(target, 0o600)
-        final_paths.append(target)
-    return final_paths
+        published_count += 1
+    return published_count
 
 
 def _set_private_mode(path: Path, mode: int) -> None:
@@ -625,10 +926,76 @@ def _styles(toolkit: SimpleNamespace) -> SimpleNamespace:
     return sample
 
 
+class _StreamingFlowables:
+    """Listenähnlicher, lazy ReportLab-Puffer mit konstanter Vorhaltebreite."""
+
+    def __init__(self, flowables: Iterable[Any]) -> None:
+        self._iterator = iter(flowables)
+        self._buffer: list[Any] = []
+        self._exhausted = False
+        self.peak_buffered = 0
+
+    def _fill(self, minimum: int = 2) -> None:
+        while not self._exhausted and len(self._buffer) < minimum:
+            try:
+                self._buffer.append(next(self._iterator))
+            except StopIteration:
+                self._exhausted = True
+                break
+        self.peak_buffered = max(self.peak_buffered, len(self._buffer))
+
+    def __len__(self) -> int:
+        self._fill()
+        return len(self._buffer)
+
+    def __getitem__(self, index: int | slice) -> Any:
+        if isinstance(index, slice):
+            if index.stop is None:
+                raise TypeError("Offene Slices sind für Streaming-Flowables nicht erlaubt.")
+            self._fill(max(0, index.stop))
+            return self._buffer[index]
+        if index >= 0:
+            self._fill(index + 1)
+        return self._buffer[index]
+
+    def __setitem__(self, index: int | slice, value: Any) -> None:
+        if isinstance(index, slice):
+            if index.stop is None:
+                raise TypeError("Offene Slices sind für Streaming-Flowables nicht erlaubt.")
+            self._fill(max(0, index.stop))
+            self._buffer[index] = value
+        else:
+            if index >= 0:
+                self._fill(index + 1)
+            self._buffer[index] = value
+        self.peak_buffered = max(self.peak_buffered, len(self._buffer))
+
+    def __delitem__(self, index: int | slice) -> None:
+        if isinstance(index, slice):
+            if index.stop is None:
+                raise TypeError("Offene Slices sind für Streaming-Flowables nicht erlaubt.")
+            self._fill(max(0, index.stop))
+        elif index >= 0:
+            self._fill(index + 1)
+        del self._buffer[index]
+
+    def insert(self, index: int, value: Any) -> None:
+        if index >= 0:
+            self._fill(index)
+        self._buffer.insert(index, value)
+        self.peak_buffered = max(self.peak_buffered, len(self._buffer))
+
+    def __iter__(self) -> Iterator[Any]:
+        while len(self):
+            value = self[0]
+            del self[0]
+            yield value
+
+
 def _build_pdf(
     path: Path,
     title: str,
-    story: list[Any],
+    story: Iterable[Any],
     config: ReportConfig,
     generated_at_utc: str,
     toolkit: SimpleNamespace,
@@ -664,25 +1031,111 @@ def _build_pdf(
         canvas.drawString(margin, 9 * toolkit.mm, f"Erstellt: {generated_at_utc}")
         canvas.restoreState()
 
+    flowables = story if isinstance(story, list) else _StreamingFlowables(story)
     document.build(
-        story,
+        flowables,
         onFirstPage=decorate_page,
         onLaterPages=decorate_page,
         canvasmaker=canvas_maker,
     )
 
 
+def _failure_reason_text(reason: str) -> str:
+    """Uebersetzt kompakte interne Kategorien fuer den menschenlesbaren Bericht."""
+
+    labels = {
+        "confirmation:not_confirmed": "Handshake nicht bestätigt",
+        "availability:missing": "keine Verfügbarkeitsbeobachtung",
+        "availability:no_piece": "keine Stückverfügbarkeit gemeldet",
+        "availability:no_unchoke": "kein UNCHOKE empfangen",
+    }
+    if reason in labels:
+        return labels[reason]
+    prefix, separator, detail = reason.partition(":")
+    if separator and prefix == "termination":
+        return f"Beendigung: {detail}"
+    if separator and prefix == "error":
+        return f"Fehlerkategorie: {detail}"
+    return reason
+
+
+def _target_metrics_story(
+    result: ScanResult,
+    styles: Any,
+    toolkit: SimpleNamespace,
+) -> list[Any]:
+    """Erzeugt fuer jedes Ziel eine vollstaendige, auch bei Nullwerten sichtbare Bilanz."""
+
+    if not result.target_metrics:
+        return [
+            _paragraph(
+                "Für diesen Lauf liegen keine zielbezogenen Abschlusszahlen vor.",
+                styles["BodyText"],
+                toolkit,
+            )
+        ]
+
+    story: list[Any] = []
+    for metric in result.target_metrics:
+        failure_reasons = (
+            " | ".join(
+                f"{_failure_reason_text(reason)}: {count}"
+                for reason, count in metric.failure_reasons
+            )
+            or "keine"
+        )
+        story.extend(
+            [
+                _paragraph(
+                    f"{_escape_text(metric.target_label)} - {_escape_text(metric.info_hash_hex)}",
+                    styles["Heading2"],
+                    toolkit,
+                    already_escaped=True,
+                ),
+                _key_value_table(
+                    (
+                        ("DHT-Anfragen gestartet", str(metric.dht_queries_started)),
+                        ("DHT-Anfragen abgeschlossen", str(metric.dht_queries_completed)),
+                        ("DHT-Anfragen fehlgeschlagen", str(metric.dht_queries_failed)),
+                        (
+                            "Tracker-Anfragen abgeschlossen",
+                            str(metric.tracker_queries_completed),
+                        ),
+                        (
+                            "Tracker-Anfragen fehlgeschlagen",
+                            str(metric.tracker_queries_failed),
+                        ),
+                        ("Gefundene Kandidaten", str(metric.candidates_discovered)),
+                        ("Direkt geprüfte Kandidaten", str(metric.candidates_checked)),
+                        ("Verbindungsversuche", str(metric.verification_attempts)),
+                        ("Bestätigte Handshakes", str(metric.confirmed_handshakes)),
+                        (
+                            "Gemeldete Stückverfügbarkeit",
+                            str(metric.piece_availability_observed),
+                        ),
+                        ("Empfangene UNCHOKE-Signale", str(metric.unchoke_observed)),
+                        ("Positive Gesamtbefunde", str(metric.positive_findings)),
+                        ("Abschließende Fehlschläge", str(metric.terminal_failures)),
+                        ("Fehlergründe", failure_reasons),
+                    ),
+                    styles,
+                    toolkit,
+                ),
+            ]
+        )
+    return story
+
+
 def _write_summary_pdf(
     path: Path,
     result: ScanResult,
-    aggregates: tuple[_IpAggregate, ...],
-    reportable: tuple[_IpAggregate, ...],
-    vpn_only: tuple[_IpAggregate, ...],
+    report_index: _ReportIndex,
     config: ReportConfig,
     generated_at_utc: str,
     toolkit: SimpleNamespace,
 ) -> None:
     styles = _styles(toolkit)
+    reportable = report_index.reportable_preview
     story: list[Any] = [
         _paragraph("Technischer Laufbericht", styles["Title"], toolkit),
         _paragraph(
@@ -699,31 +1152,35 @@ def _write_summary_pdf(
                 ("Beginn (UTC)", result.started_at_utc),
                 ("Abschluss (UTC)", result.completed_at_utc or "nicht abgeschlossen"),
                 ("Bericht erstellt (UTC)", generated_at_utc),
-                ("DHT-Kandidaten", str(len(result.candidates))),
-                ("Handshake-Versuche", str(len(result.handshakes))),
+                ("Gefundene Kandidaten", str(result.total_candidate_count)),
+                ("Direkt geprüfte Kandidaten", str(result.total_handshake_count)),
                 ("Bestätigte Handshakes", str(result.confirmed_count)),
-                ("IP-Adressen mit positivem Gesamtbefund", str(len(aggregates))),
-                ("Anlagen zu Strafanzeigen", str(len(reportable))),
-                ("Bekannte VPN-IP-Adressen", str(len(vpn_only))),
+                ("IP-Adressen mit positivem Gesamtbefund", str(report_index.positive_ip_count)),
+                ("Anlagen zu Strafanzeigen", str(report_index.reportable_ip_count)),
+                ("Bekannte VPN-IP-Adressen", str(report_index.vpn_ip_count)),
             ),
             styles,
             toolkit,
         ),
         toolkit.Spacer(1, 6),
+        _paragraph("Ergebnisse pro Infohash", styles["Heading1"], toolkit),
+        *_target_metrics_story(result, styles, toolkit),
         _paragraph("Aussagegrenze", styles["Heading1"], toolkit),
         _limitations_paragraph(styles["EvidenceBox"], toolkit),
         _paragraph("Vorgehensweise", styles["Heading1"], toolkit),
         _paragraph(
-            "Ein Kandidat wurde aus einer DHT-Antwort übernommen. Danach wurde "
-            "eine TCP-Verbindung aufgebaut und der BitTorrent-Handshake für "
+            "Ein Kandidat wurde aus einer DHT-Antwort oder aus der Antwort "
+            "eines konfigurierten UDP-Trackers übernommen. Danach wurde eine "
+            "TCP-Verbindung aufgebaut und der BitTorrent-Handshake für "
             "den konfigurierten Infohash geprüft. Nach bestätigtem Handshake wird "
             "eine inhaltsfreie Verfügbarkeitsprüfung durchgeführt. Sie beobachtet "
             "nur Bitfield-/Have- und Choke-/Unchoke-Signale; Piece-, Datei- oder "
             "Metadaten werden weder angefordert noch geladen. Die protokollierten Hashes "
             "dienen der Integritätsprüfung der lokal erfassten Ereignisse; sie "
             "sind keine digitale Signatur und kein vertrauenswürdiger externer "
-            "Zeitstempel. Der lokale Fingerabdruck einer DHT-Antwort ist später "
-            "nicht unabhängig reproduzierbar, weil das Rohpaket datensparsam "
+            "Zeitstempel. Der lokale Fingerabdruck einer DHT- oder "
+            "UDP-Tracker-Antwort ist später nicht unabhängig reproduzierbar, "
+            "weil das Rohpaket datensparsam "
             "nicht gespeichert wird.",
             styles["BodyText"],
             toolkit,
@@ -745,11 +1202,11 @@ def _write_summary_pdf(
                 _paragraph("Zeitraum UTC", styles["SmallReportText"], toolkit),
             ]
         ]
-        for aggregate in reportable:
-            row = _aggregate_row(aggregate)
+        for summary in reportable:
+            row = summary.row
             table_rows.append(
                 [
-                    _paragraph(aggregate.ip, styles["SmallReportText"], toolkit),
+                    _paragraph(summary.ip, styles["SmallReportText"], toolkit),
                     _paragraph(row["vpn_status"], styles["SmallReportText"], toolkit),
                     _paragraph(
                         row["bestaetigte_handshakes"],
@@ -783,9 +1240,20 @@ def _write_summary_pdf(
             )
         )
 
-    source_notes = _source_note_lines(
-        record for aggregate in reportable for record in aggregate.records
-    )
+    if report_index.reportable_ip_count > len(reportable):
+        story.append(
+            _paragraph(
+                f"Die PDF-Vorschau zeigt die ersten {len(reportable)} von "
+                f"{report_index.reportable_ip_count} Anlagen. Die CSV-Datei und "
+                "die Einzelanlagen enthalten sämtliche positiven Nicht-VPN-Befunde.",
+                styles["BodyText"],
+                toolkit,
+            )
+        )
+
+    source_notes = report_index.source_notes
+    if report_index.source_notes_truncated:
+        source_notes += ("Weitere Sachverhaltshinweise stehen in der vollständigen CSV-Datei.",)
     if source_notes:
         story.extend(
             [
@@ -858,14 +1326,12 @@ def _write_complaint_attachment_pdf(
     generated_at_utc: str,
     toolkit: SimpleNamespace,
 ) -> None:
+    """Schreibt alle IP-Befunde lazy, ohne sie als ReportLab-Story zu sammeln."""
+
     styles = _styles(toolkit)
     row = _aggregate_row(aggregate)
     project_hashes = _project_leak_hashes(aggregate)
-    availability_statements = _availability_statements(aggregate)
-    if not availability_statements or any(
-        not record.handshake.offering_observed for record in aggregate.records
-    ):
-        raise ValueError("Einzelanlagen dürfen nur positive Verfügbarkeitsbefunde enthalten.")
+    availability_overview = _availability_overview(aggregate)
 
     if project_hashes:
         core_finding = (
@@ -885,250 +1351,243 @@ def _write_complaint_attachment_pdf(
             "protokollseitig frei."
         )
 
-    story: list[Any] = [
-        _paragraph(
+    def iter_story() -> Iterator[Any]:
+        yield _paragraph(
             "Technische Anlage zur Strafanzeige gegen Unbekannt",
             styles["Title"],
             toolkit,
-        ),
-        _paragraph("1. Möglicher Tatgegenstand", styles["Heading1"], toolkit),
-    ]
-    if project_hashes:
-        story.extend(
-            [
-                _paragraph(
-                    "Am 19. Oktober 2026 wurden auf der Internetseite "
-                    f"{PUBLISHED_SOURCE_URL} zwei BitTorrent-Links veröffentlicht. "
-                    "Die Seite beschreibt den damit bezeichneten Datenbestand als "
-                    "„AfD-Datenleak“ und gibt an, die Daten seien ohne Berechtigung "
-                    "von Servern bzw. Postfächern der AfD kopiert worden und würden "
-                    "über BitTorrent verbreitet. Als Umfang nennt die Seite:",
-                    styles["BodyText"],
-                    toolkit,
-                ),
-                _paragraph(
-                    "<br/>".join(f"- {_escape_text(fact)}" for fact in PUBLISHED_DATASET_FACTS),
-                    styles["BodyText"],
-                    toolkit,
-                    already_escaped=True,
-                ),
-                _paragraph(
-                    "Die Strafanzeige bittet um Prüfung eines möglichen "
-                    "Anfangsverdachts insbesondere hinsichtlich:",
-                    styles["BodyText"],
-                    toolkit,
-                ),
-                _paragraph(
-                    "<br/>".join(
-                        f"- {_escape_text(point)}" for point in PROJECT_LEGAL_REVIEW_POINTS
-                    ),
-                    styles["BodyText"],
-                    toolkit,
-                    already_escaped=True,
-                ),
-            ]
         )
-    else:
-        story.append(
-            _paragraph(
+        yield _paragraph("1. Möglicher Tatgegenstand", styles["Heading1"], toolkit)
+        if project_hashes:
+            yield _paragraph(
+                "Am 19. Oktober 2026 wurden auf der Internetseite "
+                f"{PUBLISHED_SOURCE_URL} zwei BitTorrent-Links veröffentlicht. "
+                "Die Seite beschreibt den damit bezeichneten Datenbestand als "
+                "„AfD-Datenleak“ und gibt an, die Daten seien ohne Berechtigung "
+                "von Servern bzw. Postfächern der AfD kopiert worden und würden "
+                "über BitTorrent verbreitet. Als Umfang nennt die Seite:",
+                styles["BodyText"],
+                toolkit,
+            )
+            yield _paragraph(
+                "<br/>".join(f"- {_escape_text(fact)}" for fact in PUBLISHED_DATASET_FACTS),
+                styles["BodyText"],
+                toolkit,
+                already_escaped=True,
+            )
+            yield _paragraph(
+                "Die Strafanzeige bittet um Prüfung eines möglichen "
+                "Anfangsverdachts insbesondere hinsichtlich:",
+                styles["BodyText"],
+                toolkit,
+            )
+            yield _paragraph(
+                "<br/>".join(f"- {_escape_text(point)}" for point in PROJECT_LEGAL_REVIEW_POINTS),
+                styles["BodyText"],
+                toolkit,
+                already_escaped=True,
+            )
+        else:
+            yield _paragraph(
                 "Gegenstand der technischen Prüfung waren die in dieser Anlage "
                 "aufgeführten, individuell vorgegebenen Infohashes.",
                 styles["BodyText"],
                 toolkit,
             )
-        )
 
-    story.extend(
-        [
-            _paragraph(
-                "2. Anzeige gegen Unbekannt - ermittelter BitTorrent-Endpunkt",
-                styles["Heading1"],
-                toolkit,
+        yield _paragraph(
+            "2. Anzeige gegen Unbekannt - ermittelter BitTorrent-Endpunkt",
+            styles["Heading1"],
+            toolkit,
+        )
+        yield _paragraph(
+            "Die Strafanzeige richtet sich gegen Unbekannt. Als technischer "
+            "Ermittlungsansatz wurde der öffentlich erreichbare BitTorrent-Endpunkt "
+            f"mit der IP-Adresse {aggregate.ip}, den nachfolgend aufgeführten "
+            "Ports und den genauen Beobachtungszeiten dokumentiert.",
+            styles["BodyText"],
+            toolkit,
+        )
+        yield _paragraph(core_finding, styles["EvidenceBox"], toolkit)
+        yield _key_value_table(
+            (
+                ("IP-Adresse", aggregate.ip),
+                ("Infohashes", row["infohashes"]),
+                ("Erste Beobachtung (UTC)", row["erste_beobachtung_utc"]),
+                ("Letzte Beobachtung (UTC)", row["letzte_beobachtung_utc"]),
+                ("Lauf-ID", result.run_id),
+                ("Anlage erstellt (UTC)", generated_at_utc),
             ),
-            _paragraph(
-                "Die Strafanzeige richtet sich gegen Unbekannt. Als technischer "
-                "Ermittlungsansatz wurde der öffentlich erreichbare BitTorrent-Endpunkt "
-                f"mit der IP-Adresse {aggregate.ip}, den nachfolgend aufgeführten "
-                "Ports und den genauen Beobachtungszeiten dokumentiert.",
-                styles["BodyText"],
-                toolkit,
-            ),
-            _paragraph(
-                core_finding,
-                styles["EvidenceBox"],
-                toolkit,
-            ),
-            _key_value_table(
-                (
-                    ("IP-Adresse", aggregate.ip),
-                    ("Infohashes", row["infohashes"]),
-                    ("Erste Beobachtung (UTC)", row["erste_beobachtung_utc"]),
-                    ("Letzte Beobachtung (UTC)", row["letzte_beobachtung_utc"]),
-                    ("Lauf-ID", result.run_id),
-                    ("Anlage erstellt (UTC)", generated_at_utc),
-                ),
-                styles,
-                toolkit,
-            ),
-            _paragraph("3. So wurde der Endpunkt gefunden", styles["Heading1"], toolkit),
-            _paragraph(
-                "Das Prüfprogramm fragte das öffentliche BitTorrent-DHT gezielt nach "
-                "den dokumentierten Infohashes ab. Dabei nannten DHT-Antworten den "
-                f"Endpunkt mit der IP-Adresse {aggregate.ip} als Peer. Antwortender "
-                "DHT-Knoten, Transaktions-ID, Empfangszeitpunkt und lokaler "
-                "SHA-256-Fingerabdruck jeder Antwort sind in den technischen "
-                "Einzelbeobachtungen aufgeführt.",
-                styles["BodyText"],
-                toolkit,
-            ),
-            _paragraph("4. So wurde direkt geprüft", styles["Heading1"], toolkit),
-            _paragraph(
-                "Anschließend stellte das Prüfprogramm eine direkte TCP-Verbindung "
-                "zu den aufgeführten BitTorrent-Endpunkten her und führte den "
-                "BitTorrent-Handshake für den jeweiligen Infohash aus.",
-                styles["BodyText"],
-                toolkit,
-            ),
-        ]
-    )
-    story.append(
-        _paragraph(
-            "<br/><br/>".join(_escape_text(statement) for statement in availability_statements),
+            styles,
+            toolkit,
+        )
+        yield _paragraph("3. So wurde der Endpunkt gefunden", styles["Heading1"], toolkit)
+        yield _paragraph(
+            _discovery_method_statement(aggregate),
+            styles["BodyText"],
+            toolkit,
+        )
+        yield _paragraph("4. So wurde direkt geprüft", styles["Heading1"], toolkit)
+        yield _paragraph(
+            "Anschließend stellte das Prüfprogramm eine direkte TCP-Verbindung "
+            "zu den aufgeführten BitTorrent-Endpunkten her und führte den "
+            "BitTorrent-Handshake für den jeweiligen Infohash aus.",
+            styles["BodyText"],
+            toolkit,
+        )
+        yield _paragraph(
+            _escape_text(availability_overview),
             styles["EvidenceBox"],
             toolkit,
             already_escaped=True,
         )
-    )
-
-    story.extend(
-        [
-            _paragraph(
-                "Quellcode und Beschreibung der eingesetzten Messmethode sind unter "
-                f"{PROJECT_REPOSITORY_URL} öffentlich einsehbar.",
-                styles["BodyText"],
-                toolkit,
-            ),
-            _paragraph("Technische Zusammenfassung", styles["Heading1"], toolkit),
-            _key_value_table(
+        yield _paragraph(
+            "Quellcode und Beschreibung der eingesetzten Messmethode sind unter "
+            f"{PROJECT_REPOSITORY_URL} öffentlich einsehbar.",
+            styles["BodyText"],
+            toolkit,
+        )
+        yield _paragraph("Technische Zusammenfassung", styles["Heading1"], toolkit)
+        yield _key_value_table(
+            (
+                ("IP-Adresse", aggregate.ip),
+                ("Beobachtete Ports", row["ports"]),
+                ("Bestätigte Handshakes", row["bestaetigte_handshakes"]),
+                ("Zielbezeichnungen", row["zielbezeichnungen"]),
+                ("Infohashes", row["infohashes"]),
                 (
-                    ("IP-Adresse", aggregate.ip),
-                    ("Beobachtete Ports", row["ports"]),
-                    ("Bestätigte Handshakes", row["bestaetigte_handshakes"]),
-                    ("Zielbezeichnungen", row["zielbezeichnungen"]),
-                    ("Infohashes", row["infohashes"]),
-                    (
-                        "Vom Nutzer angegebene Sachverhaltshinweise",
-                        row["quellen_sachverhaltshinweise"],
-                    ),
-                    ("VPN-Einordnung", row["vpn_status"]),
+                    "Vom Nutzer angegebene Sachverhaltshinweise",
+                    row["quellen_sachverhaltshinweise"],
                 ),
-                styles,
-                toolkit,
+                ("VPN-Einordnung", row["vpn_status"]),
             ),
-            _paragraph(
-                "Öffentliche Routing-/Registry-Angaben",
-                styles["Heading1"],
-                toolkit,
-            ),
-            _paragraph(
-                "Die folgenden Angaben wurden für den öffentlichen Adressbereich "
-                "aus den in der Tabelle genannten Quellen zusammengestellt.",
-                styles["BodyText"],
-                toolkit,
-            ),
-            _key_value_table(
+            styles,
+            toolkit,
+        )
+        yield _paragraph(
+            "Öffentliche Routing-/Registry-Angaben",
+            styles["Heading1"],
+            toolkit,
+        )
+        yield _paragraph(
+            "Die vollständigen Angaben für jeden Befund stehen in den "
+            "technischen Einzelbeobachtungen.",
+            styles["BodyText"],
+            toolkit,
+        )
+        yield _key_value_table(
+            (
+                ("Präfix(e)", row["netzpraefixe"]),
+                ("ASN", row["asns"]),
                 (
-                    ("Präfix(e)", row["netzpraefixe"]),
-                    ("ASN", row["asns"]),
+                    "Öffentliche Routing-/Netzbetreiberangabe",
+                    row["routing_netzbetreiberangaben"],
+                ),
+                ("RDAP-Name", row["rdap_namen"]),
+                ("RDAP-Handle", row["rdap_handles"]),
+                ("Registrierungsland des Netzes", row["laender"]),
+                ("Öffentlicher Abuse-Kontakt", row["abuse_kontakte"]),
+                (
+                    "Angefragte bzw. weitergeleitete Quellen",
+                    row["angefragte_bzw_weitergeleitete_quellen"],
+                ),
+                (
+                    "Netzangaben zusammengestellt (UTC)",
+                    row["netzangaben_zusammengestellt_utc"],
+                ),
+                (
+                    "Quellenspezifischer Abrufzeitpunkt (UTC)",
+                    row["netzregistrierung_quellen_abruf_utc"],
+                ),
+                ("Aus lokalem Cache", row["netzregistrierung_cache_quellen"]),
+                ("Abruffehler", row["netzregistrierungs_fehler"]),
+            ),
+            styles,
+            toolkit,
+        )
+        yield _paragraph("Technische Einzelbeobachtungen", styles["Heading1"], toolkit)
+
+        for index, record in enumerate(aggregate.iter_records(), start=1):
+            candidate = record.handshake.candidate
+            handshake = record.handshake
+            enrichment = record.enrichment
+            vpn = record.vpn
+            yield _paragraph(f"Beobachtung {index}", styles["Heading2"], toolkit)
+            yield _key_value_table(
+                (
+                    ("Zielbezeichnung", candidate.target_label),
+                    ("Infohash", candidate.info_hash_hex),
                     (
-                        "Öffentliche Routing-/Netzbetreiberangabe",
-                        row["routing_netzbetreiberangaben"],
+                        "Vom Nutzer angegebener Sachverhaltshinweis",
+                        candidate.source_note or "nicht angegeben",
                     ),
-                    ("RDAP-Name", row["rdap_namen"]),
-                    ("RDAP-Handle", row["rdap_handles"]),
-                    ("Registrierungsland des Netzes", row["laender"]),
-                    ("Öffentlicher Abuse-Kontakt", row["abuse_kontakte"]),
+                    ("Endpunkt", _format_endpoint(aggregate.ip, candidate.port)),
+                    *_discovery_detail_rows(candidate),
+                    ("Handshake begonnen (UTC)", handshake.attempted_at_utc),
+                    (
+                        "Handshake abgeschlossen (UTC)",
+                        handshake.completed_at_utc or "nicht angegeben",
+                    ),
+                    ("Remote Peer-ID", handshake.remote_peer_id_hex or "nicht angegeben"),
+                    ("Reserved Bits", handshake.reserved_bits_hex or "nicht angegeben"),
+                    (
+                        "Lokaler Messendpunkt",
+                        _format_endpoint(handshake.local_ip, handshake.local_port),
+                    ),
+                    ("Gesendete Bytes", str(handshake.bytes_sent)),
+                    ("Empfangene Bytes", str(handshake.bytes_received)),
+                    *_availability_detail_rows(record),
+                    ("Netzpräfix", enrichment.prefix or "nicht angegeben"),
+                    (
+                        "ASN",
+                        " | ".join(str(asn) for asn in enrichment.asns) or "nicht angegeben",
+                    ),
+                    ("Routing-/Netzbetreiberangabe", enrichment.holder or "nicht angegeben"),
+                    ("RDAP-Name", enrichment.rdap_name or "nicht angegeben"),
+                    ("RDAP-Handle", enrichment.rdap_handle or "nicht angegeben"),
+                    ("Registrierungsland", enrichment.country or "nicht angegeben"),
+                    ("Öffentlicher Abuse-Kontakt", enrichment.abuse_email or "nicht angegeben"),
                     (
                         "Angefragte bzw. weitergeleitete Quellen",
-                        row["angefragte_bzw_weitergeleitete_quellen"],
+                        " | ".join(enrichment.source_urls) or "nicht angegeben",
                     ),
-                    (
-                        "Netzangaben zusammengestellt (UTC)",
-                        row["netzangaben_zusammengestellt_utc"],
-                    ),
+                    ("Netzangaben zusammengestellt (UTC)", enrichment.enriched_at_utc),
                     (
                         "Quellenspezifischer Abrufzeitpunkt (UTC)",
-                        row["netzregistrierung_quellen_abruf_utc"],
+                        " | ".join(
+                            f"{source}: {timestamp}"
+                            for source, timestamp in enrichment.source_fetched_at_utc
+                        )
+                        or "nicht angegeben",
                     ),
-                    ("Aus lokalem Cache", row["netzregistrierung_cache_quellen"]),
-                    ("Abruffehler", row["netzregistrierungs_fehler"]),
+                    (
+                        "Aus lokalem Cache",
+                        " | ".join(enrichment.cached_sources) or "nicht angegeben",
+                    ),
+                    ("Abruffehler", enrichment.error or "nicht angegeben"),
+                    (
+                        "VPN-Einordnung",
+                        "bekannter VPN"
+                        if vpn.status == "known_vpn"
+                        else "kein bekannter VPN-Treffer",
+                    ),
+                    ("VPN-Anbieter", vpn.provider or "nicht angegeben"),
+                    ("VPN-Begründung", vpn.reason or "nicht angegeben"),
+                    ("VPN-Quelle", _vpn_source_text(vpn.source) or "nicht angegeben"),
+                    ("SHA-256 des Evidenzereignisses", record.evidence_event_sha256),
                 ),
                 styles,
                 toolkit,
-            ),
-            _paragraph("Technische Einzelbeobachtungen", styles["Heading1"], toolkit),
-        ]
-    )
+            )
 
-    for index, record in enumerate(aggregate.records, start=1):
-        candidate = record.handshake.candidate
-        handshake = record.handshake
-        story.extend(
-            [
-                _paragraph(
-                    f"Beobachtung {index}",
-                    styles["Heading2"],
-                    toolkit,
-                ),
-                _key_value_table(
-                    (
-                        ("Zielbezeichnung", candidate.target_label),
-                        ("Infohash", candidate.info_hash_hex),
-                        (
-                            "Vom Nutzer angegebener Sachverhaltshinweis",
-                            candidate.source_note or "nicht angegeben",
-                        ),
-                        ("Endpunkt", _format_endpoint(aggregate.ip, candidate.port)),
-                        ("Von DHT genannt (UTC)", candidate.discovered_at_utc),
-                        (
-                            "DHT-Antwort von",
-                            _format_endpoint(
-                                candidate.dht_node_ip,
-                                candidate.dht_node_port,
-                            ),
-                        ),
-                        ("DHT-Transaktions-ID", candidate.transaction_id_hex),
-                        (
-                            "Lokaler SHA-256-Fingerabdruck der DHT-Antwort",
-                            candidate.response_sha256,
-                        ),
-                        ("Handshake begonnen (UTC)", handshake.attempted_at_utc),
-                        (
-                            "Handshake abgeschlossen (UTC)",
-                            handshake.completed_at_utc or "nicht angegeben",
-                        ),
-                        ("Remote Peer-ID", handshake.remote_peer_id_hex or "nicht angegeben"),
-                        ("Reserved Bits", handshake.reserved_bits_hex or "nicht angegeben"),
-                        (
-                            "Lokaler Messendpunkt",
-                            _format_endpoint(handshake.local_ip, handshake.local_port),
-                        ),
-                        ("Gesendete Bytes", str(handshake.bytes_sent)),
-                        ("Empfangene Bytes", str(handshake.bytes_received)),
-                        *_availability_detail_rows(record),
-                        ("SHA-256 des Evidenzereignisses", record.evidence_event_sha256),
-                    ),
-                    styles,
-                    toolkit,
-                ),
-            ]
-        )
+        legal_story: list[Any] = []
+        _append_legal_notes(legal_story, config, styles, toolkit)
+        yield from legal_story
 
-    _append_legal_notes(story, config, styles, toolkit)
     _build_pdf(
         path,
         f"Technische Anlage zur Strafanzeige - {aggregate.ip}",
-        story,
+        iter_story(),
         config,
         generated_at_utc,
         toolkit,
@@ -1138,45 +1597,105 @@ def _write_complaint_attachment_pdf(
 def _write_vpn_pdf(
     path: Path,
     result: ScanResult,
-    vpn_only: tuple[_IpAggregate, ...],
+    vpn_only: Iterable[_IpSummary],
+    vpn_count: int,
     config: ReportConfig,
     generated_at_utc: str,
     toolkit: SimpleNamespace,
 ) -> None:
-    styles = _styles(toolkit)
-    story: list[Any] = [
-        _paragraph("Liste bekannter VPN-Endpunkte", styles["Title"], toolkit),
-        _paragraph(
-            "Diese separate Liste enthält IP-Adressen, für die mindestens eine "
-            "konservative Klassifikation als bekannter VPN-Endpunkt vorliegt. "
-            "Für diese Einträge werden keine Einzelanlagen und keine "
-            "E-Mail-Dateien erzeugt.",
-            styles["BodyText"],
-            toolkit,
-        ),
-        _key_value_table(
-            (
-                ("Lauf-ID", result.run_id),
-                ("Bericht erstellt (UTC)", generated_at_utc),
-                ("Anzahl IP-Adressen", str(len(vpn_only))),
-            ),
-            styles,
-            toolkit,
-        ),
-        _paragraph("Aussagegrenze", styles["Heading1"], toolkit),
-        _limitations_paragraph(styles["EvidenceBox"], toolkit),
-    ]
+    """Schreibt die vollständige VPN-Liste zeilenweise direkt auf PDF-Seiten."""
 
-    if vpn_only:
-        rows: list[list[Any]] = [
-            [
-                _paragraph("IP-Adresse", styles["SmallReportText"], toolkit),
-                _paragraph("Anbieter", styles["SmallReportText"], toolkit),
-                _paragraph("Grund / Quelle", styles["SmallReportText"], toolkit),
-            ]
-        ]
-        for aggregate in vpn_only:
-            row = _aggregate_row(aggregate)
+    width, height = toolkit.A4
+    margin = 15 * toolkit.mm
+    bottom = 18 * toolkit.mm
+    title = "Liste bekannter VPN-Endpunkte"
+    canvas = toolkit.Canvas(
+        str(path),
+        pagesize=toolkit.A4,
+        invariant=1,
+        pageCompression=0,
+    )
+    canvas.setTitle(title)
+    canvas.setCreator("BitTorrent-Beobachter")
+    canvas.setAuthor(config.reporter_name.strip() or "BitTorrent-Beobachter")
+    page = 0
+    y = 0.0
+
+    def start_page() -> None:
+        nonlocal page, y
+        if page:
+            canvas.showPage()
+        page += 1
+        canvas.setFont("Helvetica", 7)
+        canvas.setFillColor(toolkit.colors.HexColor("#5B6670"))
+        canvas.drawString(margin, height - 11 * toolkit.mm, title)
+        canvas.drawRightString(width - margin, 9 * toolkit.mm, f"Seite {page}")
+        canvas.drawString(margin, 9 * toolkit.mm, f"Erstellt: {generated_at_utc}")
+        canvas.setFillColor(toolkit.colors.black)
+        y = height - 20 * toolkit.mm
+
+    def draw_wrapped(text: str, *, bold: bool = False, size: int = 9) -> None:
+        nonlocal y
+        cleaned = " ".join(text.split())
+        lines = textwrap.wrap(
+            cleaned,
+            width=105,
+            break_long_words=True,
+            break_on_hyphens=False,
+        ) or [""]
+        leading = size + 3
+        for line in lines:
+            if y < bottom + leading:
+                start_page()
+            canvas.setFont("Helvetica-Bold" if bold else "Helvetica", size)
+            canvas.drawString(margin, y, line)
+            y -= leading
+        y -= 3
+
+    def table_header() -> None:
+        nonlocal y
+        if y < bottom + 24:
+            start_page()
+        canvas.setFillColor(toolkit.colors.HexColor("#EEF3F8"))
+        canvas.rect(margin, y - 3, width - (2 * margin), 14, fill=1, stroke=0)
+        canvas.setFillColor(toolkit.colors.black)
+        canvas.setFont("Helvetica-Bold", 7)
+        canvas.drawString(margin + 3, y, "IP-Adresse")
+        canvas.drawString(margin + 153, y, "Anbieter")
+        canvas.drawString(margin + 283, y, "Grund / Quelle")
+        y -= 17
+
+    def cell(value: str, limit: int) -> str:
+        cleaned = " ".join(value.split()) or "nicht angegeben"
+        if len(cleaned) <= limit:
+            return cleaned
+        return f"{cleaned[: limit - 1]}…"
+
+    start_page()
+    canvas.setFont("Helvetica-Bold", 18)
+    canvas.drawString(margin, y, title)
+    y -= 27
+    draw_wrapped(
+        "Diese separate Liste enthält IP-Adressen, für die mindestens eine "
+        "konservative Klassifikation als bekannter VPN-Endpunkt vorliegt. Für "
+        "diese Einträge werden keine Einzelanlagen und keine E-Mail-Dateien erzeugt."
+    )
+    draw_wrapped(f"Lauf-ID: {result.run_id}")
+    draw_wrapped(f"Bericht erstellt (UTC): {generated_at_utc}")
+    draw_wrapped(f"Anzahl IP-Adressen: {vpn_count}")
+    draw_wrapped("Aussagegrenze", bold=True, size=13)
+    for limitation in EVIDENCE_LIMITATIONS:
+        draw_wrapped(f"- {limitation}")
+
+    written = 0
+    if vpn_count:
+        draw_wrapped("Bekannte VPN-Endpunkte", bold=True, size=13)
+        table_header()
+        for summary in vpn_only:
+            if y < bottom + 14:
+                start_page()
+                table_header()
+            row = summary.row
             reason_source = (
                 " | ".join(
                     value
@@ -1185,31 +1704,28 @@ def _write_vpn_pdf(
                 )
                 or "nicht angegeben"
             )
-            rows.append(
-                [
-                    _paragraph(aggregate.ip, styles["SmallReportText"], toolkit),
-                    _paragraph(row["vpn_anbieter"], styles["SmallReportText"], toolkit),
-                    _paragraph(reason_source, styles["SmallReportText"], toolkit),
-                ]
-            )
-        story.append(_data_table(rows, (150, 130, 231), toolkit, repeat_rows=1))
+            canvas.setFont("Helvetica", 7)
+            canvas.drawString(margin + 3, y, cell(summary.ip, 45))
+            canvas.drawString(margin + 153, y, cell(row["vpn_anbieter"], 34))
+            canvas.drawString(margin + 283, y, cell(reason_source, 62))
+            y -= 12
+            written += 1
     else:
-        story.append(
-            _paragraph(
-                "Keine als bekannter VPN klassifizierte IP-Adresse vorhanden.",
-                styles["BodyText"],
-                toolkit,
-            )
+        draw_wrapped("Keine als bekannter VPN klassifizierte IP-Adresse vorhanden.")
+
+    if config.legal_notes:
+        draw_wrapped("Zusätzliche Prüfpunkte", bold=True, size=13)
+        for note in config.legal_notes:
+            if note.strip():
+                draw_wrapped(f"- {note}")
+
+    canvas.save()
+    _set_private_mode(path, 0o600)
+    if written != vpn_count:
+        raise ValueError(
+            "VPN-Laufindex und gestreamte VPN-Berichtsdaten stimmen nicht überein: "
+            f"{vpn_count} erwartet, {written} geschrieben."
         )
-    _append_legal_notes(story, config, styles, toolkit)
-    _build_pdf(
-        path,
-        "Liste bekannter VPN-Endpunkte",
-        story,
-        config,
-        generated_at_utc,
-        toolkit,
-    )
 
 
 def _paragraph(
@@ -1356,9 +1872,15 @@ def _vpn_source_text(source: str | None) -> str | None:
     return source
 
 
-def _source_note_lines(records: Iterable[EvidenceRecord]) -> tuple[str, ...]:
-    """Bindet unbestätigte Nutzerangaben eindeutig an ihren Infohash."""
+def _source_note_lines(
+    records: Iterable[EvidenceRecord],
+    *,
+    limit: int = MAX_SUMMARY_SOURCE_NOTES,
+) -> tuple[str, ...]:
+    """Bindet eine begrenzte Summary an Infohash; Details bleiben recordweise erhalten."""
 
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("limit muss eine positive Ganzzahl sein.")
     lines: list[str] = []
     seen: set[tuple[str, str]] = set()
     for record in records:
@@ -1374,129 +1896,253 @@ def _source_note_lines(records: Iterable[EvidenceRecord]) -> tuple[str, ...]:
             f"Unbestätigte Nutzerangabe zu {candidate.target_label} "
             f"(Infohash {candidate.info_hash_hex}): {note}"
         )
+        if len(lines) == limit:
+            break
     return tuple(lines)
 
 
+class _CompactValues:
+    """Haelt nur wenige Summary-Werte; vollständige Werte stehen in Detailzeilen."""
+
+    def __init__(self, *, maximum: int = 2) -> None:
+        if maximum < 1:
+            raise ValueError("maximum muss positiv sein.")
+        self.maximum = maximum
+        self.values: set[str] = set()
+        self.overflow = False
+
+    def add(self, value: object | None) -> None:
+        if value is None:
+            return
+        cleaned = str(value).strip()
+        if not cleaned or cleaned in self.values:
+            return
+        if len(self.values) < self.maximum:
+            self.values.add(cleaned)
+        else:
+            self.overflow = True
+
+    def render(self) -> str:
+        rendered = " | ".join(sorted(self.values))
+        if self.overflow:
+            suffix = "weitere Werte vollständig in CSV und technischen Einzelbeobachtungen"
+            return f"{rendered} | {suffix}" if rendered else suffix
+        return rendered or "nicht angegeben"
+
+
+def _record_timestamps(record: EvidenceRecord) -> Iterator[str]:
+    handshake = record.handshake
+    observation = handshake.availability
+    for timestamp in (
+        handshake.candidate.discovered_at_utc,
+        handshake.attempted_at_utc,
+        handshake.completed_at_utc,
+        observation.started_at_utc if observation is not None else None,
+        observation.ended_at_utc if observation is not None else None,
+    ):
+        if timestamp:
+            yield timestamp
+
+
 def _aggregate_row(aggregate: _IpAggregate) -> dict[str, str]:
-    records = aggregate.records
-    candidates = tuple(record.handshake.candidate for record in records)
-    observations = tuple(
-        timestamp
-        for record in records
-        for timestamp in (
-            record.handshake.candidate.discovered_at_utc,
-            record.handshake.attempted_at_utc,
-            record.handshake.completed_at_utc,
-            (
-                record.handshake.availability.started_at_utc
-                if record.handshake.availability is not None
-                else None
-            ),
-            (
-                record.handshake.availability.ended_at_utc
-                if record.handshake.availability is not None
-                else None
-            ),
-        )
-        if timestamp
-    )
-    ordered_observations = sorted(set(observations), key=_timestamp_as_datetime)
+    """Erstellt eine konstante Summary; vollständige Werte bleiben in Detailzeilen."""
 
-    def values(items: Iterable[object | None]) -> str:
-        unique = sorted(
-            {str(item).strip() for item in items if item is not None and str(item).strip()}
-        )
-        return " | ".join(unique) if unique else "nicht angegeben"
+    ports = _CompactValues()
+    target_labels = _CompactValues()
+    info_hashes = _CompactValues()
+    source_notes = _CompactValues()
+    discovery_sources = _CompactValues()
+    first_seen: tuple[datetime, str] | None = None
+    last_seen: tuple[datetime, str] | None = None
+    bytes_sent = 0
+    bytes_received = 0
+    representative: EvidenceRecord | None = None
 
-    ports = " | ".join(str(port) for port in sorted({candidate.port for candidate in candidates}))
-    asns = " | ".join(
-        str(asn) for asn in sorted({asn for record in records for asn in record.enrichment.asns})
-    )
-    row = {
+    for record in aggregate.iter_records():
+        if representative is None or (
+            aggregate.is_known_vpn
+            and representative.vpn.status != "known_vpn"
+            and record.vpn.status == "known_vpn"
+        ):
+            representative = record
+        candidate = record.handshake.candidate
+        ports.add(candidate.port)
+        target_labels.add(candidate.target_label)
+        info_hashes.add(candidate.info_hash_hex)
+        discovery_sources.add(_discovery_source_label(candidate))
+        note = " ".join(candidate.source_note.split())
+        if note:
+            source_notes.add(
+                f"Unbestätigte Nutzerangabe zu {candidate.target_label} "
+                f"(Infohash {candidate.info_hash_hex}): {note}"
+            )
+        bytes_sent += record.handshake.bytes_sent
+        bytes_received += record.handshake.bytes_received
+        for timestamp in _record_timestamps(record):
+            parsed = _timestamp_as_datetime(timestamp)
+            if first_seen is None or parsed < first_seen[0]:
+                first_seen = (parsed, timestamp)
+            if last_seen is None or parsed > last_seen[0]:
+                last_seen = (parsed, timestamp)
+
+    if representative is None:
+        raise ValueError(f"IP-Aggregat {aggregate.ip} ist leer.")
+    if aggregate.record_count == 1:
+        return _record_row(representative, ip_is_known_vpn=aggregate.is_known_vpn)
+    enrichment = representative.enrichment
+    vpn = representative.vpn
+    return {
         "ip": aggregate.ip,
-        "ports": ports or "nicht angegeben",
-        "zielbezeichnungen": values(candidate.target_label for candidate in candidates),
-        "infohashes": values(candidate.info_hash_hex for candidate in candidates),
-        "quellen_sachverhaltshinweise": (
-            " | ".join(_source_note_lines(records)) or "nicht angegeben"
+        "ports": ports.render(),
+        "zielbezeichnungen": target_labels.render(),
+        "infohashes": info_hashes.render(),
+        "quellen_sachverhaltshinweise": source_notes.render(),
+        "erste_beobachtung_utc": first_seen[1] if first_seen else "nicht angegeben",
+        "letzte_beobachtung_utc": last_seen[1] if last_seen else "nicht angegeben",
+        "bestaetigte_handshakes": str(aggregate.record_count),
+        "fundquellen": discovery_sources.render(),
+        "lokaler_fundantwort_fingerabdruck_sha256": (
+            "vollständig in CSV und technischen Einzelbeobachtungen"
         ),
-        "erste_beobachtung_utc": (
-            ordered_observations[0] if ordered_observations else "nicht angegeben"
-        ),
-        "letzte_beobachtung_utc": (
-            ordered_observations[-1] if ordered_observations else "nicht angegeben"
-        ),
-        "bestaetigte_handshakes": str(len(records)),
-        "lokaler_dht_antwort_fingerabdruck_sha256": values(
-            candidate.response_sha256 for candidate in candidates
-        ),
-        "beweisereignis_sha256": values(record.evidence_event_sha256 for record in records),
-        "remote_peer_ids": values(record.handshake.remote_peer_id_hex for record in records),
-        "bytes_gesendet_summe": str(sum(record.handshake.bytes_sent for record in records)),
-        "bytes_empfangen_summe": str(sum(record.handshake.bytes_received for record in records)),
-        "netzpraefixe": values(record.enrichment.prefix for record in records),
-        "asns": asns or "nicht angegeben",
-        "routing_netzbetreiberangaben": values(record.enrichment.holder for record in records),
-        "rdap_namen": values(record.enrichment.rdap_name for record in records),
-        "rdap_handles": values(record.enrichment.rdap_handle for record in records),
-        "laender": values(record.enrichment.country for record in records),
-        "abuse_kontakte": values(record.enrichment.abuse_email for record in records),
+        "beweisereignis_sha256": "vollständig in CSV und technischen Einzelbeobachtungen",
+        "remote_peer_ids": "vollständig in CSV und technischen Einzelbeobachtungen",
+        "bytes_gesendet_summe": str(bytes_sent),
+        "bytes_empfangen_summe": str(bytes_received),
+        "netzpraefixe": enrichment.prefix or "nicht angegeben",
+        "asns": " | ".join(str(asn) for asn in enrichment.asns) or "nicht angegeben",
+        "routing_netzbetreiberangaben": enrichment.holder or "nicht angegeben",
+        "rdap_namen": enrichment.rdap_name or "nicht angegeben",
+        "rdap_handles": enrichment.rdap_handle or "nicht angegeben",
+        "laender": enrichment.country or "nicht angegeben",
+        "abuse_kontakte": enrichment.abuse_email or "nicht angegeben",
         "vpn_status": ("bekannter VPN" if aggregate.is_known_vpn else "kein bekannter VPN-Treffer"),
-        "vpn_anbieter": values(record.vpn.provider for record in records),
-        "vpn_begruendung": values(record.vpn.reason for record in records),
-        "vpn_quellen": values(_vpn_source_text(record.vpn.source) for record in records),
-        "angefragte_bzw_weitergeleitete_quellen": values(
-            source for record in records for source in record.enrichment.source_urls
+        "vpn_anbieter": vpn.provider or "nicht angegeben",
+        "vpn_begruendung": vpn.reason or "nicht angegeben",
+        "vpn_quellen": _vpn_source_text(vpn.source) or "nicht angegeben",
+        "angefragte_bzw_weitergeleitete_quellen": (
+            "vollständig in CSV und technischen Einzelbeobachtungen"
         ),
-        "netzangaben_zusammengestellt_utc": values(
-            record.enrichment.enriched_at_utc for record in records
+        "netzangaben_zusammengestellt_utc": enrichment.enriched_at_utc,
+        "netzregistrierung_quellen_abruf_utc": (
+            "vollständig in CSV und technischen Einzelbeobachtungen"
         ),
-        "netzregistrierung_quellen_abruf_utc": values(
-            f"{source}: {timestamp}"
-            for record in records
-            for source, timestamp in record.enrichment.source_fetched_at_utc
+        "netzregistrierung_cache_quellen": (
+            " | ".join(enrichment.cached_sources) or "nicht angegeben"
         ),
-        "netzregistrierung_cache_quellen": values(
-            source for record in records for source in record.enrichment.cached_sources
-        ),
-        "netzregistrierungs_fehler": values(record.enrichment.error for record in records),
+        "netzregistrierungs_fehler": enrichment.error or "nicht angegeben",
         "aussagegrenze": " ".join(EVIDENCE_LIMITATIONS),
     }
-    return row
 
 
-def _write_csv(path: Path, aggregates: Iterable[_IpAggregate]) -> None:
-    buffer = io.StringIO(newline="")
-    writer = csv.DictWriter(
-        buffer,
-        fieldnames=CSV_FIELDNAMES,
-        delimiter=";",
-        lineterminator="\n",
-        quoting=csv.QUOTE_MINIMAL,
-    )
-    writer.writeheader()
-    for aggregate in aggregates:
-        row = _aggregate_row(aggregate)
-        writer.writerow({key: _csv_safe(row[key]) for key in CSV_FIELDNAMES})
-    path.write_text(buffer.getvalue(), encoding="utf-8", newline="")
+def _record_row(record: EvidenceRecord, *, ip_is_known_vpn: bool) -> dict[str, str]:
+    """Formatiert genau einen vollständigen positiven Befund als CSV-Zeile."""
+
+    candidate = record.handshake.candidate
+    enrichment = record.enrichment
+    vpn = record.vpn
+    timestamps = sorted(_record_timestamps(record), key=_timestamp_as_datetime)
+    source_note = " ".join(candidate.source_note.split())
+    return {
+        "ip": _canonical_ip(candidate.ip),
+        "ports": str(candidate.port),
+        "zielbezeichnungen": candidate.target_label,
+        "infohashes": candidate.info_hash_hex,
+        "quellen_sachverhaltshinweise": (
+            f"Unbestätigte Nutzerangabe zu {candidate.target_label} "
+            f"(Infohash {candidate.info_hash_hex}): {source_note}"
+            if source_note
+            else "nicht angegeben"
+        ),
+        "erste_beobachtung_utc": timestamps[0] if timestamps else "nicht angegeben",
+        "letzte_beobachtung_utc": timestamps[-1] if timestamps else "nicht angegeben",
+        "bestaetigte_handshakes": "1",
+        "fundquellen": _discovery_source_label(candidate),
+        "lokaler_fundantwort_fingerabdruck_sha256": candidate.response_sha256,
+        "beweisereignis_sha256": record.evidence_event_sha256,
+        "remote_peer_ids": record.handshake.remote_peer_id_hex or "nicht angegeben",
+        "bytes_gesendet_summe": str(record.handshake.bytes_sent),
+        "bytes_empfangen_summe": str(record.handshake.bytes_received),
+        "netzpraefixe": enrichment.prefix or "nicht angegeben",
+        "asns": " | ".join(str(asn) for asn in enrichment.asns) or "nicht angegeben",
+        "routing_netzbetreiberangaben": enrichment.holder or "nicht angegeben",
+        "rdap_namen": enrichment.rdap_name or "nicht angegeben",
+        "rdap_handles": enrichment.rdap_handle or "nicht angegeben",
+        "laender": enrichment.country or "nicht angegeben",
+        "abuse_kontakte": enrichment.abuse_email or "nicht angegeben",
+        "vpn_status": "bekannter VPN" if ip_is_known_vpn else "kein bekannter VPN-Treffer",
+        "vpn_anbieter": vpn.provider or "nicht angegeben",
+        "vpn_begruendung": vpn.reason or "nicht angegeben",
+        "vpn_quellen": _vpn_source_text(vpn.source) or "nicht angegeben",
+        "angefragte_bzw_weitergeleitete_quellen": (
+            " | ".join(enrichment.source_urls) or "nicht angegeben"
+        ),
+        "netzangaben_zusammengestellt_utc": enrichment.enriched_at_utc,
+        "netzregistrierung_quellen_abruf_utc": (
+            " | ".join(
+                f"{source}: {timestamp}" for source, timestamp in enrichment.source_fetched_at_utc
+            )
+            or "nicht angegeben"
+        ),
+        "netzregistrierung_cache_quellen": (
+            " | ".join(enrichment.cached_sources) or "nicht angegeben"
+        ),
+        "netzregistrierungs_fehler": enrichment.error or "nicht angegeben",
+        "aussagegrenze": " ".join(EVIDENCE_LIMITATIONS),
+    }
 
 
-def _write_vpn_csv(path: Path, aggregates: Iterable[_IpAggregate]) -> None:
-    """Schreibe fuer bekannte VPNs bewusst nur die separate Minimalliste."""
+def _iter_csv_rows(
+    result: ScanResult,
+    *,
+    known_vpn: bool,
+) -> Iterator[dict[str, str]]:
+    """Liefert Nicht-VPN-Befunde einzeln und bekannte VPN-IP-Adressen einmal."""
 
-    buffer = io.StringIO(newline="")
-    writer = csv.DictWriter(
-        buffer,
-        fieldnames=VPN_CSV_FIELDNAMES,
-        delimiter=";",
-        lineterminator="\n",
-        quoting=csv.QUOTE_MINIMAL,
-    )
-    writer.writeheader()
-    for aggregate in aggregates:
-        row = _aggregate_row(aggregate)
-        writer.writerow({key: _csv_safe(row[key]) for key in VPN_CSV_FIELDNAMES})
-    path.write_text(buffer.getvalue(), encoding="utf-8", newline="")
+    for aggregate in _iter_ip_aggregates(result):
+        if aggregate.is_known_vpn != known_vpn:
+            continue
+        if known_vpn:
+            for record in aggregate.iter_records():
+                if record.vpn.status == "known_vpn":
+                    yield _record_row(record, ip_is_known_vpn=True)
+                    break
+            continue
+        for record in aggregate.iter_records():
+            yield _record_row(record, ip_is_known_vpn=False)
+
+
+def _write_csv(path: Path, rows: Iterable[dict[str, str]]) -> None:
+    """Schreibt vollständige Beobachtungen recordweise in die Staging-Datei."""
+
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=CSV_FIELDNAMES,
+            delimiter=";",
+            lineterminator="\n",
+            quoting=csv.QUOTE_MINIMAL,
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: _csv_safe(row[key]) for key in CSV_FIELDNAMES})
+    _set_private_mode(path, 0o600)
+
+
+def _write_vpn_csv(path: Path, rows: Iterable[dict[str, str]]) -> None:
+    """Schreibt jede bekannte VPN-IP einmal in die separate Minimalliste."""
+
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=VPN_CSV_FIELDNAMES,
+            delimiter=";",
+            lineterminator="\n",
+            quoting=csv.QUOTE_MINIMAL,
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: _csv_safe(row[key]) for key in VPN_CSV_FIELDNAMES})
+    _set_private_mode(path, 0o600)
 
 
 def _csv_safe(value: str) -> str:
@@ -1508,6 +2154,48 @@ def _csv_safe(value: str) -> str:
     return value
 
 
+def _write_mime_headers(
+    handle: Any,
+    message: EmailMessage,
+    email_policy: Any,
+) -> None:
+    """Schreibt nur den Headerblock eines kleinen MIME-Objekts."""
+
+    serialized = message.as_bytes(policy=email_policy)
+    header_block, separator, _payload = serialized.partition(b"\r\n\r\n")
+    if not separator:
+        raise ValueError("MIME-Header konnten nicht serialisiert werden.")
+    handle.write(header_block)
+    handle.write(b"\r\n\r\n")
+
+
+def _write_base64_chunks(handle: Any, chunks: Iterable[bytes]) -> None:
+    """Kodiert einen Bytestrom in RFC-konforme 76-Zeichen-Zeilen."""
+
+    pending = bytearray()
+    for chunk in chunks:
+        if not isinstance(chunk, bytes):
+            raise TypeError("MIME-Quelldaten müssen Bytes sein.")
+        pending.extend(chunk)
+        while len(pending) >= 57:
+            handle.write(base64.b64encode(pending[:57]))
+            handle.write(b"\r\n")
+            del pending[:57]
+    if pending:
+        handle.write(base64.b64encode(pending))
+        handle.write(b"\r\n")
+
+
+def _iter_file_chunks(path: Path, *, chunk_size: int = 57 * 128) -> Iterator[bytes]:
+    """Liest eine Anlage in kleinen Binaerpaketen statt per ``read_bytes``."""
+
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size < 1:
+        raise ValueError("chunk_size muss eine positive Ganzzahl sein.")
+    with path.open("rb") as handle:
+        while chunk := handle.read(chunk_size):
+            yield chunk
+
+
 def _write_complaint_email(
     path: Path,
     result: ScanResult,
@@ -1516,16 +2204,19 @@ def _write_complaint_email(
     generated_at_utc: str,
     attachment_pdf: Path,
 ) -> None:
+    """Schreibt eine versandfertige EML und streamt die PDF-Anlage."""
+
     email_policy = SMTP.clone(max_line_length=998)
     message = EmailMessage(policy=email_policy)
     project_hashes = _project_leak_hashes(aggregate)
     if project_hashes:
-        message["Subject"] = (
+        subject = (
             "Strafanzeige gegen Unbekannt - Verdacht der Verbreitung von 281 GB "
             f"mutmaßlich unbefugt kopierter AfD-Daten - IP {aggregate.ip}"
         )
     else:
-        message["Subject"] = f"Strafanzeige gegen Unbekannt - BitTorrent-Endpunkt {aggregate.ip}"
+        subject = f"Strafanzeige gegen Unbekannt - BitTorrent-Endpunkt {aggregate.ip}"
+    message["Subject"] = subject
     message["Date"] = format_datetime(_timestamp_as_datetime(generated_at_utc), usegmt=True)
     message["X-Unsent"] = "1"
     message["X-Report-Run-ID"] = _single_line(result.run_id, "run_id")
@@ -1542,19 +2233,7 @@ def _write_complaint_email(
         )
 
     row = _aggregate_row(aggregate)
-    availability_statements = _availability_statements(aggregate)
-    if availability_statements:
-        direct_check = "\n\n".join(availability_statements)
-    else:
-        direct_check = (
-            "Für diesen älteren Datensatz ist nur ein erfolgreicher "
-            "BitTorrent-Handshake dokumentiert. Eine 60-sekündige "
-            "Verfügbarkeitsbeobachtung, gemeldete Stückverfügbarkeit oder "
-            "ein UNCHOKE-Signal wurden nicht erfasst. Es wird daher keine "
-            "solche Behauptung aufgestellt. Inhaltsblöcke wurden weder angefordert "
-            "noch heruntergeladen."
-        )
-
+    direct_check = _availability_overview(aggregate)
     additional_legal_text = ""
     if config.legal_notes:
         additional_legal_text = (
@@ -1619,7 +2298,7 @@ def _write_complaint_email(
         "3. Direkte Überprüfung des BitTorrent-Clients\n"
         f"{direct_check}\n\n"
         "4. Technischer Beleg\n"
-        f"Die technischen Einzelheiten stehen in der angehängten PDF-Datei "
+        "Die technischen Einzelheiten stehen in der angehängten PDF-Datei "
         f"{attachment_pdf.name}. Quellcode und Beschreibung der Messmethode sind "
         f"unter {PROJECT_REPOSITORY_URL} öffentlich einsehbar.\n\n"
         "Ich bitte um Aufnahme der Ermittlungen gegen Unbekannt, um zeitnahe "
@@ -1630,18 +2309,38 @@ def _write_complaint_email(
         + (f"\n{config.reporter_name.strip()}" if config.reporter_name.strip() else "")
         + "\n"
     )
-    message.set_content(body, subtype="plain", charset="utf-8")
-    message.add_attachment(
-        attachment_pdf.read_bytes(),
-        maintype="application",
-        subtype="pdf",
-        filename=attachment_pdf.name,
-    )
+
     boundary_seed = hashlib.sha256(
         f"{result.run_id}\0{aggregate.ip}\0{generated_at_utc}".encode()
     ).hexdigest()[:32]
-    message.set_boundary(f"===============bittorrent-{boundary_seed}==")
-    path.write_bytes(message.as_bytes(policy=email_policy))
+    boundary = f"===============bittorrent-{boundary_seed}=="
+    message["MIME-Version"] = "1.0"
+    message["Content-Type"] = "multipart/mixed"
+    message.set_boundary(boundary)
+
+    text_headers = EmailMessage(policy=email_policy)
+    text_headers["Content-Type"] = 'text/plain; charset="utf-8"'
+    text_headers["Content-Transfer-Encoding"] = "base64"
+
+    attachment_headers = EmailMessage(policy=email_policy)
+    attachment_headers["Content-Type"] = "application/pdf"
+    attachment_headers["Content-Transfer-Encoding"] = "base64"
+    attachment_headers.add_header(
+        "Content-Disposition",
+        "attachment",
+        filename=_single_line(attachment_pdf.name, "PDF-Dateiname"),
+    )
+
+    with path.open("xb") as handle:
+        _set_private_mode(path, 0o600)
+        _write_mime_headers(handle, message, email_policy)
+        handle.write(f"--{boundary}\r\n".encode("ascii"))
+        _write_mime_headers(handle, text_headers, email_policy)
+        _write_base64_chunks(handle, (body.encode("utf-8"),))
+        handle.write(f"\r\n--{boundary}\r\n".encode("ascii"))
+        _write_mime_headers(handle, attachment_headers, email_policy)
+        _write_base64_chunks(handle, _iter_file_chunks(attachment_pdf))
+        handle.write(f"\r\n--{boundary}--\r\n".encode("ascii"))
 
 
 def _timestamp_as_datetime(value: str) -> datetime:
@@ -1655,22 +2354,30 @@ def _single_line(value: str, label: str) -> str:
     return value
 
 
-def _write_manifest(
+def _start_manifest(
     path: Path,
-    files: Iterable[Path],
     run_id: str,
     generated_at_utc: str,
-) -> None:
-    entries = sorted(files, key=lambda item: item.name)
-    lines = [
-        "# SHA-256-Manifest der erzeugten Berichte",
-        f"# Lauf-ID: {run_id}",
-        f"# Erstellt (UTC): {generated_at_utc}",
-        "# Die Manifestdatei selbst ist wegen des Zirkelschlusses nicht enthalten.",
-    ]
-    for file_path in entries:
-        lines.append(f"{_sha256_file(file_path)} *{file_path.name}")
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+) -> TextIO:
+    """Öffnet ein privates Manifest und schreibt sofort den festen Kopf."""
+
+    handle = path.open("x", encoding="utf-8", newline="\n")
+    try:
+        _set_private_mode(path, 0o600)
+        handle.write("# SHA-256-Manifest der erzeugten Berichte\n")
+        handle.write(f"# Lauf-ID: {run_id}\n")
+        handle.write(f"# Erstellt (UTC): {generated_at_utc}\n")
+        handle.write("# Die Manifestdatei selbst ist wegen des Zirkelschlusses nicht enthalten.\n")
+    except Exception:
+        handle.close()
+        raise
+    return handle
+
+
+def _append_manifest_entry(handle: TextIO, file_path: Path) -> None:
+    """Schreibt genau einen bereits erzeugten Bericht unmittelbar ins Manifest."""
+
+    handle.write(f"{_sha256_file(file_path)} *{file_path.name}\n")
 
 
 def _sha256_file(path: Path) -> str:

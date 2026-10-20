@@ -208,7 +208,7 @@ class PeerVerifierTests(unittest.IsolatedAsyncioTestCase):
             ["unchoke", "choke", "bitfield"],
         )
 
-    async def test_early_disconnect_never_counts_as_full_observation(self) -> None:
+    async def test_early_disconnect_preserves_validated_positive_signals(self) -> None:
         wire = peer_message(1) + peer_message(5, b"\x80")
 
         result, _fake_socket, _fake_loop = await run_verifier(
@@ -219,14 +219,14 @@ class PeerVerifierTests(unittest.IsolatedAsyncioTestCase):
         observation = result.availability
         assert observation is not None
         self.assertTrue(result.confirmed)
-        self.assertFalse(result.offering_observed)
+        self.assertTrue(result.offering_observed)
         self.assertFalse(observation.completed_full_window)
         self.assertTrue(observation.piece_availability_announced)
         self.assertTrue(observation.unchoked)
         self.assertEqual(observation.termination_reason, "peer_closed")
 
     async def test_forbidden_messages_are_rejected_without_reading_payload(self) -> None:
-        forbidden = ((6, "request_rejected"), (7, "piece_rejected"), (20, "extension_rejected"))
+        forbidden = ((6, "request_rejected"), (7, "piece_rejected"))
         for message_id, event_kind in forbidden:
             with self.subTest(message_id=message_id):
                 payload = b"must-not-be-read"
@@ -239,11 +239,146 @@ class PeerVerifierTests(unittest.IsolatedAsyncioTestCase):
 
                 observation = result.availability
                 assert observation is not None
-                self.assertFalse(result.offering_observed)
+                self.assertTrue(result.offering_observed)
                 self.assertIsNotNone(observation.error)
                 self.assertEqual(observation.piece_payload_bytes_received, 0)
                 self.assertEqual(fake_loop.incoming, bytearray(payload))
                 self.assertEqual(observation.control_events[-1].kind, event_kind)
+
+    async def test_supported_control_extensions_are_consumed_without_requests(self) -> None:
+        extension_payload = b"\x00" + (b"x" * (peer_module.RECEIVE_CHUNK_BYTES * 2 + 7))
+        rejected_request = (
+            (23).to_bytes(4, "big") + (16_384).to_bytes(4, "big") + (16_384).to_bytes(4, "big")
+        )
+        wire = b"".join(
+            (
+                peer_message(1),
+                peer_message(9, (6881).to_bytes(2, "big")),
+                peer_message(13, (11).to_bytes(4, "big")),
+                peer_message(14),
+                peer_message(15),
+                peer_message(16, rejected_request),
+                peer_message(17, (17).to_bytes(4, "big")),
+                peer_message(20, extension_payload),
+            )
+        )
+
+        result, _fake_socket, fake_loop = await run_verifier(
+            wire,
+            close_when_empty=True,
+        )
+
+        observation = result.availability
+        assert observation is not None
+        self.assertTrue(result.offering_observed)
+        self.assertFalse(observation.completed_full_window)
+        self.assertEqual(observation.request_messages_sent, 0)
+        self.assertEqual(observation.piece_payload_bytes_received, 0)
+        self.assertEqual(observation.metadata_requests_sent, 0)
+        self.assertEqual(fake_loop.incoming, bytearray())
+        self.assertLessEqual(max(fake_loop.receive_sizes), peer_module.RECEIVE_CHUNK_BYTES)
+        self.assertEqual(
+            [event.kind for event in observation.control_events],
+            [
+                "unchoke",
+                "port",
+                "suggest_piece",
+                "have_all",
+                "have_none",
+                "reject_request",
+                "allowed_fast",
+                "extension_handshake",
+            ],
+        )
+        extension_event = observation.control_events[-1]
+        self.assertEqual(extension_event.payload_length, len(extension_payload))
+        self.assertEqual(
+            extension_event.payload_sha256,
+            hashlib.sha256(extension_payload).hexdigest(),
+        )
+
+    async def test_unsolicited_extended_payload_is_not_read(self) -> None:
+        metadata_payload = b"torrent-metadata-must-remain-unread"
+        extended_payload = b"\x03" + metadata_payload
+        wire = peer_message(1) + peer_message(5, b"\x80")
+        header_and_ids = len(extended_payload + b"\x14").to_bytes(4, "big") + b"\x14\x03"
+
+        result, _fake_socket, fake_loop = await run_verifier(
+            wire + header_and_ids + metadata_payload,
+            close_when_empty=False,
+        )
+
+        observation = result.availability
+        assert observation is not None
+        self.assertTrue(result.offering_observed)
+        self.assertEqual(observation.metadata_requests_sent, 0)
+        self.assertEqual(observation.piece_payload_bytes_received, 0)
+        self.assertEqual(fake_loop.incoming, bytearray(metadata_payload))
+        self.assertEqual(
+            observation.control_events[-1].kind,
+            "extension_payload_rejected",
+        )
+
+    async def test_have_none_alone_does_not_claim_piece_availability(self) -> None:
+        result, _fake_socket, _fake_loop = await run_verifier(
+            peer_message(1) + peer_message(15),
+            close_when_empty=True,
+        )
+
+        observation = result.availability
+        assert observation is not None
+        self.assertFalse(result.offering_observed)
+        self.assertFalse(observation.piece_availability_announced)
+        self.assertEqual(
+            [event.kind for event in observation.control_events],
+            ["unchoke", "have_none"],
+        )
+
+    async def test_malformed_supported_control_frames_stop_before_payload(self) -> None:
+        malformed_messages = (
+            (9, b"bad"),
+            (13, b"bad"),
+            (14, b"bad"),
+            (15, b"bad"),
+            (16, b"bad"),
+            (17, b"bad"),
+        )
+        for message_id, payload in malformed_messages:
+            with self.subTest(message_id=message_id):
+                header_and_id = (1 + len(payload)).to_bytes(4, "big") + bytes((message_id,))
+                result, _fake_socket, fake_loop = await run_verifier(
+                    header_and_id + payload,
+                    close_when_empty=False,
+                )
+
+                observation = result.availability
+                assert observation is not None
+                self.assertFalse(result.offering_observed)
+                self.assertIsNotNone(observation.error)
+                self.assertEqual(fake_loop.incoming, bytearray(payload))
+
+        result, _fake_socket, _fake_loop = await run_verifier(
+            peer_message(20),
+            close_when_empty=False,
+        )
+        observation = result.availability
+        assert observation is not None
+        self.assertFalse(result.offering_observed)
+        self.assertIsNotNone(observation.error)
+
+    async def test_late_protocol_error_does_not_erase_positive_signals(self) -> None:
+        unknown_payload = b"not-read"
+        unknown_frame = (1 + len(unknown_payload)).to_bytes(4, "big") + b"\x63" + unknown_payload
+        result, _fake_socket, fake_loop = await run_verifier(
+            peer_message(1) + peer_message(5, b"\x80") + unknown_frame,
+            close_when_empty=False,
+        )
+
+        observation = result.availability
+        assert observation is not None
+        self.assertTrue(result.offering_observed)
+        self.assertIsNotNone(observation.error)
+        self.assertEqual(fake_loop.incoming, bytearray(unknown_payload))
 
     async def test_unknown_message_and_oversized_frame_stop_before_payload(self) -> None:
         unknown_payload = b"not-read"

@@ -13,6 +13,7 @@ class Target:
     label: str
     info_hash: bytes
     source_note: str = ""
+    trackers: tuple[str, ...] = ()
 
     @property
     def info_hash_hex(self) -> str:
@@ -21,7 +22,7 @@ class Target:
 
 @dataclass(frozen=True, slots=True)
 class PeerCandidate:
-    """Ein von einer DHT-Antwort genannter öffentlicher Peer-Endpunkt."""
+    """Ein von DHT oder UDP-Tracker genannter öffentlicher Peer-Endpunkt."""
 
     target_label: str
     info_hash_hex: str
@@ -33,6 +34,7 @@ class PeerCandidate:
     transaction_id_hex: str
     response_sha256: str
     source_note: str = ""
+    discovery_source: str = "dht"
 
     @property
     def endpoint(self) -> tuple[str, int]:
@@ -98,16 +100,17 @@ class HandshakeResult:
 
     @property
     def offering_observed(self) -> bool:
-        """Nur der vollständig und fehlerfrei beobachtete positive Gesamtbefund."""
+        """Ein direkt validierter Verfügbarkeits- und Freigabebefund ohne Datenabruf."""
         observation = self.availability
         return bool(
             self.confirmed
             and observation is not None
-            and observation.completed_full_window
             and observation.interested_sent
             and observation.piece_availability_announced
             and observation.unchoked
-            and observation.error is None
+            and observation.request_messages_sent == 0
+            and observation.piece_payload_bytes_received == 0
+            and observation.metadata_requests_sent == 0
         )
 
 
@@ -150,9 +153,31 @@ class EvidenceRecord:
     evidence_event_sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class TargetScanMetrics:
+    """Kompakte Fortschritts- und Abschlusszahlen eines einzelnen Infohashes."""
+
+    target_label: str
+    info_hash_hex: str
+    dht_queries_started: int = 0
+    dht_queries_completed: int = 0
+    dht_queries_failed: int = 0
+    tracker_queries_completed: int = 0
+    tracker_queries_failed: int = 0
+    candidates_discovered: int = 0
+    candidates_checked: int = 0
+    verification_attempts: int = 0
+    confirmed_handshakes: int = 0
+    piece_availability_observed: int = 0
+    unchoke_observed: int = 0
+    positive_findings: int = 0
+    terminal_failures: int = 0
+    failure_reasons: tuple[tuple[str, int], ...] = ()
+
+
 @dataclass(slots=True)
 class ScanResult:
-    """Gesamtergebnis eines begrenzten Prüflaufs."""
+    """Gesamtergebnis eines vollständigen, speicherschonenden Prüflaufs."""
 
     run_id: str
     started_at_utc: str
@@ -160,18 +185,42 @@ class ScanResult:
     candidates: list[PeerCandidate] = field(default_factory=list)
     handshakes: list[HandshakeResult] = field(default_factory=list)
     records: list[EvidenceRecord] = field(default_factory=list)
+    candidate_count: int = 0
+    handshake_count: int = 0
+    confirmed_handshake_count: int = 0
+    offering_observation_count: int = 0
+    known_vpn_total: int = 0
+    target_metrics: tuple[TargetScanMetrics, ...] = ()
+    run_store_path: Path | None = None
     report_paths: list[Path] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     notices: list[str] = field(default_factory=list)
 
     @property
+    def total_candidate_count(self) -> int:
+        return max(self.candidate_count, len(self.candidates))
+
+    @property
+    def total_handshake_count(self) -> int:
+        return max(self.handshake_count, len(self.handshakes))
+
+    @property
     def confirmed_count(self) -> int:
-        return sum(result.confirmed for result in self.handshakes)
+        return max(
+            self.confirmed_handshake_count,
+            sum(result.confirmed for result in self.handshakes),
+        )
 
     @property
     def offering_count(self) -> int:
-        return sum(result.offering_observed for result in self.handshakes)
+        return max(
+            self.offering_observation_count,
+            sum(result.offering_observed for result in self.handshakes),
+        )
 
     @property
     def known_vpn_count(self) -> int:
-        return sum(record.vpn.status == "known_vpn" for record in self.records)
+        return max(
+            self.known_vpn_total,
+            sum(record.vpn.status == "known_vpn" for record in self.records),
+        )
