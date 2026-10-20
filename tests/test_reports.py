@@ -15,6 +15,7 @@ from email.parser import BytesParser
 from pathlib import Path
 from unittest import mock
 
+import bittorrent_beobachter.reports as reports_module
 from bittorrent_beobachter.models import (
     EvidenceRecord,
     HandshakeResult,
@@ -233,6 +234,14 @@ class ReportGenerationTests(unittest.TestCase):
             self.assertEqual(all_rows[0]["bestaetigte_handshakes"], "2")
             self.assertEqual(all_rows[0]["ports"], "51413 | 51414")
             self.assertEqual(
+                all_rows[0]["erste_beobachtung_utc"],
+                "2026-10-20T10:01:00Z",
+            )
+            self.assertEqual(
+                all_rows[0]["letzte_beobachtung_utc"],
+                "2026-10-20T10:10:02Z",
+            )
+            self.assertEqual(
                 all_rows[0]["lokaler_dht_antwort_fingerabdruck_sha256"],
                 f"{1:064x} | {2:064x}",
             )
@@ -396,6 +405,71 @@ class ReportGenerationTests(unittest.TestCase):
             self.assertIn(b"Technische Anlage zur Strafanzeige", pdf_bytes)
             self.assertNotIn(b"ENTWURF", pdf_bytes)
             self.assertNotIn(b"Adressat", pdf_bytes)
+
+    def test_complaint_attachment_uses_requested_evidence_first_structure(self) -> None:
+        project_hash = "852795102149749ad91123af01ceac5da6f9eb5a"
+        result = ScanResult(
+            run_id="attachment-structure",
+            started_at_utc="2026-10-20T10:00:00Z",
+            completed_at_utc="2026-10-20T11:00:00Z",
+            records=[
+                _evidence_record(
+                    "198.51.100.83",
+                    6013,
+                    13,
+                    info_hash_hex=project_hash,
+                )
+            ],
+        )
+        aggregate = reports_module._aggregate_reportable_records(result.records)[0]
+        captured_story: list[object] = []
+
+        def capture_pdf(
+            _path: Path,
+            _title: str,
+            story: list[object],
+            *_args: object,
+        ) -> None:
+            captured_story.extend(story)
+
+        with mock.patch.object(reports_module, "_build_pdf", side_effect=capture_pdf):
+            reports_module._write_complaint_attachment_pdf(
+                Path("unused.pdf"),
+                result,
+                aggregate,
+                ReportConfig(),
+                "2026-10-20T11:05:00Z",
+                reports_module._load_reportlab(),
+            )
+
+        paragraph_text = "\n".join(
+            flowable.getPlainText()
+            for flowable in captured_story
+            if callable(getattr(flowable, "getPlainText", None))
+        )
+        expected_sections = (
+            "1. Möglicher Tatgegenstand",
+            "2. Anzeige gegen Unbekannt - ermittelter BitTorrent-Endpunkt",
+            "3. So wurde der Endpunkt gefunden",
+            "4. So wurde direkt geprüft",
+            "Technische Zusammenfassung",
+            "Öffentliche Routing-/Registry-Angaben",
+            "Technische Einzelbeobachtungen",
+        )
+        section_positions = [paragraph_text.index(section) for section in expected_sections]
+        self.assertEqual(section_positions, sorted(section_positions))
+        self.assertIn("Die Strafanzeige richtet sich gegen Unbekannt.", paragraph_text)
+        self.assertIn(
+            "bestätigte den dokumentierten Infohash, meldete verfügbare Teile und gab mit UNCHOKE",
+            paragraph_text,
+        )
+        self.assertIn("nannten DHT-Antworten den Endpunkt", paragraph_text)
+        self.assertIn("direkte TCP-Verbindung", paragraph_text)
+        self.assertNotIn("Täter", paragraph_text)
+        self.assertNotIn("Aussagegrenze", paragraph_text)
+        self.assertNotIn("belegt keines der gesetzlichen Tatbestandsmerkmale", paragraph_text)
+        self.assertNotIn("nicht gerichtlich bewiesen", paragraph_text)
+        self.assertNotIn("belegt nicht für sich allein die konkrete Beobachtung", paragraph_text)
 
     def test_offering_claim_requires_positive_overall_gate(self) -> None:
         project_hash = "852795102149749ad91123af01ceac5da6f9eb5a"
