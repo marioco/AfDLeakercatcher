@@ -7,7 +7,7 @@ $ExpectedOpenSslVersion = "OpenSSL 3.5.9 29 Sep 2026"
 $ResultIllustrationRelativePath = "_internal/bittorrent_beobachter/assets/leaker_chase.png"
 $ExpectedResultIllustrationHash = "9ea29e8488c1459390c528c3caebab9fc38e3b264439d721fce6b1c59a721902"
 $OnePagerName = "AfDLeakerCatcher-Kurzuebersicht.pdf"
-$ExpectedOnePagerHash = "8c3ab4ec26ffa978a5059b2367b7d52669d3da195627ca2c5b9ec0b46522fbd1"
+$ExpectedOnePagerHash = "639d0d8469908a1417519e0f0c96173d3bec7d3c4f2252e50206d9e912e1ac1f"
 $ThirdPartyLicenseNames = @(
     "Python-3.14.8.txt",
     "Tcl-9.0.4.txt",

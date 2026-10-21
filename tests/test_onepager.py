@@ -6,49 +6,89 @@ import hashlib
 import re
 from pathlib import Path
 
-from tools.generate_kurzuebersicht import generate_onepager
+from PIL import Image
+
+from tools.generate_kurzuebersicht import (
+    ENDPOINT_CROP,
+    ENDPOINT_IMAGE_SIZE,
+    ENDPOINT_SCREENSHOT,
+    PROGRAM_CROP,
+    PROGRAM_IMAGE_SIZE,
+    PROGRAM_SCREENSHOT,
+    generate_overview,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 COMMITTED_PDF = PROJECT_ROOT / "AfDLeakerCatcher-Kurzuebersicht.pdf"
 GENERATOR = PROJECT_ROOT / "tools" / "generate_kurzuebersicht.py"
-EXPECTED_SHA256 = "8c3ab4ec26ffa978a5059b2367b7d52669d3da195627ca2c5b9ec0b46522fbd1"
+EXPECTED_PDF_SHA256 = "639d0d8469908a1417519e0f0c96173d3bec7d3c4f2252e50206d9e912e1ac1f"
+EXPECTED_IMAGE_HASHES = {
+    ENDPOINT_SCREENSHOT: "b4901f6c0f4312d13a01f9abc2e4a4e881ea192d5c6fa3932135e6271ed81ce8",
+    PROGRAM_SCREENSHOT: "8e31c8ad8ef20166f54fea0ccd8a79dadfadd55769b61a51261195dc1afbc1f9",
+}
 
 
-def test_onepager_is_exactly_one_deterministic_vector_page(tmp_path: Path) -> None:
+def test_overview_is_exactly_two_deterministic_pages(tmp_path: Path) -> None:
     first = tmp_path / "first.pdf"
     second = tmp_path / "second.pdf"
 
-    generate_onepager(first)
-    generate_onepager(second)
+    generate_overview(first)
+    generate_overview(second)
 
     payload = first.read_bytes()
     assert payload == second.read_bytes() == COMMITTED_PDF.read_bytes()
     assert payload.startswith(b"%PDF-1.4")
-    assert hashlib.sha256(payload).hexdigest() == EXPECTED_SHA256
-    assert len(re.findall(rb"/Type /Page(?!s)", payload)) == 1
-    assert b"/Count 1" in payload
-    assert b"/MediaBox [ 0 0 841.8898 595.2756 ]" in payload
-    assert b"/Subtype /Image" not in payload
+    assert hashlib.sha256(payload).hexdigest() == EXPECTED_PDF_SHA256
+    assert len(re.findall(rb"/Type /Page(?!s)", payload)) == 2
+    assert b"/Count 2" in payload
+    assert payload.count(b"/MediaBox [ 0 0 841.8898 595.2756 ]") >= 1
+    assert payload.count(b"/Subtype /Image") == 2
     assert b"/JavaScript" not in payload
-    assert len(payload) < 100_000
+    assert len(payload) < 1_000_000
 
 
-def test_onepager_copy_is_simple_and_contains_no_real_endpoint_data() -> None:
+def test_overview_uses_the_exact_supplied_screenshots() -> None:
+    expected_sizes = {
+        ENDPOINT_SCREENSHOT: ENDPOINT_IMAGE_SIZE,
+        PROGRAM_SCREENSHOT: PROGRAM_IMAGE_SIZE,
+    }
+    for image_path, expected_hash in EXPECTED_IMAGE_HASHES.items():
+        payload = image_path.read_bytes()
+        assert payload.startswith(b"\x89PNG\r\n\x1a\n")
+        assert hashlib.sha256(payload).hexdigest() == expected_hash
+        with Image.open(image_path) as image:
+            image.verify()
+        with Image.open(image_path) as image:
+            assert image.size == expected_sizes[image_path]
+
+    assert ENDPOINT_CROP == (0, 0, 1622, 657)
+    assert PROGRAM_CROP == (0, 286, 2290, 1427)
+
+
+def test_overview_copy_explains_program_and_initial_suspicion_without_disclaimer() -> None:
     source = GENERATOR.read_text(encoding="utf-8")
 
     for expected_text in (
-        "Vom BitTorrent-Datenleck zum prüfbaren Ermittlungsansatz",
-        "Datenleck über BitTorrent",
-        "Teilnehmer finden",
-        "60 Sekunden Direktprüfung",
-        "Kein Download des Datenlecks",
-        "IP-Adresse, Port, UTC-Zeit",
-        "behördliche Bewertung eines ",
-        "möglichen Anfangsverdachts.",
-        "Rechtliche Bewertung und Anschlusszuordnung",
+        "AfDLeakerCatcher ermittelt die technische Spur eines Datenlecks",
+        "BEISPIELAUSZUG GEFUNDENER IP-ADRESSEN",
+        "DHT und Tracker nach dem bekannten Infohash",
+        "Direkte Bestätigung über volle 60 Sekunden",
+        "PDF, CSV und Strafanzeige gegen Unbekannt",
+        "Warum diese Daten einen Anfangsverdacht begründen",
+        "Der Gegenclient bestätigt den Infohash",
+        "Warum die Tatsachenkette ausreicht",
+        "Zureichende tatsächliche Anhaltspunkte nach § 152 Abs. 2 StPO",
+        "unmittelbar nutzbaren Ermittlungsansatz",
     ):
         assert expected_text in source
 
-    assert re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", source) is None
-    assert re.search(r"\b[0-9a-fA-F]{40}\b", source) is None
-    assert re.search(r"\b[0-9a-fA-F]{64}\b", source) is None
+    for unwanted_text in (
+        "möglicher Anfangsverdacht",
+        "mutmaßlicher Datenbestand",
+        "rechtliche Bewertung",
+        "behördliche Bewertung",
+        "reicht nicht",
+        "kein Beweis",
+        "möglicherweise",
+    ):
+        assert unwanted_text.casefold() not in source.casefold()

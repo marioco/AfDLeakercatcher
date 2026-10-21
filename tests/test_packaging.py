@@ -14,7 +14,7 @@ PACKAGE_DIRECTORY = f"dist/{PRODUCT_NAME}"
 PDF_NAME = "Cybercrime-E-Mail-Kontakte_BKA-und-LKA_Deutschland_Stand-2026-10-20.pdf"
 PDF_SHA256 = "75585bb562b705f5644734299f78d1b26f1bd083a4acd962d21704041feb2f12"
 ONEPAGER_NAME = "AfDLeakerCatcher-Kurzuebersicht.pdf"
-ONEPAGER_SHA256 = "8c3ab4ec26ffa978a5059b2367b7d52669d3da195627ca2c5b9ec0b46522fbd1"
+ONEPAGER_SHA256 = "639d0d8469908a1417519e0f0c96173d3bec7d3c4f2252e50206d9e912e1ac1f"
 RESULT_ILLUSTRATION = "bittorrent_beobachter/assets/leaker_chase.png"
 RESULT_ILLUSTRATION_SHA256 = "9ea29e8488c1459390c528c3caebab9fc38e3b264439d721fce6b1c59a721902"
 ARCHIVE_NAME = f"{PRODUCT_NAME}-Windows-x64.zip"
@@ -301,7 +301,7 @@ def test_version_sources_tag_checks_and_direct_download_are_consistent() -> None
     project = tomllib.loads(_text("pyproject.toml"))
     version = project["project"]["version"]
 
-    assert version == _app_version() == "0.3.8"
+    assert version == _app_version() == "0.3.9"
     assert f"Windows-Download \N{EN DASH} Version {version}" in readme
     release_path = f"releases/download/afdleakercatcher-v{version}/"
     assert readme.count(release_path) >= 2
