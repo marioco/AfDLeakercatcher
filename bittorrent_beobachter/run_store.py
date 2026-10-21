@@ -17,6 +17,12 @@ from pathlib import Path
 from typing import Any
 
 from .models import (
+    MAX_PEER_CONTROL_PAYLOAD_BYTES,
+    MAX_PEER_PIECE_INDEX,
+    MAX_RETAINED_PEER_CONTROL_EVENTS,
+    OBSERVATION_ROUNDING_TOLERANCE_SECONDS,
+    OBSERVATION_WALL_CLOCK_TOLERANCE_SECONDS,
+    TERMINAL_PEER_DIAGNOSTIC_KINDS,
     EvidenceRecord,
     HandshakeResult,
     NetworkEnrichment,
@@ -25,6 +31,7 @@ from .models import (
     PeerControlEvent,
     VpnClassification,
 )
+from .path_safety import is_link_like, path_has_link_like_component
 
 SCHEMA_VERSION = 3
 VALID_CANDIDATE_STATUSES = frozenset({"pending", "in_progress", "done"})
@@ -349,7 +356,7 @@ def _availability_from_mapping(value: object) -> PeerAvailabilityObservation:
     raw_events = data["control_events"]
     if not isinstance(raw_events, (list, tuple)):
         raise RunStoreError("control_events muss eine Liste sein.")
-    return PeerAvailabilityObservation(
+    observation = PeerAvailabilityObservation(
         started_at_utc=str(_require_string(data["started_at_utc"], "started_at_utc")),
         ended_at_utc=str(_require_string(data["ended_at_utc"], "ended_at_utc")),
         requested_duration_seconds=_require_float(
@@ -383,6 +390,8 @@ def _availability_from_mapping(value: object) -> PeerAvailabilityObservation:
         control_events=tuple(_control_event_from_mapping(item) for item in raw_events),
         error=_require_string(data["error"], "availability.error", optional=True),
     )
+    _validate_availability(observation)
+    return observation
 
 
 def _handshake_from_mapping(value: object) -> HandshakeResult:
@@ -412,7 +421,7 @@ def _handshake_from_mapping(value: object) -> HandshakeResult:
             ipaddress.ip_address(local_ip)
         except ValueError as exc:
             raise RunStoreError("HandshakeResult.local_ip ist ungueltig.") from exc
-    return HandshakeResult(
+    handshake = HandshakeResult(
         candidate=_candidate_from_mapping(data["candidate"]),
         attempted_at_utc=str(_require_string(data["attempted_at_utc"], "attempted_at_utc")),
         completed_at_utc=_require_string(
@@ -432,6 +441,8 @@ def _handshake_from_mapping(value: object) -> HandshakeResult:
         error=_require_string(data["error"], "handshake.error", optional=True),
         availability=availability,
     )
+    _validate_handshake(handshake)
+    return handshake
 
 
 def _network_enrichment_from_mapping(value: object) -> NetworkEnrichment:
@@ -519,14 +530,22 @@ def _vpn_from_mapping(value: object) -> VpnClassification:
     )
 
 
-def _validate_control_event(event: PeerControlEvent) -> datetime:
+def _validate_control_event(event: PeerControlEvent) -> tuple[datetime, float]:
     _observed_text, observed_at = _require_utc_timestamp(
         event.observed_at_utc, "control_event.observed_at_utc"
     )
-    _require_nonnegative_float(event.elapsed_seconds, "control_event.elapsed_seconds")
+    elapsed_seconds = _require_nonnegative_float(
+        event.elapsed_seconds, "control_event.elapsed_seconds"
+    )
     _require_nonnegative_int(event.payload_length, "control_event.payload_length")
+    if event.payload_length > MAX_PEER_CONTROL_PAYLOAD_BYTES:
+        raise RunStoreError("control_event.payload_length ueberschreitet das Peer-Wire-Limit.")
     if event.piece_index is not None:
         _require_nonnegative_int(event.piece_index, "control_event.piece_index")
+        if event.piece_index > MAX_PEER_PIECE_INDEX:
+            raise RunStoreError(
+                "control_event.piece_index passt nicht in das vier Byte breite Wire-Feld."
+            )
     if event.set_bits is not None:
         _require_nonnegative_int(event.set_bits, "control_event.set_bits")
     if event.payload_sha256 is not None:
@@ -537,7 +556,91 @@ def _validate_control_event(event: PeerControlEvent) -> datetime:
         )
     if not event.kind.strip():
         raise RunStoreError("control_event.kind darf nicht leer sein.")
-    return observed_at
+    details = (
+        event.piece_index,
+        event.non_empty,
+        event.payload_sha256,
+        event.set_bits,
+    )
+    if event.kind in {
+        "keepalive",
+        "choke",
+        "unchoke",
+        "peer_interested",
+        "peer_not_interested",
+        "have_all",
+        "have_none",
+    }:
+        if event.payload_length != 0 or any(value is not None for value in details):
+            raise RunStoreError(
+                f"Kontrollereignis {event.kind!r} enthaelt ungueltige Nutzlastfelder."
+            )
+    elif event.kind == "have":
+        if (
+            event.payload_length != 4
+            or event.piece_index is None
+            or any(
+                value is not None
+                for value in (event.non_empty, event.payload_sha256, event.set_bits)
+            )
+        ):
+            raise RunStoreError("HAVE-Kontrollereignis ist ungueltig.")
+    elif event.kind == "bitfield":
+        if (
+            event.payload_length < 1
+            or event.piece_index is not None
+            or event.non_empty is None
+            or event.payload_sha256 is None
+            or event.set_bits is None
+            or event.set_bits > event.payload_length * 8
+            or event.non_empty != (event.set_bits > 0)
+        ):
+            raise RunStoreError("BITFIELD-Kontrollereignis ist ungueltig.")
+    elif event.kind == "port":
+        if event.payload_length != 2 or any(value is not None for value in details):
+            raise RunStoreError("PORT-Kontrollereignis ist ungueltig.")
+    elif event.kind in {"suggest_piece", "allowed_fast"}:
+        if (
+            event.payload_length != 4
+            or event.piece_index is None
+            or any(
+                value is not None
+                for value in (event.non_empty, event.payload_sha256, event.set_bits)
+            )
+        ):
+            raise RunStoreError(f"Kontrollereignis {event.kind!r} ist ungueltig.")
+    elif event.kind == "reject_request":
+        if (
+            event.payload_length != 12
+            or event.piece_index is None
+            or any(
+                value is not None
+                for value in (event.non_empty, event.payload_sha256, event.set_bits)
+            )
+        ):
+            raise RunStoreError("REJECT_REQUEST-Kontrollereignis ist ungueltig.")
+    elif event.kind == "extension_handshake":
+        if (
+            event.payload_length < 1
+            or event.payload_sha256 is None
+            or any(
+                value is not None for value in (event.piece_index, event.non_empty, event.set_bits)
+            )
+        ):
+            raise RunStoreError("Erweiterungs-Handshake-Ereignis ist ungueltig.")
+    elif event.kind in {
+        "extension_payload_rejected",
+        "request_rejected",
+        "piece_rejected",
+        "unknown_message_rejected",
+    }:
+        if any(value is not None for value in details) or (
+            event.kind == "extension_payload_rejected" and event.payload_length < 1
+        ):
+            raise RunStoreError(f"Diagnoseereignis {event.kind!r} ist ungueltig.")
+    else:
+        raise RunStoreError(f"Unbekannte Kontrollereignisart: {event.kind!r}.")
+    return observed_at, elapsed_seconds
 
 
 def _validate_availability(observation: PeerAvailabilityObservation) -> None:
@@ -558,6 +661,38 @@ def _validate_availability(observation: PeerAvailabilityObservation) -> None:
     duration = _require_nonnegative_float(
         observation.duration_seconds, "availability.duration_seconds"
     )
+    if (
+        observation.completed_full_window
+        and duration + OBSERVATION_ROUNDING_TOLERANCE_SECONDS < requested_duration
+    ):
+        raise RunStoreError(
+            "Eine vollstaendige Verfuegbarkeitsbeobachtung unterschreitet die angeforderte Dauer."
+        )
+    wall_clock_duration = (ended_at - started_at).total_seconds()
+    if abs(wall_clock_duration - duration) > OBSERVATION_WALL_CLOCK_TOLERANCE_SECONDS:
+        raise RunStoreError(
+            "UTC-Zeitfenster und protokollierte Beobachtungsdauer sind inkonsistent."
+        )
+    if (
+        observation.completed_full_window
+        and observation.error is None
+        and observation.termination_reason != "duration_elapsed"
+    ):
+        raise RunStoreError(
+            "Eine vollstaendige Verfuegbarkeitsbeobachtung benoetigt den Abschlussgrund "
+            "duration_elapsed."
+        )
+    if (
+        observation.completed_full_window
+        and observation.error is None
+        and any(
+            event.kind in TERMINAL_PEER_DIAGNOSTIC_KINDS for event in observation.control_events
+        )
+    ):
+        raise RunStoreError(
+            "Eine fehlerfreie Vollfensterbeobachtung darf kein terminales "
+            "Diagnoseereignis enthalten."
+        )
     unchoked_duration = _require_nonnegative_float(
         observation.unchoked_duration_seconds,
         "availability.unchoked_duration_seconds",
@@ -572,15 +707,67 @@ def _validate_availability(observation: PeerAvailabilityObservation) -> None:
         ("metadata_requests_sent", observation.metadata_requests_sent),
     ):
         _require_nonnegative_int(counter, "availability." + label)
+    error_free_observation = observation.error is None
+    expected_retained_events = min(
+        observation.messages_received,
+        MAX_RETAINED_PEER_CONTROL_EVENTS,
+    )
+    if error_free_observation:
+        if len(observation.control_events) != expected_retained_events:
+            raise RunStoreError(
+                "Die gespeicherte Ereigniszahl passt nicht zur Zahl empfangener "
+                "Kontrollnachrichten."
+            )
+    elif observation.messages_received < len(observation.control_events):
+        raise RunStoreError(
+            "Die Zahl empfangener Kontrollnachrichten unterschreitet die gespeicherten Ereignisse."
+        )
     if not observation.termination_reason.strip():
         raise RunStoreError("availability.termination_reason darf nicht leer sein.")
     announced = observation.non_empty_bitfield or observation.have_announced
     if observation.piece_availability_announced != announced:
         raise RunStoreError("Die zusammengefasste Stueckverfuegbarkeit ist inkonsistent.")
+    previous_elapsed: float | None = None
+    bitfield_count = 0
     for event in observation.control_events:
-        observed_at = _validate_control_event(event)
+        observed_at, elapsed_seconds = _validate_control_event(event)
+        if event.kind == "bitfield":
+            bitfield_count += 1
+            if bitfield_count > 1:
+                raise RunStoreError(
+                    "Eine Verfuegbarkeitsbeobachtung darf nur ein BITFIELD enthalten."
+                )
         if observed_at < started_at or observed_at > ended_at:
             raise RunStoreError("Ein Kontrollereignis liegt ausserhalb des Beobachtungsfensters.")
+        if elapsed_seconds > duration + OBSERVATION_ROUNDING_TOLERANCE_SECONDS:
+            raise RunStoreError(
+                "Ein Kontrollereignis liegt hinter der protokollierten Beobachtungsdauer."
+            )
+        wall_clock_elapsed = (observed_at - started_at).total_seconds()
+        if abs(wall_clock_elapsed - elapsed_seconds) > OBSERVATION_WALL_CLOCK_TOLERANCE_SECONDS:
+            raise RunStoreError(
+                "UTC-Zeitpunkt und Laufzeit eines Kontrollereignisses sind inkonsistent."
+            )
+        if previous_elapsed is not None and elapsed_seconds < previous_elapsed:
+            raise RunStoreError("Die Laufzeiten der Kontrollereignisse sind nicht monoton.")
+        previous_elapsed = elapsed_seconds
+    minimum_control_bytes = HandshakeResult._minimum_recorded_control_bytes(
+        observation.control_events
+    )
+    if minimum_control_bytes is not None:
+        minimum_control_bytes += 4 * (
+            observation.messages_received - len(observation.control_events)
+        )
+    if minimum_control_bytes is None or (
+        observation.bytes_received != minimum_control_bytes
+        if error_free_observation
+        and observation.messages_received <= MAX_RETAINED_PEER_CONTROL_EVENTS
+        else observation.bytes_received < minimum_control_bytes
+    ):
+        raise RunStoreError(
+            "Die empfangenen Kontrollbytes passen nicht exakt zu den vollstaendig "
+            "gespeicherten Ereignissen oder unterschreiten die begrenzte Aufzeichnung."
+        )
 
 
 def _validate_handshake(handshake: HandshakeResult) -> None:
@@ -622,10 +809,23 @@ def _validate_handshake(handshake: HandshakeResult) -> None:
         or handshake.reserved_bits_hex is None
     ):
         raise RunStoreError("Ein bestaetigter Handshake ist unvollstaendig.")
+    if handshake.confirmed and (handshake.bytes_sent < 68 or handshake.bytes_received < 68):
+        raise RunStoreError(
+            "Ein bestaetigter Handshake benoetigt mindestens 68 gesendete und empfangene Byte."
+        )
+    if handshake.confirmed and handshake.error is not None:
+        raise RunStoreError("Ein bestaetigter Handshake darf keinen Handshake-Fehler enthalten.")
     if not handshake.confirmed and handshake.availability is not None:
         raise RunStoreError("Ein unbestaetigter Handshake darf keine Verfuegbarkeit enthalten.")
     if handshake.availability is not None:
         _validate_availability(handshake.availability)
+        if handshake.availability.interested_sent and handshake.bytes_sent != 73:
+            raise RunStoreError("Handshake und INTERESTED muessen genau 73 gesendete Byte ergeben.")
+        expected_received = 68 + handshake.availability.bytes_received
+        if handshake.bytes_received != expected_received:
+            raise RunStoreError(
+                "Handshake- und Verfuegbarkeitszaehler fuer empfangene Byte sind inkonsistent."
+            )
         _started_text, availability_started = _require_utc_timestamp(
             handshake.availability.started_at_utc,
             "availability.started_at_utc",
@@ -828,11 +1028,15 @@ class RunStore:
             self._initialize_schema(connection)
 
     def _prepare_private_database_file(self) -> None:
+        if path_has_link_like_component(self.path):
+            raise RunStoreError("Die Laufdatenbank darf keine Link-Komponente enthalten.")
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if path_has_link_like_component(self.path):
+            raise RunStoreError("Die Laufdatenbank darf keine Link-Komponente enthalten.")
         if os.name != "nt":
             self.path.parent.chmod(0o700)
         if self.path.exists():
-            if self.path.is_symlink() or not self.path.is_file():
+            if is_link_like(self.path) or not self.path.is_file():
                 raise RunStoreError("Die Laufdatenbank muss eine regulaere Datei sein.")
         else:
             flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
@@ -1344,8 +1548,13 @@ class RunStore:
 
         return selected
 
-    def store_handshake_batch(self, results: Iterable[HandshakeResult]) -> int:
-        """Speichert einen Ergebnisbatch und setzt seine Kandidaten atomar auf ``done``."""
+    def store_handshake_batch(
+        self,
+        results: Iterable[HandshakeResult],
+        *,
+        count_new_only: bool = False,
+    ) -> int:
+        """Speichere Ergebnisse atomar; optional zaehle nur erstmals gepruefte Kandidaten."""
 
         prepared: list[tuple[HandshakeResult, str]] = []
         seen: set[tuple[str, str, int]] = set()
@@ -1365,6 +1574,7 @@ class RunStore:
         if not prepared:
             return 0
 
+        new_results = 0
         with closing(self._connect()) as connection:
             try:
                 self._begin_immediate(connection)
@@ -1400,6 +1610,8 @@ class RunStore:
                         raise RunStoreError(
                             "Handshake-Ergebnis gehoert nicht zu einem reservierten Kandidaten."
                         )
+                    if row["previous_offering_observed"] is None:
+                        new_results += 1
                     if (
                         row["previous_offering_observed"] == 1
                         or row["evidence_candidate_id"] is not None
@@ -1513,7 +1725,7 @@ class RunStore:
             except Exception:
                 connection.rollback()
                 raise
-        return len(prepared)
+        return new_results if count_new_only else len(prepared)
 
     def store_evidence_batch(self, records: Iterable[EvidenceRecord]) -> int:
         """Speichert einen vollstaendigen EvidenceRecord-Batch atomar."""
@@ -2052,6 +2264,29 @@ class RunStore:
                     evidence_records=int(row["evidence_records"]),
                 )
         return metrics
+
+    def handshake_result_count(
+        self,
+        target_hashes: Iterable[str] = (),
+    ) -> int:
+        """Zaehle eindeutig gespeicherte Handshake-Ergebnisse ohne Kandidatenaggregation."""
+
+        requested = frozenset(_validate_info_hash(item) for item in target_hashes)
+        with closing(self._connect()) as connection:
+            if not requested:
+                row = connection.execute("SELECT COUNT(*) FROM handshake_results").fetchone()
+                if row is None:
+                    raise RunStoreError("Handshake-Fortschritt konnte nicht gelesen werden.")
+                return int(row[0])
+
+            cursor = connection.execute(
+                """
+                SELECT c.info_hash
+                FROM handshake_results AS h
+                JOIN candidates AS c ON c.id = h.candidate_id
+                """
+            )
+            return sum(1 for row in cursor if str(row[0]) in requested)
 
     @staticmethod
     def _validate_batch_size(batch_size: int) -> None:

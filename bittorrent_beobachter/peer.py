@@ -14,6 +14,10 @@ from datetime import UTC, datetime
 
 from .dht import MAX_TIMEOUT_SECONDS, normalize_global_endpoint
 from .models import (
+    MAX_PEER_CONTROL_PAYLOAD_BYTES,
+    MAX_PEER_OBSERVATION_BYTES,
+    MAX_PEER_OBSERVATION_MESSAGES,
+    MAX_RETAINED_PEER_CONTROL_EVENTS,
     HandshakeResult,
     PeerAvailabilityObservation,
     PeerCandidate,
@@ -28,10 +32,15 @@ INTERESTED_MESSAGE = b"\x00\x00\x00\x01\x02"
 DEFAULT_OBSERVATION_SECONDS = 60.0
 MIN_OBSERVATION_SECONDS = 0.01
 MAX_OBSERVATION_SECONDS = 300.0
-MAX_PEER_MESSAGE_LENGTH = 1_048_576
-MAX_BITFIELD_BYTES = MAX_PEER_MESSAGE_LENGTH - 1
-MAX_OBSERVATION_BYTES = 4_194_304
-MAX_CONTROL_EVENTS = 512
+MAX_PEER_MESSAGE_LENGTH = MAX_PEER_CONTROL_PAYLOAD_BYTES + 1
+MAX_BITFIELD_BYTES = MAX_PEER_CONTROL_PAYLOAD_BYTES
+MAX_OBSERVATION_BYTES = MAX_PEER_OBSERVATION_BYTES
+# Schutz gegen CPU-/Scheduler-Last durch extrem viele winzige Frames. Die
+# fachlich relevanten Zustandswechsel bleiben darunter weit oberhalb aller
+# normalen Peer-Verläufe, während eine Keepalive-Flut kontrolliert endet.
+MAX_OBSERVATION_MESSAGES = MAX_PEER_OBSERVATION_MESSAGES
+# Reine Speichergrenze; der Empfang läuft unabhängig davon bis zu seinem Ende weiter.
+MAX_CONTROL_EVENTS = MAX_RETAINED_PEER_CONTROL_EVENTS
 RECEIVE_CHUNK_BYTES = 16_384
 
 MESSAGE_CHOKE = 0
@@ -74,12 +83,17 @@ class _ObservationState:
     events: list[PeerControlEvent] = field(default_factory=list)
     messages_received: int = 0
     bytes_received: int = 0
+    bitfield_received: bool = False
     non_empty_bitfield: bool = False
     have_announced: bool = False
     unchoked: bool = False
     peer_choking: bool = True
     unchoked_since: float | None = None
     completed_unchoked_seconds: float = 0.0
+    latest_event: PeerControlEvent | None = None
+    piece_availability_event: PeerControlEvent | None = None
+    active_unchoke_event: PeerControlEvent | None = None
+    offer_proof_events: tuple[PeerControlEvent, PeerControlEvent] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,19 +176,66 @@ def _record_event(
     set_bits: int | None = None,
 ) -> float:
     observed_monotonic = time.monotonic()
-    state.events.append(
-        PeerControlEvent(
-            observed_at_utc=_utc_now_text(),
-            elapsed_seconds=_elapsed_seconds(state.started_monotonic, observed_monotonic),
-            kind=kind,
-            payload_length=payload_length,
-            piece_index=piece_index,
-            non_empty=non_empty,
-            payload_sha256=payload_sha256,
-            set_bits=set_bits,
-        )
+    event = PeerControlEvent(
+        observed_at_utc=_utc_now_text(),
+        elapsed_seconds=_elapsed_seconds(state.started_monotonic, observed_monotonic),
+        kind=kind,
+        payload_length=payload_length,
+        piece_index=piece_index,
+        non_empty=non_empty,
+        payload_sha256=payload_sha256,
+        set_bits=set_bits,
     )
+    state.latest_event = event
+    if len(state.events) < MAX_CONTROL_EVENTS:
+        state.events.append(event)
     return observed_monotonic
+
+
+def _capture_offer_proof(
+    state: _ObservationState,
+    newly_observed: PeerControlEvent,
+) -> None:
+    """Bewahrt zwei Ereignisse, die gleichzeitiges Angebot sicher belegen."""
+
+    if (
+        state.offer_proof_events is not None
+        or state.peer_choking
+        or state.piece_availability_event is None
+        or state.active_unchoke_event is None
+    ):
+        return
+    if newly_observed.kind == "unchoke":
+        state.offer_proof_events = (
+            state.piece_availability_event,
+            state.active_unchoke_event,
+        )
+    elif newly_observed.kind == "have" or (
+        newly_observed.kind == "bitfield" and newly_observed.non_empty
+    ):
+        state.offer_proof_events = (
+            state.active_unchoke_event,
+            newly_observed,
+        )
+
+
+def _bounded_control_events(state: _ObservationState) -> tuple[PeerControlEvent, ...]:
+    """Fügt einen späten Angebotsnachweis in den begrenzten Ereignisspeicher ein."""
+
+    events = list(state.events)
+    proof_events = state.offer_proof_events or ()
+    for proof_event in proof_events:
+        if any(event is proof_event for event in events):
+            continue
+        while len(events) >= MAX_CONTROL_EVENTS:
+            for index in range(len(events) - 1, -1, -1):
+                if all(events[index] is not event for event in proof_events):
+                    del events[index]
+                    break
+            else:
+                raise AssertionError("Angebotsnachweis überschreitet den Ereignisspeicher.")
+        events.append(proof_event)
+    return tuple(events)
 
 
 async def _receive_exact(
@@ -317,7 +378,7 @@ def _availability_result(
         piece_payload_bytes_received=0,
         metadata_requests_sent=0,
         termination_reason=termination_reason,
-        control_events=tuple(state.events),
+        control_events=_bounded_control_events(state),
         error=error,
     )
 
@@ -337,18 +398,6 @@ async def _observe_control_messages(
     deadline = started_monotonic + observation_seconds
 
     while True:
-        if len(state.events) >= MAX_CONTROL_EVENTS:
-            error = PeerProtocolError(
-                f"Kontrollereignis-Limit von {MAX_CONTROL_EVENTS} wurde erreicht."
-            )
-            return _availability_result(
-                state,
-                requested_duration_seconds=observation_seconds,
-                interested_sent=True,
-                termination_reason="control_event_limit",
-                completed_full_window=False,
-                error=_safe_error(error),
-            )
         if MAX_OBSERVATION_BYTES - state.bytes_received < 4:
             error = PeerProtocolError(
                 f"Beobachtungs-Limit von {MAX_OBSERVATION_BYTES} Byte wurde erreicht."
@@ -401,6 +450,18 @@ async def _observe_control_messages(
 
         message_length = int.from_bytes(length_prefix, "big")
         state.messages_received += 1
+        if state.messages_received > MAX_OBSERVATION_MESSAGES:
+            error = PeerProtocolError(
+                f"Beobachtungs-Limit von {MAX_OBSERVATION_MESSAGES} Nachrichten wurde erreicht."
+            )
+            return _availability_result(
+                state,
+                requested_duration_seconds=observation_seconds,
+                interested_sent=True,
+                termination_reason="message_limit",
+                completed_full_window=False,
+                error=_safe_error(error),
+            )
         if message_length == 0:
             _record_event(state, "keepalive", payload_length=0)
             continue
@@ -461,11 +522,16 @@ async def _observe_control_messages(
                     MESSAGE_NOT_INTERESTED: "peer_not_interested",
                 }[message_id]
                 event_monotonic = _record_event(state, event_kind, payload_length=0)
+                event = state.latest_event
+                if event is None:
+                    raise AssertionError("Kontrollereignis wurde nicht erzeugt.")
                 if message_id == MESSAGE_UNCHOKE:
                     state.unchoked = True
                     if state.peer_choking:
                         state.peer_choking = False
                         state.unchoked_since = event_monotonic
+                        state.active_unchoke_event = event
+                        _capture_offer_proof(state, event)
                 elif message_id == MESSAGE_CHOKE and not state.peer_choking:
                     if state.unchoked_since is not None:
                         state.completed_unchoked_seconds += max(
@@ -473,6 +539,7 @@ async def _observe_control_messages(
                         )
                     state.peer_choking = True
                     state.unchoked_since = None
+                    state.active_unchoke_event = None
                 continue
 
             if message_id == MESSAGE_HAVE:
@@ -496,11 +563,20 @@ async def _observe_control_messages(
                     payload_length=4,
                     piece_index=piece_index,
                 )
+                event = state.latest_event
+                if event is None:
+                    raise AssertionError("HAVE-Ereignis wurde nicht erzeugt.")
+                if state.piece_availability_event is None:
+                    state.piece_availability_event = event
+                _capture_offer_proof(state, event)
                 continue
 
             if message_id == MESSAGE_BITFIELD:
                 if not 1 <= payload_length <= MAX_BITFIELD_BYTES:
                     raise PeerProtocolError("BITFIELD-Nachricht hat eine ungültige Länge.")
+                if state.bitfield_received:
+                    raise PeerProtocolError("Peer hat mehr als eine BITFIELD-Nachricht gesendet.")
+                state.bitfield_received = True
                 payload_sha256, set_bits = await _read_bitfield(
                     loop,
                     peer_socket,
@@ -519,6 +595,15 @@ async def _observe_control_messages(
                     payload_sha256=payload_sha256,
                     set_bits=set_bits,
                 )
+                event = state.latest_event
+                if event is None:
+                    raise AssertionError("BITFIELD-Ereignis wurde nicht erzeugt.")
+                if non_empty:
+                    if state.piece_availability_event is None:
+                        state.piece_availability_event = event
+                    _capture_offer_proof(state, event)
+                else:
+                    state.piece_availability_event = None
                 continue
 
             if message_id == MESSAGE_PORT:
@@ -545,6 +630,8 @@ async def _observe_control_messages(
                 # Ohne ausgehandeltes BEP 6 sind dies keine Stücknachweise.
                 event_kind = "have_all" if message_id == MESSAGE_HAVE_ALL else "have_none"
                 _record_event(state, event_kind, payload_length=0)
+                if message_id == MESSAGE_HAVE_NONE:
+                    state.piece_availability_event = None
                 continue
 
             if message_id in {MESSAGE_SUGGEST_PIECE, MESSAGE_ALLOWED_FAST}:

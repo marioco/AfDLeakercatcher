@@ -162,6 +162,118 @@ def test_journal_and_atomic_files_use_private_permissions(tmp_path: Path) -> Non
     assert stat.S_IMODE(cache_path.stat().st_mode) == 0o600
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Symlink-Rechte unterscheiden sich unter Windows")
+@pytest.mark.parametrize("link_kind", ("journal", "lock", "pending"))
+def test_journal_sidecar_symlinks_are_rejected_without_touching_target(
+    tmp_path: Path,
+    link_kind: str,
+) -> None:
+    journal_path = tmp_path / "evidence.jsonl"
+    journal = EvidenceJournal(journal_path)
+    if link_kind != "journal":
+        journal.append(
+            {"kind": "existing"},
+            recorded_at_utc="2026-10-20T10:00:00Z",
+        )
+
+    if link_kind == "journal":
+        link_path = journal_path
+    elif link_kind == "lock":
+        link_path = tmp_path / ".evidence.jsonl.lock"
+        link_path.unlink()
+    else:
+        link_path = tmp_path / ".evidence.jsonl.pending"
+
+    target = tmp_path / f"preserved-{link_kind}.bin"
+    target.write_bytes(b"unveraendert")
+    target.chmod(0o644)
+    link_path.symlink_to(target)
+    original_mode = stat.S_IMODE(target.stat().st_mode)
+
+    verification = EvidenceJournal(journal_path).verify()
+
+    assert verification.valid is False
+    assert target.read_bytes() == b"unveraendert"
+    assert stat.S_IMODE(target.stat().st_mode) == original_mode
+    with pytest.raises(EvidenceJournalError):
+        EvidenceJournal(journal_path).append({"kind": "blocked"})
+    assert target.read_bytes() == b"unveraendert"
+    assert stat.S_IMODE(target.stat().st_mode) == original_mode
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Symlink-Rechte unterscheiden sich unter Windows")
+def test_dangling_pending_symlink_is_not_treated_as_absent(tmp_path: Path) -> None:
+    journal_path = tmp_path / "evidence.jsonl"
+    pending_path = tmp_path / ".evidence.jsonl.pending"
+    missing_target = tmp_path / "missing-target"
+    pending_path.symlink_to(missing_target)
+
+    verification = EvidenceJournal(journal_path).verify()
+
+    assert verification.valid is False
+    assert "symbolischer Link" in (verification.error or "")
+    with pytest.raises(EvidenceJournalError, match="symbolischer Link"):
+        EvidenceJournal(journal_path).append({"kind": "blocked"})
+    assert not missing_target.exists()
+
+
+def test_pending_payload_length_is_bounded_before_read(tmp_path: Path) -> None:
+    journal_path = tmp_path / "evidence.jsonl"
+    pending_path = tmp_path / ".evidence.jsonl.pending"
+    header = {
+        "transaction_format_version": 1,
+        "base_size": 0,
+        "base_entries_count": 0,
+        "base_last_event_sha256": "0" * 64,
+        "final_entries_count": 1,
+        "final_event_sha256": "1" * 64,
+        "payload_length": 2**100,
+        "payload_sha256": "2" * 64,
+    }
+    pending_path.write_bytes(canonical_json_bytes(header) + b"\nx")
+
+    with pytest.raises(EvidenceJournalError, match="Nutzlastlimit"):
+        list(EvidenceJournal(journal_path).iter_verified_batches())
+
+
+def test_pending_payload_length_must_match_actual_remaining_size(tmp_path: Path) -> None:
+    journal_path = tmp_path / "evidence.jsonl"
+    pending_path = tmp_path / ".evidence.jsonl.pending"
+    header = {
+        "transaction_format_version": 1,
+        "base_size": 0,
+        "base_entries_count": 0,
+        "base_last_event_sha256": "0" * 64,
+        "final_entries_count": 1,
+        "final_event_sha256": "1" * 64,
+        "payload_length": 1,
+        "payload_sha256": "2" * 64,
+    }
+    pending_path.write_bytes(canonical_json_bytes(header) + b"\nxy")
+
+    with pytest.raises(EvidenceJournalError, match="Zusatzdaten"):
+        list(EvidenceJournal(journal_path).iter_verified_batches())
+
+
+def test_recursive_pending_header_is_reported_as_journal_error(tmp_path: Path) -> None:
+    journal_path = tmp_path / "evidence.jsonl"
+    pending_path = tmp_path / ".evidence.jsonl.pending"
+    recursive_value = "[" * 1_100 + "0" + "]" * 1_100
+    recursive_header = (
+        '{"base_entries_count":0,"base_last_event_sha256":"'
+        + "0" * 64
+        + '","base_size":0,"final_entries_count":1,"final_event_sha256":"'
+        + "1" * 64
+        + '","payload_length":1,"payload_sha256":'
+        + recursive_value
+        + ',"transaction_format_version":1}\n'
+    )
+    pending_path.write_bytes(recursive_header.encode("ascii"))
+
+    with pytest.raises(EvidenceJournalError, match="JSON-Kopf"):
+        list(EvidenceJournal(journal_path).iter_verified_batches())
+
+
 def test_append_has_no_total_event_count_or_journal_size_cap(tmp_path: Path) -> None:
     path = tmp_path / "evidence.jsonl"
     journal = EvidenceJournal(path)

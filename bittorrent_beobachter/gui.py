@@ -27,7 +27,7 @@ from tkinter import (
     simpledialog,
     ttk,
 )
-from typing import Any
+from typing import Any, Literal
 
 from . import APP_NAME, VERSION
 from .config import (
@@ -53,6 +53,36 @@ DESIRED_MIN_WINDOW_HEIGHT = 600
 MAX_SCREEN_MARGIN_X = 40
 MAX_SCREEN_MARGIN_Y = 80
 MIN_TEXT_WRAP_LENGTH = 260
+DESIRED_SETTINGS_DIALOG_WIDTH = 540
+DESIRED_SETTINGS_DIALOG_HEIGHT = 330
+DESIRED_MIN_SETTINGS_DIALOG_WIDTH = 320
+DESIRED_MIN_SETTINGS_DIALOG_HEIGHT = 240
+
+CYBER_COLORS = {
+    "background": "#07111F",
+    "surface": "#0B1728",
+    "surface_raised": "#10243A",
+    "surface_active": "#12324A",
+    "positive_surface": "#0D2A2B",
+    "warning_surface": "#2D2511",
+    "text": "#F3F8FF",
+    "muted": "#A7B8CC",
+    "accent": "#19E6FF",
+    "accent_hover": "#7CF2FF",
+    "magenta": "#FF4FD8",
+    "success": "#45F0A1",
+    "warning": "#FFC857",
+    "danger": "#FF6B8A",
+    "border": "#36708F",
+}
+GUIStatusState = Literal["ready", "running", "success", "warning", "error"]
+STATUS_STYLE_BY_STATE: dict[GUIStatusState, str] = {
+    "ready": "Status.Ready.TLabel",
+    "running": "Status.Running.TLabel",
+    "success": "Status.Success.TLabel",
+    "warning": "Status.Warning.TLabel",
+    "error": "Status.Error.TLabel",
+}
 
 
 def _fit_window_to_screen(
@@ -89,13 +119,291 @@ def _configure_window_geometry(root: Tk) -> None:
     root.minsize(minimum_width, minimum_height)
 
 
+def _configure_cyberpunk_theme(root: Tk) -> ttk.Style:
+    """Konfiguriert ein kontrastreiches, plattformunabhängiges Dark-Theme."""
+
+    colors = CYBER_COLORS
+    root.configure(background=colors["background"])
+    root.option_add("*selectBackground", colors["accent"])
+    root.option_add("*selectForeground", colors["background"])
+    root.option_add("*insertBackground", colors["accent"])
+
+    style = ttk.Style(root)
+    if "clam" in style.theme_names():
+        # Clam respektiert Farbangaben auch unter Windows; native Themes tun das
+        # für einzelne Widgets nicht zuverlässig.
+        style.theme_use("clam")
+
+    style.configure(".", background=colors["background"], foreground=colors["text"])
+    style.configure("TFrame", background=colors["background"])
+    style.configure("Panel.TFrame", background=colors["surface"])
+    style.configure("Hero.TFrame", background=colors["surface_raised"])
+    style.configure("StatusPanel.TFrame", background=colors["surface"])
+
+    style.configure("TLabel", background=colors["background"], foreground=colors["text"])
+    style.configure(
+        "Hero.TLabel",
+        background=colors["surface_raised"],
+        foreground=colors["text"],
+        font=("TkDefaultFont", 20, "bold"),
+    )
+    style.configure(
+        "Kicker.TLabel",
+        background=colors["surface_raised"],
+        foreground=colors["magenta"],
+        font=("TkDefaultFont", 9, "bold"),
+    )
+    style.configure(
+        "HeroAccent.TLabel",
+        background=colors["surface_raised"],
+        foreground=colors["accent"],
+    )
+    style.configure("Muted.TLabel", foreground=colors["muted"])
+    style.configure(
+        "Panel.TLabel",
+        background=colors["surface"],
+        foreground=colors["text"],
+    )
+    style.configure(
+        "Muted.Panel.TLabel",
+        background=colors["surface"],
+        foreground=colors["muted"],
+    )
+    style.configure(
+        "StatusCaption.TLabel",
+        background=colors["surface"],
+        foreground=colors["muted"],
+        font=("TkDefaultFont", 8, "bold"),
+    )
+    for state, foreground in (
+        ("Ready", colors["accent"]),
+        ("Running", colors["warning"]),
+        ("Success", colors["success"]),
+        ("Warning", colors["warning"]),
+        ("Error", colors["danger"]),
+    ):
+        style.configure(
+            f"Status.{state}.TLabel",
+            background=colors["surface"],
+            foreground=foreground,
+            font=("TkDefaultFont", 10, "bold"),
+        )
+
+    style.configure(
+        "TLabelframe",
+        background=colors["surface"],
+        bordercolor=colors["border"],
+        darkcolor=colors["border"],
+        lightcolor=colors["border"],
+        borderwidth=1,
+        relief="solid",
+    )
+    style.configure(
+        "TLabelframe.Label",
+        background=colors["surface"],
+        foreground=colors["accent"],
+        font=("TkDefaultFont", 10, "bold"),
+    )
+    style.configure("Notice.TLabelframe", bordercolor=colors["warning"])
+    style.configure(
+        "Notice.TLabelframe.Label",
+        background=colors["surface"],
+        foreground=colors["warning"],
+    )
+
+    style.configure(
+        "TButton",
+        background=colors["surface_raised"],
+        foreground=colors["text"],
+        bordercolor=colors["border"],
+        focuscolor=colors["accent"],
+        focusthickness=2,
+        padding=(12, 8),
+    )
+    style.map(
+        "TButton",
+        background=[("pressed", colors["surface_active"]), ("active", colors["surface_active"])],
+        foreground=[("disabled", colors["muted"]), ("!disabled", colors["text"])],
+        bordercolor=[("focus", colors["accent"]), ("!focus", colors["border"])],
+    )
+    style.configure(
+        "Accent.TButton",
+        background=colors["accent"],
+        foreground=colors["background"],
+        bordercolor=colors["accent"],
+    )
+    style.map(
+        "Accent.TButton",
+        background=[
+            ("disabled", colors["surface_raised"]),
+            ("pressed", colors["accent"]),
+            ("active", colors["accent_hover"]),
+        ],
+        foreground=[("disabled", colors["muted"]), ("!disabled", colors["background"])],
+        bordercolor=[("disabled", colors["border"]), ("focus", colors["accent"])],
+    )
+    style.configure(
+        "Danger.TButton",
+        background=colors["magenta"],
+        foreground=colors["background"],
+        bordercolor=colors["magenta"],
+    )
+    style.map(
+        "Danger.TButton",
+        background=[
+            ("disabled", colors["surface_raised"]),
+            ("pressed", colors["danger"]),
+            ("active", colors["danger"]),
+        ],
+        foreground=[("disabled", colors["muted"]), ("!disabled", colors["background"])],
+        bordercolor=[("disabled", colors["border"]), ("focus", colors["magenta"])],
+    )
+
+    style.configure(
+        "TCheckbutton",
+        background=colors["surface"],
+        foreground=colors["text"],
+        focuscolor=colors["accent"],
+        padding=(2, 3),
+    )
+    style.map(
+        "TCheckbutton",
+        background=[("active", colors["surface"]), ("!active", colors["surface"])],
+        foreground=[("disabled", colors["muted"]), ("!disabled", colors["text"])],
+        indicatorcolor=[
+            ("selected", colors["accent"]),
+            ("!selected", colors["surface_raised"]),
+        ],
+    )
+    style.configure(
+        "TEntry",
+        fieldbackground=colors["surface_raised"],
+        foreground=colors["text"],
+        insertcolor=colors["accent"],
+        bordercolor=colors["border"],
+        lightcolor=colors["border"],
+        darkcolor=colors["border"],
+        padding=7,
+    )
+    style.map(
+        "TEntry",
+        fieldbackground=[
+            ("disabled", colors["surface"]),
+            ("readonly", colors["surface"]),
+        ],
+        foreground=[("disabled", colors["muted"]), ("readonly", colors["text"])],
+        bordercolor=[("focus", colors["accent"]), ("!focus", colors["border"])],
+        lightcolor=[("focus", colors["accent"]), ("!focus", colors["border"])],
+        darkcolor=[("focus", colors["accent"]), ("!focus", colors["border"])],
+    )
+
+    style.configure(
+        "Treeview",
+        background=colors["surface"],
+        fieldbackground=colors["surface"],
+        foreground=colors["text"],
+        bordercolor=colors["border"],
+        lightcolor=colors["border"],
+        darkcolor=colors["border"],
+        rowheight=28,
+    )
+    style.map(
+        "Treeview",
+        background=[("selected", colors["accent"])],
+        foreground=[("selected", colors["background"])],
+    )
+    style.configure(
+        "Treeview.Heading",
+        background=colors["surface_raised"],
+        foreground=colors["accent"],
+        bordercolor=colors["border"],
+        lightcolor=colors["border"],
+        darkcolor=colors["border"],
+        relief="flat",
+        padding=(8, 7),
+        font=("TkDefaultFont", 9, "bold"),
+    )
+    style.map(
+        "Treeview.Heading",
+        background=[("active", colors["surface_active"])],
+        foreground=[("active", colors["accent_hover"])],
+    )
+    style.configure(
+        "Vertical.TScrollbar",
+        background=colors["surface_raised"],
+        troughcolor=colors["background"],
+        bordercolor=colors["background"],
+        arrowcolor=colors["accent"],
+    )
+    style.configure(
+        "Horizontal.TScrollbar",
+        background=colors["surface_raised"],
+        troughcolor=colors["background"],
+        bordercolor=colors["background"],
+        arrowcolor=colors["accent"],
+    )
+    style.configure(
+        "Cyber.Horizontal.TProgressbar",
+        background=colors["accent"],
+        troughcolor=colors["surface_raised"],
+        bordercolor=colors["border"],
+        lightcolor=colors["accent"],
+        darkcolor=colors["accent"],
+    )
+    style.configure("TSeparator", background=colors["border"])
+    return style
+
+
+def _fit_settings_dialog_to_screen(
+    screen_width: int,
+    screen_height: int,
+    requested_width: int,
+    requested_height: int,
+) -> tuple[int, int, int, int]:
+    """Begrenzt den Einstellungsdialog auf die nutzbare Bildschirmfläche."""
+
+    dimensions = (screen_width, screen_height, requested_width, requested_height)
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in dimensions
+    ):
+        raise ValueError("Bildschirm- und Dialogabmessungen müssen positive Ganzzahlen sein.")
+    horizontal_margin = min(MAX_SCREEN_MARGIN_X, screen_width // 20)
+    vertical_margin = min(MAX_SCREEN_MARGIN_Y, screen_height // 10)
+    available_width = max(1, screen_width - horizontal_margin)
+    available_height = max(1, screen_height - vertical_margin)
+    initial_width = min(
+        max(DESIRED_SETTINGS_DIALOG_WIDTH, requested_width),
+        available_width,
+    )
+    initial_height = min(
+        max(DESIRED_SETTINGS_DIALOG_HEIGHT, requested_height),
+        available_height,
+    )
+    minimum_width = min(DESIRED_MIN_SETTINGS_DIALOG_WIDTH, initial_width)
+    minimum_height = min(DESIRED_MIN_SETTINGS_DIALOG_HEIGHT, initial_height)
+    return initial_width, initial_height, minimum_width, minimum_height
+
+
+def _configure_settings_dialog_geometry(dialog: Toplevel) -> None:
+    dialog.update_idletasks()
+    initial_width, initial_height, minimum_width, minimum_height = _fit_settings_dialog_to_screen(
+        dialog.winfo_screenwidth(),
+        dialog.winfo_screenheight(),
+        dialog.winfo_reqwidth(),
+        dialog.winfo_reqheight(),
+    )
+    dialog.geometry(f"{initial_width}x{initial_height}")
+    dialog.minsize(minimum_width, minimum_height)
+
+
 class SettingsDialog(Toplevel):
     """Kleiner Dialog für optionale Absender- und Empfängerangaben."""
 
     def __init__(self, parent: Tk, settings: ReportingSettings) -> None:
         super().__init__(parent)
         self.title("Angaben für die Entwürfe")
-        self.resizable(False, False)
+        self.configure(background=CYBER_COLORS["background"])
+        self.resizable(True, True)
         self.transient(parent)
         self.grab_set()
         self.result: ReportingSettings | None = None
@@ -105,33 +413,71 @@ class SettingsDialog(Toplevel):
         self.email = StringVar(value=settings.reporter_email)
         self.recipient = StringVar(value=settings.police_recipient)
 
-        frame = ttk.Frame(self, padding=16)
-        frame.pack(fill=BOTH, expand=True)
+        viewport = ttk.Frame(self)
+        viewport.pack(fill=BOTH, expand=True)
+        canvas = Canvas(
+            viewport,
+            background=CYBER_COLORS["background"],
+            highlightthickness=0,
+        )
+        scrollbar = ttk.Scrollbar(viewport, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=RIGHT, fill="y")
+        canvas.pack(side=LEFT, fill=BOTH, expand=True)
+
+        frame = ttk.Frame(canvas, padding=16, style="Panel.TFrame")
+        content_window = canvas.create_window((0, 0), window=frame, anchor="nw")
+        frame.columnconfigure(0, weight=1)
         fields = (
             ("Name der meldenden Person/Organisation", self.name),
             ("Absender-E-Mail (optional)", self.email),
             ("Empfänger-E-Mail der Polizei (optional)", self.recipient),
         )
+        field_labels: list[Any] = []
         for row, (label, variable) in enumerate(fields):
-            ttk.Label(frame, text=label).grid(row=row * 2, column=0, sticky="w", pady=(0, 3))
-            ttk.Entry(frame, textvariable=variable, width=60).grid(
+            field_label = ttk.Label(frame, text=label, style="Panel.TLabel")
+            field_label.grid(row=row * 2, column=0, sticky="w", pady=(0, 3))
+            field_labels.append(field_label)
+            ttk.Entry(frame, textvariable=variable).grid(
                 row=row * 2 + 1, column=0, sticky="ew", pady=(0, 10)
             )
 
-        ttk.Label(
+        note_label = ttk.Label(
             frame,
             text=(
                 "Die Anwendung versendet nichts. Leere Empfängerfelder können später "
                 "im E-Mail-Programm ergänzt werden."
             ),
+            style="Muted.Panel.TLabel",
             wraplength=480,
-        ).grid(row=6, column=0, sticky="w", pady=(2, 12))
-        buttons = ttk.Frame(frame)
+        )
+        note_label.grid(row=6, column=0, sticky="w", pady=(2, 12))
+        buttons = ttk.Frame(frame, style="Panel.TFrame")
         buttons.grid(row=7, column=0, sticky="e")
         ttk.Button(buttons, text="Abbrechen", command=self.destroy).pack(side=LEFT, padx=(0, 8))
-        ttk.Button(buttons, text="Speichern", command=self._save).pack(side=RIGHT)
+        ttk.Button(
+            buttons,
+            text="Speichern",
+            command=self._save,
+            style="Accent.TButton",
+        ).pack(side=RIGHT)
+
+        def update_scroll_region(_event: object) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def resize_content(event: Any) -> None:
+            content_width = max(1, event.width)
+            canvas.itemconfigure(content_window, width=content_width)
+            wrap_length = max(120, content_width - 32)
+            note_label.configure(wraplength=wrap_length)
+            for field_label in field_labels:
+                field_label.configure(wraplength=wrap_length)
+
+        frame.bind("<Configure>", update_scroll_region)
+        canvas.bind("<Configure>", resize_content)
         self.bind("<Escape>", lambda _event: self.destroy())
         self.protocol("WM_DELETE_WINDOW", self.destroy)
+        _configure_settings_dialog_geometry(self)
         self.wait_visibility()
         self.focus_set()
 
@@ -208,10 +554,11 @@ class ObserverApp:
         self.close_requested = False
         self.latest_output_dir: Path | None = None
         self._run_output_dir: Path | None = None
-        self.config = self._load_initial_config()
 
         root.title(f"{APP_NAME} {VERSION}")
+        _configure_cyberpunk_theme(root)
         _configure_window_geometry(root)
+        self.config = self._load_initial_config()
         self._build_ui()
         self._refresh_targets()
         self.root.protocol("WM_DELETE_WINDOW", self._request_close)
@@ -272,7 +619,7 @@ class ObserverApp:
         viewport.pack(fill=BOTH, expand=True)
         canvas = Canvas(
             viewport,
-            background=self.root.cget("background"),
+            background=CYBER_COLORS["background"],
             highlightthickness=0,
         )
         main_scrollbar = ttk.Scrollbar(viewport, orient="vertical", command=canvas.yview)
@@ -301,20 +648,32 @@ class ObserverApp:
         outer.bind("<Configure>", update_scroll_region)
         canvas.bind("<Configure>", resize_content)
 
-        ttk.Label(outer, text=APP_NAME, font=("TkDefaultFont", 18, "bold")).pack(anchor="w")
+        hero = ttk.Frame(outer, style="Hero.TFrame", padding=(18, 14))
+        hero.pack(fill=X, pady=(0, 12))
+        ttk.Label(
+            hero,
+            text=f"NETWORK EVIDENCE CONSOLE  //  v{VERSION}",
+            style="Kicker.TLabel",
+        ).pack(anchor="w")
+        ttk.Label(hero, text=APP_NAME, style="Hero.TLabel").pack(anchor="w", pady=(2, 2))
         remember_label(
             ttk.Label(
-                outer,
+                hero,
                 text=(
-                    "Inhaltsfreie Verfügbarkeitsprüfung: Es werden keine Datei- oder "
-                    "Metadatenblöcke angefordert, heruntergeladen oder hochgeladen."
+                    "Inhaltsfreie Verfügbarkeitsprüfung // Keine Datei- oder "
+                    "Metadatenblöcke werden angefordert, heruntergeladen oder hochgeladen."
                 ),
-                foreground="#205493",
+                style="HeroAccent.TLabel",
                 wraplength=950,
             )
-        ).pack(anchor="w", fill=X, pady=(4, 12))
+        ).pack(anchor="w", fill=X)
 
-        notice = ttk.LabelFrame(outer, text="Wichtige Aussagegrenze", padding=10)
+        notice = ttk.LabelFrame(
+            outer,
+            text="WICHTIGE AUSSAGEGRENZE",
+            padding=12,
+            style="Notice.TLabelframe",
+        )
         notice.pack(fill=X, pady=(0, 12))
         remember_label(
             ttk.Label(
@@ -326,11 +685,16 @@ class ObserverApp:
                     "Der Befund identifiziert keine Person und beweist keinen tatsächlichen "
                     "Upload oder eine Straftat. Jede Anzeige muss vor dem Versand geprüft werden."
                 ),
+                style="Panel.TLabel",
                 wraplength=930,
             )
         ).pack(anchor="w", fill=X)
 
-        target_box = ttk.LabelFrame(outer, text="Ziele für manuelle Prüfläufe", padding=10)
+        target_box = ttk.LabelFrame(
+            outer,
+            text="ZIELE FÜR MANUELLE PRÜFLÄUFE",
+            padding=12,
+        )
         target_box.pack(fill=X, pady=(0, 12))
         remember_label(
             ttk.Label(
@@ -339,12 +703,15 @@ class ObserverApp:
                     "Die beiden Voreinstellungen bestätigen keinen Inhalt. Ein Prüflauf "
                     "beginnt erst nach „Jetzt prüfen“ und Ihrer ausdrücklichen Bestätigung."
                 ),
-                foreground="#555555",
+                style="Muted.Panel.TLabel",
                 wraplength=930,
             )
         ).pack(anchor="w", fill=X, pady=(0, 8))
+        target_table = ttk.Frame(target_box, style="Panel.TFrame")
+        target_table.pack(fill=X, expand=True)
+        target_table.columnconfigure(0, weight=1)
         self.target_tree = ttk.Treeview(
-            target_box,
+            target_table,
             columns=("label", "hash"),
             show="headings",
             height=4,
@@ -352,30 +719,41 @@ class ObserverApp:
         )
         self.target_tree.heading("label", text="Bezeichnung")
         self.target_tree.heading("hash", text="Infohash")
-        self.target_tree.column("label", width=340, anchor="w")
-        self.target_tree.column("hash", width=430, anchor="w")
-        target_buttons = ttk.Frame(target_box)
-        target_buttons.pack(side=RIGHT, padx=(10, 0), anchor="n")
-        self.target_tree.pack(side=LEFT, fill=X, expand=True)
+        self.target_tree.column("label", width=300, minwidth=150, anchor="w", stretch=True)
+        self.target_tree.column("hash", width=430, minwidth=280, anchor="w", stretch=True)
+        target_scrollbar = ttk.Scrollbar(
+            target_table,
+            orient="horizontal",
+            command=self.target_tree.xview,
+        )
+        self.target_tree.configure(xscrollcommand=target_scrollbar.set)
+        self.target_tree.grid(row=0, column=0, sticky="nsew")
+        target_scrollbar.grid(row=1, column=0, sticky="ew")
+        target_buttons = ttk.Frame(target_box, style="Panel.TFrame")
+        target_buttons.pack(fill=X, pady=(10, 0))
         self.add_target_button = ttk.Button(
             target_buttons,
             text="Magnet-Link hinzufügen",
             command=self._add_target,
         )
-        self.add_target_button.pack(fill=X, pady=(0, 6))
+        self.add_target_button.pack(side=LEFT, padx=(0, 8))
         self.remove_target_button = ttk.Button(
             target_buttons,
             text="Auswahl entfernen",
             command=self._remove_target,
         )
-        self.remove_target_button.pack(fill=X, pady=(0, 6))
+        self.remove_target_button.pack(side=LEFT, padx=(0, 8))
         self.settings_button = ttk.Button(
             target_buttons,
             text="Entwurfsangaben",
             command=self._edit_settings,
         )
-        self.settings_button.pack(fill=X)
-        privacy_box = ttk.LabelFrame(outer, text="Optionale öffentliche Netzauskunft", padding=10)
+        self.settings_button.pack(side=LEFT)
+        privacy_box = ttk.LabelFrame(
+            outer,
+            text="OPTIONALE ÖFFENTLICHE NETZAUSKUNFT",
+            padding=12,
+        )
         privacy_box.pack(fill=X, pady=(0, 12))
         self.enrichment_enabled = BooleanVar(value=self.config.enrichment.enabled)
         self.enrichment_checkbox = ttk.Checkbutton(
@@ -395,7 +773,7 @@ class ObserverApp:
                     "extern abgefragt. Regionalregister wie RIPE, ARIN, APNIC, LACNIC oder "
                     "AFRINIC können Anfragen protokollieren."
                 ),
-                foreground="#555555",
+                style="Muted.Panel.TLabel",
                 wraplength=930,
             )
         ).pack(anchor="w", fill=X, pady=(4, 0))
@@ -408,6 +786,7 @@ class ObserverApp:
             action_buttons,
             text="Jetzt prüfen",
             command=self._start_scan,
+            style="Accent.TButton",
         )
         self.scan_button.pack(side=LEFT)
         self.cancel_button = ttk.Button(
@@ -415,6 +794,7 @@ class ObserverApp:
             text="Prüflauf abbrechen",
             command=self._cancel_scan,
             state="disabled",
+            style="Danger.TButton",
         )
         self.cancel_button.pack(side=LEFT, padx=(8, 0))
         self.open_button = ttk.Button(
@@ -424,7 +804,12 @@ class ObserverApp:
             state="disabled",
         )
         self.open_button.pack(side=LEFT, padx=(8, 0))
-        self.progress = ttk.Progressbar(action_bar, mode="indeterminate", length=170)
+        self.progress = ttk.Progressbar(
+            action_bar,
+            mode="indeterminate",
+            length=210,
+            style="Cyber.Horizontal.TProgressbar",
+        )
         self.progress.pack(anchor="w", pady=(8, 0))
         self.config_controls = (
             self.add_target_button,
@@ -433,13 +818,32 @@ class ObserverApp:
             self.enrichment_checkbox,
         )
 
-        self.status_text = StringVar(value="Bereit. Fügen Sie einen Magnet-Link hinzu.")
-        remember_label(ttk.Label(outer, textvariable=self.status_text, wraplength=930)).pack(
-            anchor="w", fill=X, pady=(0, 8)
+        status_panel = ttk.Frame(
+            outer,
+            style="StatusPanel.TFrame",
+            padding=(12, 9),
         )
+        status_panel.pack(fill=X, pady=(0, 12))
+        ttk.Label(
+            status_panel,
+            text="SYSTEMSTATUS",
+            style="StatusCaption.TLabel",
+        ).pack(anchor="w")
+        self.status_text = StringVar(value="Bereit. Fügen Sie einen Magnet-Link hinzu.")
+        self.status_label = remember_label(
+            ttk.Label(
+                status_panel,
+                textvariable=self.status_text,
+                style=STATUS_STYLE_BY_STATE["ready"],
+                wraplength=930,
+            )
+        )
+        self.status_label.pack(anchor="w", fill=X, pady=(2, 0))
 
-        result_box = ttk.LabelFrame(outer, text="Letzter Prüflauf", padding=10)
+        result_box = ttk.LabelFrame(outer, text="LETZTER PRÜFLAUF", padding=12)
         result_box.pack(fill=BOTH, expand=True)
+        result_box.columnconfigure(0, weight=1)
+        result_box.rowconfigure(0, weight=1)
         self.result_tree = ttk.Treeview(
             result_box,
             columns=("time", "target", "endpoint", "status", "network", "class"),
@@ -464,19 +868,42 @@ class ObserverApp:
         for name, title in headings.items():
             self.result_tree.heading(name, text=title)
             self.result_tree.column(name, width=widths[name], anchor="w")
-        scrollbar = ttk.Scrollbar(result_box, orient="vertical", command=self.result_tree.yview)
-        self.result_tree.configure(yscrollcommand=scrollbar.set)
-        self.result_tree.pack(side=LEFT, fill=BOTH, expand=True)
-        scrollbar.pack(side=RIGHT, fill="y")
+        vertical_scrollbar = ttk.Scrollbar(
+            result_box,
+            orient="vertical",
+            command=self.result_tree.yview,
+        )
+        horizontal_scrollbar = ttk.Scrollbar(
+            result_box,
+            orient="horizontal",
+            command=self.result_tree.xview,
+        )
+        self.result_tree.configure(
+            yscrollcommand=vertical_scrollbar.set,
+            xscrollcommand=horizontal_scrollbar.set,
+        )
+        self.result_tree.tag_configure(
+            "availability",
+            background=CYBER_COLORS["positive_surface"],
+            foreground=CYBER_COLORS["accent"],
+        )
+        self.result_tree.tag_configure(
+            "known_vpn",
+            background=CYBER_COLORS["warning_surface"],
+            foreground=CYBER_COLORS["warning"],
+        )
+        self.result_tree.grid(row=0, column=0, sticky="nsew")
+        vertical_scrollbar.grid(row=0, column=1, sticky="ns")
+        horizontal_scrollbar.grid(row=1, column=0, sticky="ew")
 
         remember_label(
             ttk.Label(
                 outer,
                 text=(
                     "Keine automatische Anzeige · Kein automatischer E-Mail-Versand · "
-                    "Bekannte VPN-Endpunkte erscheinen nur in der gesonderten Liste"
+                    "Bekannte VPN-Endpunkte werden gekennzeichnet und gesondert berichtet"
                 ),
-                foreground="#555555",
+                style="Muted.TLabel",
             )
         ).pack(anchor="w", fill=X, pady=(10, 0))
         self.root.bind("<MouseWheel>", self._scroll_main_view, add="+")
@@ -500,6 +927,14 @@ class ObserverApp:
         self._content_canvas.yview_scroll(direction, "units")
         return "break"
 
+    def _set_status(self, message: str, *, state: GUIStatusState) -> None:
+        """Aktualisiert Statusinhalt und die dazugehörige, nicht allein farbliche Anzeige."""
+
+        self.status_text.set(message)
+        status_label = getattr(self, "status_label", None)
+        if status_label is not None:
+            status_label.configure(style=STATUS_STYLE_BY_STATE[state])
+
     def _refresh_targets(self) -> None:
         self.target_tree.delete(*self.target_tree.get_children())
         for index, target in enumerate(self.config.targets):
@@ -507,11 +942,15 @@ class ObserverApp:
                 "", END, iid=str(index), values=(target.label, target.info_hash_hex)
             )
         if self.config.targets:
-            self.status_text.set(
-                f"Bereit. {len(self.config.targets)} Ziel(e) konfiguriert; es läuft kein Prüflauf."
+            self._set_status(
+                f"Bereit. {len(self.config.targets)} Ziel(e) konfiguriert; es läuft kein Prüflauf.",
+                state="ready",
             )
         else:
-            self.status_text.set("Bereit. Keine Ziele eingetragen; es läuft kein Prüflauf.")
+            self._set_status(
+                "Bereit. Keine Ziele eingetragen; es läuft kein Prüflauf.",
+                state="ready",
+            )
 
     def _add_target(self) -> None:
         magnet = simpledialog.askstring(
@@ -659,7 +1098,7 @@ class ObserverApp:
         self.progress.start(10)
         self.result_tree.delete(*self.result_tree.get_children())
         self._discard_pending_progress()
-        self.status_text.set("Prüflauf wird vorbereitet …")
+        self._set_status("Prüflauf wird vorbereitet …", state="running")
         self.scan_thread = threading.Thread(
             target=self._scan_worker,
             args=(config_snapshot,),
@@ -716,13 +1155,15 @@ class ObserverApp:
                 if not self.close_requested:
                     messagebox.showerror("Prüflauf fehlgeschlagen", str(payload), parent=self.root)
                     if run_output_dir is not None and run_output_dir.is_dir():
-                        self.status_text.set(
+                        self._set_status(
                             "Der Prüflauf endete mit einem Fehler. Bereits gespeicherte "
-                            "Teilergebnisse sind im Ergebnisordner verwendbar."
+                            "Teilergebnisse sind im Ergebnisordner verwendbar.",
+                            state="error",
                         )
                     else:
-                        self.status_text.set(
-                            "Der Prüflauf ist fehlgeschlagen. Details stehen im Protokoll."
+                        self._set_status(
+                            "Der Prüflauf ist fehlgeschlagen. Details stehen im Protokoll.",
+                            state="error",
                         )
             elif event == "done":
                 terminal_event_seen = True
@@ -736,9 +1177,10 @@ class ObserverApp:
                 self._run_output_dir = self.latest_output_dir
                 self.open_button.configure(state="normal")
                 if not self.close_requested:
-                    self.status_text.set(
+                    self._set_status(
                         f"{result_count} positive Befund(e) sind bereits fertig gespeichert. "
-                        "Der Prüflauf sucht weiter."
+                        "Der Prüflauf sucht weiter.",
+                        state="running",
                     )
 
         try:
@@ -751,7 +1193,7 @@ class ObserverApp:
             and self.running
             and not self.close_requested
         ):
-            self.status_text.set(latest_progress)
+            self._set_status(latest_progress, state="running")
         if self.close_requested and not self.running:
             self.root.destroy()
             return
@@ -774,9 +1216,10 @@ class ObserverApp:
             return
         self.cancel_event.set()
         self.cancel_button.configure(state="disabled")
-        self.status_text.set(
+        self._set_status(
             "Prüflauf wird kontrolliert abgebrochen; gefundene Ergebnisse "
-            "werden fertig gespeichert."
+            "werden fertig gespeichert.",
+            state="warning",
         )
 
     def _request_close(self) -> None:
@@ -806,8 +1249,10 @@ class ObserverApp:
                 network = record.enrichment.holder or record.enrichment.rdap_name or "unbekannt"
                 if record.vpn.status == "known_vpn":
                     classification = f"VPN: {record.vpn.provider or 'bekannt'}"
+                    row_tag = "known_vpn"
                 else:
                     classification = "VPN unbekannt"
+                    row_tag = "availability"
                 endpoint = (
                     f"[{candidate.ip}]:{candidate.port}"
                     if ":" in candidate.ip
@@ -816,6 +1261,7 @@ class ObserverApp:
                 self.result_tree.insert(
                     "",
                     END,
+                    tags=(row_tag,),
                     values=(
                         handshake.completed_at_utc or handshake.attempted_at_utc,
                         candidate.target_label,
@@ -855,26 +1301,29 @@ class ObserverApp:
             display_suffix = " Die Ergebnistabelle enthält keine positiven Befunde."
         target_suffix = _target_status_text(result)
         if result.cancelled:
-            self.status_text.set(
+            self._set_status(
                 f"Kontrolliert abgebrochen: {result.total_candidate_count} Kandidaten gefunden, "
                 f"{result.total_handshake_count} direkt geprüft und {result.offering_count} "
                 "positive Befunde fertig gespeichert."
-                f"{display_suffix}{target_suffix}{notice_suffix}"
+                f"{display_suffix}{target_suffix}{notice_suffix}",
+                state="warning",
             )
         elif result.total_candidate_count == 0 and not result.errors:
-            self.status_text.set(
+            self._set_status(
                 "Fertig. Zurzeit wurden keine antwortenden Endpunkte gefunden. "
-                f"Das ist kein Programmfehler.{display_suffix}{target_suffix}{notice_suffix}"
+                f"Das ist kein Programmfehler.{display_suffix}{target_suffix}{notice_suffix}",
+                state="ready",
             )
         else:
-            self.status_text.set(
+            self._set_status(
                 f"Fertig: {result.total_candidate_count} Kandidaten gefunden, "
                 f"{result.total_handshake_count} direkt geprüft, "
                 f"{result.confirmed_count} bestätigte Handshakes, "
                 f"{result.offering_count} positive Verfügbarkeitsprüfungen, "
                 f"{result.known_vpn_count} bekannte VPN-Befunde. "
                 f"{len(result.errors)} Hinweis(e)/Fehler."
-                f"{display_suffix}{target_suffix}{notice_suffix}"
+                f"{display_suffix}{target_suffix}{notice_suffix}",
+                state="warning" if result.errors else "success",
             )
         if result.errors:
             messagebox.showwarning(

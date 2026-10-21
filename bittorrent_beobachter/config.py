@@ -21,6 +21,9 @@ from .models import Target
 
 MAX_CONFIG_BYTES = 256_000
 MAX_CONFIG_TARGETS = 20
+# Begrenzung ausschliesslich fuer externe Discovery-Quellen je Ziel. Sie
+# begrenzt weder gefundene Peer-Kandidaten noch deren direkte Pruefung.
+MAX_TRACKERS_PER_TARGET = 128
 BUNDLED_PRESET_REVISION = 4
 DEFAULT_BOOTSTRAP_NODES = (
     ("router.bittorrent.com", 6881),
@@ -177,7 +180,7 @@ def default_data_dir() -> Path:
     """Liefert einen beschreibbaren Laufzeitpfad passend zum Betriebssystem."""
     override = os.environ.get("BITTORRENT_BEOBACHTER_DATA_DIR")
     if override:
-        return Path(override).expanduser().resolve()
+        return Path(override).expanduser()
 
     if sys.platform == "win32":
         base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
@@ -193,7 +196,7 @@ def default_config_path(data_dir: Path | None = None) -> Path:
     """Liefert Override oder Konfigurationsdatei in der App-Ablage."""
     override = os.environ.get("BITTORRENT_BEOBACHTER_CONFIG")
     if override:
-        return Path(override).expanduser().resolve()
+        return Path(override).expanduser()
     return (data_dir or default_data_dir()) / "config.json"
 
 
@@ -266,6 +269,8 @@ def _validated_udp_tracker(value: Any, field: str) -> str:
 def _validated_tracker_tuple(value: Any, field: str) -> tuple[str, ...]:
     if not isinstance(value, (list, tuple)):
         raise ConfigError(f"{field} muss eine Liste sein.")
+    if len(value) > MAX_TRACKERS_PER_TARGET:
+        raise ConfigError(f"{field} darf höchstens {MAX_TRACKERS_PER_TARGET} Tracker enthalten.")
     trackers: list[str] = []
     seen: set[str] = set()
     for index, item in enumerate(value):
@@ -682,6 +687,8 @@ def save_config(path: Path, config: AppConfig) -> None:
     """Validiert und schreibt die Konfiguration atomar mit privaten Rechten."""
     validated_config = config_from_dict(config_to_dict(config))
     payload = json.dumps(config_to_dict(validated_config), ensure_ascii=False, indent=2) + "\n"
+    if len(payload.encode("utf-8")) > MAX_CONFIG_BYTES:
+        raise ConfigError(f"Konfiguration ist größer als {MAX_CONFIG_BYTES} Byte.")
 
     _create_private_directories(path.parent)
     temporary_root = path.parent

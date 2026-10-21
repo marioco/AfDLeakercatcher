@@ -25,6 +25,7 @@ from .config import (
     parse_magnet,
     save_config,
 )
+from .path_safety import is_link_like, path_has_link_like_component
 
 MAX_LOG_BYTES = 25_000
 LOG_BACKUPS = 1
@@ -59,6 +60,10 @@ def default_log_file(data_dir: Path) -> Path:
     return data_dir / "logs" / "monitor.log"
 
 
+def _path_has_symlink_component(path: Path) -> bool:
+    return path_has_link_like_component(path)
+
+
 def setup_logging(log_file: Path) -> logging.Logger:
     """Konfiguriert UTC-Ausgabe und die vorgeschriebene kleine Rotation."""
     logger = logging.getLogger("bittorrent_beobachter")
@@ -67,6 +72,10 @@ def setup_logging(log_file: Path) -> logging.Logger:
     if logger.handlers:
         return logger
 
+    if _path_has_symlink_component(log_file):
+        raise OSError(f"Protokollpfad darf keine Symlink-Komponente enthalten: {log_file}")
+    if log_file.exists() and not log_file.is_file():
+        raise OSError(f"Protokollpfad ist keine reguläre Datei: {log_file}")
     _create_private_directories(log_file.parent)
     formatter = logging.Formatter(LOG_FORMAT, datefmt="%Y-%m-%d %H:%M:%S")
     formatter.converter = time.gmtime
@@ -98,12 +107,19 @@ def _create_private_directories(directory: Path) -> None:
         if parent == current:
             break
         current = parent
+    if is_link_like(current):
+        raise OSError(f"Protokollverzeichnis darf kein Symlink sein: {current}")
+    if current.exists() and not current.is_dir():
+        raise OSError(f"Protokollpfad ist kein Verzeichnis: {current}")
     for path in reversed(missing):
+        created = True
         try:
             path.mkdir(mode=0o700)
         except FileExistsError:
-            continue
-        if os.name != "nt":
+            created = False
+        if is_link_like(path) or not path.is_dir():
+            raise OSError(f"Protokollverzeichnis ist unsicher: {path}")
+        if created and os.name != "nt":
             path.chmod(0o700)
 
 
@@ -218,9 +234,28 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
-    data_dir = (args.data_dir or default_data_dir()).expanduser().resolve()
-    config_path = (args.config or default_config_path(data_dir)).expanduser().resolve()
-    log_file = (args.log_file or default_log_file(data_dir)).expanduser().resolve()
+    requested_data_dir = (args.data_dir or default_data_dir()).expanduser()
+    if _path_has_symlink_component(requested_data_dir):
+        raise ConfigError(
+            f"Der Datenpfad darf keine Symlink-Komponente enthalten: {requested_data_dir}"
+        )
+    data_dir = requested_data_dir.resolve()
+    if data_dir.exists() and not data_dir.is_dir():
+        raise ConfigError(f"Der Datenpfad ist kein Verzeichnis: {data_dir}")
+
+    requested_config_path = (args.config or default_config_path(data_dir)).expanduser()
+    if _path_has_symlink_component(requested_config_path):
+        raise ConfigError(
+            f"Die Konfiguration darf keine Symlink-Komponente enthalten: {requested_config_path}"
+        )
+    config_path = requested_config_path.resolve()
+
+    requested_log_file = (args.log_file or default_log_file(data_dir)).expanduser()
+    if _path_has_symlink_component(requested_log_file):
+        raise ConfigError(
+            f"Die Protokolldatei darf keine Symlink-Komponente enthalten: {requested_log_file}"
+        )
+    log_file = requested_log_file.resolve()
     return data_dir, config_path, log_file
 
 
@@ -374,6 +409,8 @@ def _scan_once_with_signal_cancellation(
 
 
 def _watch(config_path: Path, data_dir: Path, logger: logging.Logger) -> int:
+    from .monitor import MonitorError
+
     stop_event = threading.Event()
 
     def request_stop(signum: int, _frame: object) -> None:
@@ -391,8 +428,10 @@ def _watch(config_path: Path, data_dir: Path, logger: logging.Logger) -> int:
                 logger,
                 cancel_event=stop_event,
             )
-        except (ConfigError, OSError):
-            logger.exception("Prüflauf konnte nicht gestartet werden")
+        except (ConfigError, MonitorError, OSError):
+            logger.exception(
+                "Prüflauf fehlgeschlagen; die Überwachung wird nach dem Intervall fortgesetzt"
+            )
             exit_code = 1
         if stop_event.is_set():
             break
@@ -415,6 +454,15 @@ def _verify_journal(data_dir: Path) -> int:
     from .evidence import EvidenceJournal
 
     journal_path = data_dir / "evidence" / "events.jsonl"
+    pending_path = journal_path.with_name(f".{journal_path.name}.pending")
+    if (
+        not journal_path.exists()
+        and not is_link_like(journal_path)
+        and not pending_path.exists()
+        and not is_link_like(pending_path)
+    ):
+        print(f"FEHLER: Kein Evidenzjournal vorhanden: {journal_path}")
+        return 1
     journal = EvidenceJournal(journal_path)
     result = journal.verify()
     if not result.valid:
@@ -432,7 +480,12 @@ def main(argv: list[str] | None = None) -> int:
         from .gui import verify_gui_runtime
 
         return verify_gui_runtime()
-    data_dir, config_path, log_file = _resolve_paths(args)
+    try:
+        data_dir, config_path, log_file = _resolve_paths(args)
+    except (ConfigError, OSError) as exc:
+        if sys.stderr is not None and callable(getattr(sys.stderr, "write", None)):
+            print(f"FEHLER: {exc}", file=sys.stderr)
+        return 2
     command = args.command or "gui"
     startup_warning: str | None = None
     try:

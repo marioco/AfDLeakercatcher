@@ -30,6 +30,7 @@ from typing import Any, TextIO
 
 from . import APP_NAME
 from .models import EvidenceRecord, PeerCandidate, ScanResult
+from .path_safety import path_has_link_like_component
 from .run_store import RunStore
 
 PROJECT_REPOSITORY_URL = "https://github.com/marioco/AfDLeakercatcher"
@@ -426,8 +427,17 @@ def generate_reports(
     generated_timestamp = _normalise_utc_timestamp(
         generated_at_utc or result.completed_at_utc or result.started_at_utc
     )
-    output_dir = Path(output_dir).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    requested_output_dir = Path(output_dir).expanduser().absolute()
+    if path_has_link_like_component(requested_output_dir):
+        raise ValueError(
+            f"Berichtsziel darf keine Symlink-Komponente enthalten: {requested_output_dir}"
+        )
+    requested_output_dir.mkdir(parents=True, exist_ok=True)
+    if path_has_link_like_component(requested_output_dir):
+        raise ValueError(
+            f"Berichtsziel darf keine Symlink-Komponente enthalten: {requested_output_dir}"
+        )
+    output_dir = requested_output_dir.resolve()
     if os.name != "nt":
         output_dir.chmod(0o700)
     if not output_dir.is_dir():

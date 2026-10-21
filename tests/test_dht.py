@@ -16,6 +16,7 @@ import bittorrent_beobachter.dht as dht_module
 from bittorrent_beobachter.bencode import bdecode, bencode
 from bittorrent_beobachter.dht import (
     DHT_K_CLOSEST_NODES,
+    DHT_MAX_ENDPOINTS_PER_NODE_ID,
     DHTConfig,
     DHTCrawler,
     DHTNode,
@@ -105,6 +106,7 @@ class DHTParsingTests(unittest.TestCase):
 
         self.assertEqual(response.source, ("1.1.1.1", 6881))
         self.assertEqual(response.transaction_id, b"aa")
+        self.assertEqual(response.responder_id, b"r" * 20)
         self.assertEqual(response.peers, (("8.8.4.4", 6881),))
         self.assertEqual(response.response_sha256, hashlib.sha256(packet).hexdigest())
         with self.assertRaises(DHTProtocolError):
@@ -200,6 +202,26 @@ class DHTCrawlerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(checked_paths[0].parent, root)
             self.assertEqual(tuple(root.iterdir()), ())
             self.assertFalse(crawler.has_pending_work)
+
+    async def test_bootstrap_endpoint_is_bound_to_its_answering_node_id(self) -> None:
+        bootstrap = ("8.8.8.8", 6881)
+        alternative = DHTNode(b"n" * 20, "1.1.1.1", 6881)
+        target_id = int.from_bytes(b"h" * 20, "big")
+        frontier = dht_module._DHTNodeFrontier()
+        try:
+            frontier.add_bootstrap_nodes((bootstrap,))
+            self.assertEqual(frontier.claim(1), (bootstrap,))
+            self.assertIsNone(frontier.claimed_node_id(bootstrap))
+
+            frontier.bind_node_id(bootstrap, alternative.node_id, target_id)
+            self.assertEqual(frontier.claimed_node_id(bootstrap), alternative.node_id)
+            frontier.mark_queried(bootstrap)
+            frontier.add_discovered_nodes((alternative,), target_id)
+
+            self.assertEqual(frontier.claim(1), ())
+            self.assertFalse(frontier.has_unfinished())
+        finally:
+            frontier.close()
 
     async def test_frontier_directory_must_exist(self) -> None:
         with self.assertRaisesRegex(ValueError, "vorhandenes Verzeichnis"):
@@ -297,6 +319,7 @@ class DHTCrawlerTests(unittest.IsolatedAsyncioTestCase):
                 return DHTResponse(
                     source=bootstrap,
                     transaction_id=transaction_id,
+                    responder_id=b"b" * 20,
                     nodes=(DHTNode(b"n" * 20, *second),),
                     peers=(("8.8.4.4", 51413),),
                     response_sha256="a" * 64,
@@ -304,6 +327,7 @@ class DHTCrawlerTests(unittest.IsolatedAsyncioTestCase):
             return DHTResponse(
                 source=second,
                 transaction_id=transaction_id,
+                responder_id=b"n" * 20,
                 nodes=(),
                 peers=(("2606:4700:4700::1111", 6881),),
                 response_sha256="b" * 64,
@@ -343,6 +367,11 @@ class DHTCrawlerTests(unittest.IsolatedAsyncioTestCase):
             return DHTResponse(
                 source=endpoint,
                 transaction_id=transaction_id,
+                responder_id=(
+                    b"b" * 20
+                    if endpoint == bootstrap
+                    else (endpoint[1] - 10_000).to_bytes(20, "big")
+                ),
                 nodes=nodes if endpoint == bootstrap else (),
                 peers=(),
                 response_sha256="c" * 64,
@@ -357,6 +386,150 @@ class DHTCrawlerTests(unittest.IsolatedAsyncioTestCase):
             {("1.1.1.1", 10_000 + index) for index in range(DHT_K_CLOSEST_NODES)},
         )
 
+    async def test_k_closest_counts_unique_node_ids_not_alternative_endpoints(self) -> None:
+        bootstrap = ("8.8.8.8", 6881)
+        repeated_id = (1).to_bytes(20, "big")
+        legitimate_id = (2).to_bytes(20, "big")
+        alternatives = tuple(("1.1.1.1", 12_000 + index) for index in range(8))
+        legitimate = ("8.8.4.4", 6881)
+        calls: list[tuple[str, int]] = []
+
+        async def query(
+            endpoint: tuple[str, int], _info_hash: bytes, transaction_id: bytes
+        ) -> DHTResponse:
+            calls.append(endpoint)
+            nodes: tuple[DHTNode, ...] = ()
+            responder_id = repeated_id
+            if endpoint == bootstrap:
+                nodes = (
+                    *(DHTNode(repeated_id, *alternative) for alternative in alternatives),
+                    DHTNode(legitimate_id, *legitimate),
+                )
+                responder_id = b"b" * 20
+            elif endpoint == legitimate:
+                responder_id = legitimate_id
+            return DHTResponse(
+                source=endpoint,
+                transaction_id=transaction_id,
+                nodes=nodes,
+                peers=(),
+                response_sha256="c" * 64,
+                responder_id=responder_id,
+            )
+
+        crawler = DHTCrawler(
+            [bootstrap],
+            config=DHTConfig(concurrency=DHT_K_CLOSEST_NODES),
+            query_hook=query,
+        )
+
+        self.assertEqual(await crawler.discover(Target("Test", bytes(20))), [])
+        self.assertEqual(set(calls), {bootstrap, alternatives[0], legitimate})
+        self.assertEqual(crawler.queries_completed, 3)
+
+    async def test_alternative_endpoint_is_queried_only_after_primary_failure(self) -> None:
+        bootstrap = ("8.8.8.8", 6881)
+        primary = ("1.1.1.1", 13_001)
+        alternative = ("1.1.1.1", 13_002)
+        shared_id = b"n" * 20
+        calls: list[tuple[str, int]] = []
+
+        async def query(
+            endpoint: tuple[str, int], _info_hash: bytes, transaction_id: bytes
+        ) -> DHTResponse:
+            calls.append(endpoint)
+            if endpoint == primary:
+                raise DHTQueryError("simulierter Ausfall")
+            return DHTResponse(
+                source=endpoint,
+                transaction_id=transaction_id,
+                nodes=(
+                    (DHTNode(shared_id, *primary), DHTNode(shared_id, *alternative))
+                    if endpoint == bootstrap
+                    else ()
+                ),
+                peers=(),
+                response_sha256="d" * 64,
+                responder_id=b"b" * 20 if endpoint == bootstrap else shared_id,
+            )
+
+        crawler = DHTCrawler(
+            [bootstrap],
+            config=DHTConfig(concurrency=1),
+            query_hook=query,
+        )
+
+        self.assertEqual(await crawler.discover(Target("Test", bytes(20))), [])
+        self.assertEqual(calls, [bootstrap, primary, alternative])
+        self.assertEqual(crawler.queries_completed, 2)
+        self.assertEqual(crawler.queries_failed, 1)
+
+    async def test_alternative_endpoint_chain_is_bounded_per_node_id(self) -> None:
+        shared_id = b"n" * 20
+        legitimate_id = b"l" * 20
+        alternatives = tuple(
+            DHTNode(shared_id, "1.1.1.1", 14_000 + index) for index in range(1_000)
+        )
+        legitimate = DHTNode(legitimate_id, "8.8.4.4", 6881)
+        frontier = dht_module._DHTNodeFrontier()
+
+        try:
+            frontier.add_discovered_nodes((*alternatives, legitimate), target_id=0)
+            first_claim = frontier.claim(DHT_K_CLOSEST_NODES)
+            self.assertIn(legitimate.endpoint, first_claim)
+            shared_claims = [
+                endpoint for endpoint in first_claim if endpoint != legitimate.endpoint
+            ]
+            self.assertEqual(len(shared_claims), 1)
+            frontier.mark_queried(legitimate.endpoint)
+
+            attempted_shared = list(shared_claims)
+            frontier.mark_failed(shared_claims[0])
+            while claim := frontier.claim(DHT_K_CLOSEST_NODES):
+                self.assertEqual(len(claim), 1)
+                attempted_shared.extend(claim)
+                frontier.mark_failed(claim[0])
+
+            self.assertEqual(len(attempted_shared), DHT_MAX_ENDPOINTS_PER_NODE_ID)
+            self.assertEqual(
+                attempted_shared,
+                [node.endpoint for node in alternatives[:DHT_MAX_ENDPOINTS_PER_NODE_ID]],
+            )
+            self.assertFalse(frontier.has_unfinished())
+        finally:
+            frontier.close()
+
+    async def test_response_from_wrong_node_id_is_rejected(self) -> None:
+        bootstrap = ("8.8.8.8", 6881)
+        discovered = ("1.1.1.1", 14_001)
+        expected_id = b"n" * 20
+        calls: list[tuple[str, int]] = []
+
+        async def query(
+            endpoint: tuple[str, int], _info_hash: bytes, transaction_id: bytes
+        ) -> DHTResponse:
+            calls.append(endpoint)
+            return DHTResponse(
+                source=endpoint,
+                transaction_id=transaction_id,
+                nodes=(DHTNode(expected_id, *discovered),) if endpoint == bootstrap else (),
+                peers=() if endpoint == bootstrap else (("8.8.4.4", 6881),),
+                response_sha256="e" * 64,
+                responder_id=b"b" * 20 if endpoint == bootstrap else b"x" * 20,
+            )
+
+        crawler = DHTCrawler(
+            [bootstrap],
+            config=DHTConfig(concurrency=1),
+            query_hook=query,
+        )
+
+        self.assertEqual(await crawler.discover(Target("Test", bytes(20))), [])
+        self.assertEqual(calls, [bootstrap, discovered])
+        self.assertEqual(crawler.queries_completed, 1)
+        self.assertEqual(crawler.queries_failed, 1)
+        self.assertEqual(crawler.issue_counts, {dht_module.DHT_ISSUE_PROTOCOL: 1})
+
     async def test_endlessly_farther_nodes_do_not_block_kademlia_convergence(self) -> None:
         bootstrap = ("8.8.8.8", 6881)
         calls: list[tuple[str, int]] = []
@@ -370,6 +543,7 @@ class DHTCrawlerTests(unittest.IsolatedAsyncioTestCase):
             return DHTResponse(
                 source=endpoint,
                 transaction_id=transaction_id,
+                responder_id=(b"b" * 20 if endpoint == bootstrap else step.to_bytes(20, "big")),
                 nodes=(
                     DHTNode(
                         next_step.to_bytes(20, "big"),
@@ -433,11 +607,13 @@ class DHTCrawlerTests(unittest.IsolatedAsyncioTestCase):
             try:
                 await asyncio.sleep(0)
                 nodes: tuple[DHTNode, ...] = ()
+                responder_id = b"b" * 20
                 if endpoint == bootstrap:
                     nodes = (*first_level, first_level[0])
                 elif endpoint[0].startswith("8.20."):
                     octets = tuple(int(part) for part in endpoint[0].split("."))
                     index = octets[2] * 250 + octets[3] - 1
+                    responder_id = (index + 1).to_bytes(20, "big")
                     if index < DHT_K_CLOSEST_NODES:
                         raise DHTQueryError("simulierter Ausfall eines nahen Kontakts")
                     child = endpoint_for(21, index)
@@ -447,9 +623,14 @@ class DHTCrawlerTests(unittest.IsolatedAsyncioTestCase):
                             *child,
                         ),
                     )
+                elif endpoint[0].startswith("8.21."):
+                    octets = tuple(int(part) for part in endpoint[0].split("."))
+                    index = octets[2] * 250 + octets[3] - 1
+                    responder_id = (width + index + 1).to_bytes(20, "big")
                 return DHTResponse(
                     source=endpoint,
                     transaction_id=transaction_id,
+                    responder_id=responder_id,
                     nodes=nodes,
                     peers=(),
                     response_sha256="f" * 64,
@@ -512,6 +693,7 @@ class DHTCrawlerTests(unittest.IsolatedAsyncioTestCase):
             return DHTResponse(
                 source=endpoint,
                 transaction_id=transaction_id,
+                responder_id=b"b" * 20,
                 nodes=(DHTNode(b"n" * 20, *hanging),) if endpoint == bootstrap else (),
                 peers=peers if endpoint == bootstrap else (),
                 response_sha256="c" * 64,
@@ -567,6 +749,7 @@ class DHTCrawlerTests(unittest.IsolatedAsyncioTestCase):
             return DHTResponse(
                 source=endpoint,
                 transaction_id=transaction_id,
+                responder_id=b"b" * 20,
                 nodes=(DHTNode(b"n" * 20, *failing),),
                 peers=peers,
                 response_sha256="c" * 64,
@@ -596,6 +779,7 @@ class DHTCrawlerTests(unittest.IsolatedAsyncioTestCase):
             return DHTResponse(
                 source=endpoint,
                 transaction_id=transaction_id,
+                responder_id=b"b" * 20,
                 nodes=(),
                 peers=(*peers, peers[0]),
                 response_sha256="c" * 64,
@@ -628,6 +812,7 @@ class DHTCrawlerTests(unittest.IsolatedAsyncioTestCase):
             return DHTResponse(
                 source=endpoint,
                 transaction_id=transaction_id,
+                responder_id=b"b" * 20,
                 nodes=(),
                 peers=(*peers, peers[0]),
                 response_sha256="d" * 64,
@@ -663,6 +848,11 @@ class DHTCrawlerTests(unittest.IsolatedAsyncioTestCase):
             return DHTResponse(
                 source=endpoint,
                 transaction_id=transaction_id,
+                responder_id=(
+                    b"b" * 20
+                    if endpoint == bootstrap
+                    else (chain_length - step + 1).to_bytes(20, "big")
+                ),
                 nodes=nodes,
                 peers=(),
                 response_sha256="e" * 64,
@@ -711,6 +901,11 @@ class DHTCrawlerTests(unittest.IsolatedAsyncioTestCase):
             return DHTResponse(
                 source=endpoint,
                 transaction_id=transaction_id,
+                responder_id=(
+                    b"b" * 20
+                    if endpoint == bootstrap
+                    else (chain_length - step + 1).to_bytes(20, "big")
+                ),
                 nodes=nodes,
                 peers=(),
                 response_sha256="f" * 64,

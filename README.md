@@ -1,10 +1,10 @@
 # AfDLeakerCatcher
 
-## Windows-Download – Version 0.3.4
+## Windows-Download – Version 0.3.5
 
-### [⬇ AfDLeakerCatcher für Windows herunterladen](https://github.com/marioco/AfDLeakercatcher/releases/download/afdleakercatcher-v0.3.4/AfDLeakerCatcher-Windows-x64.zip)
+### [⬇ AfDLeakerCatcher für Windows herunterladen](https://github.com/marioco/AfDLeakercatcher/releases/download/afdleakercatcher-v0.3.5/AfDLeakerCatcher-Windows-x64.zip)
 
-[SHA-256-Prüfsumme zum Download](https://github.com/marioco/AfDLeakercatcher/releases/download/afdleakercatcher-v0.3.4/AfDLeakerCatcher-Windows-x64.zip.sha256)
+[SHA-256-Prüfsumme zum Download](https://github.com/marioco/AfDLeakercatcher/releases/download/afdleakercatcher-v0.3.5/AfDLeakerCatcher-Windows-x64.zip.sha256)
 
 Keine GitHub-Kenntnisse nötig: Auf den Link klicken, die ZIP-Datei **einmal**
 entpacken und anschließend `AfDLeakerCatcher.exe` doppelklicken. Es gibt keinen
@@ -14,13 +14,15 @@ Eine leicht bedienbare, quelloffene Python-Anwendung zur **inhaltsfreien** Prüf
 ausdrücklich konfigurierter BitTorrent-v1-Infohashes. Die Anwendung fordert keine Datei-
 oder Torrent-Metadatenblöcke an, lädt keine davon hoch und verschickt keine Meldung
 automatisch.
+Die kontrastreiche Desktop-Oberfläche verbindet ein dunkles Cyberpunk-Design mit
+Klartext-Statusmeldungen, sichtbaren Tastaturfokussen und responsiven Tabellen.
 
 ## Was die Anwendung belastbar sagen kann
 
-Die Anwendung sucht Endpunkte im öffentlichen BitTorrent-DHT mit `get_peers` und fragt
-die für ein Ziel gespeicherten, validierten UDP-Tracker ab. Beides geschieht erst nach
-der ausdrücklichen Bestätigung vor dem Prüflauf. Für gefundene Endpunkte führt sie eine
-gezielte, inhaltsfreie Prüfung durch:
+Die Anwendung sucht Endpunkte parallel im öffentlichen BitTorrent-DHT mit `get_peers`
+und über die für ein Ziel gespeicherten, validierten UDP-Tracker. Beides geschieht erst
+nach der ausdrücklichen Bestätigung vor dem Prüflauf. Für gefundene Endpunkte führt sie
+eine gezielte, inhaltsfreie Prüfung durch:
 
 1. Ein DHT-Knoten oder UDP-Tracker nennt `IP:Port` für den konfigurierten Infohash.
 2. Die Anwendung sendet den standardisierten 68-Byte-BitTorrent-Handshake.
@@ -39,10 +41,12 @@ gezielte, inhaltsfreie Prüfung durch:
 Es gibt keine Mengenbegrenzung für gefundene oder direkt geprüfte Kandidaten. Die
 DHT-Suche läuft in wiederholten konvergierenden Runden weiter, bis während des
 konfigurierten Ruhefensters – standardmäßig 30 Sekunden – kein neuer eindeutiger
-Kandidat mehr gefunden wurde. Exakte Doppelnennungen desselben Infohashes mit derselben
-IP und demselben Port werden nur einmal geprüft. Jeder gefundene eindeutige Kandidat
-wird mit einer begrenzten Zahl von Verbindungsversuchen geprüft; standardmäßig sind es
-höchstens drei Versuche.
+Kandidat mehr gefunden wurde. Gleichzeitige Doppelnennungen desselben Infohashes mit
+derselben IP und demselben Port werden zusammengeführt. Ein bestätigter, technisch fehlerfreier
+Vollzeitbefund ist nach einem Versuch abschließend; nur technische oder vorzeitige
+Teilbeobachtungen werden unmittelbar wiederholt, standardmäßig bis zu drei Versuche.
+Eine zeitlich spätere echte Wiederentdeckung kann einen negativen Endpunkt erneut
+einplanen, ohne erstmals gefundene Kandidaten zu verdrängen.
 
 Ein positiver Angebotsbefund wird nur erzeugt, wenn der bestätigte Client während der
 vollständig abgelaufenen konfigurierten Beobachtungszeit – standardmäßig 60 Sekunden –
@@ -291,7 +295,7 @@ gh attestation verify AfDLeakerCatcher-Windows-x64.zip -R marioco/AfDLeakercatch
 
 Ein Push auf `main` erzeugt nach erfolgreichem Build ein GitHub-Release, sofern für die
 eingetragene Version noch keines existiert. Dasselbe gilt für einen exakt zur
-Paket- und App-Version passenden Tag wie `afdleakercatcher-v0.3.4`. Ein bereits
+Paket- und App-Version passenden Tag wie `afdleakercatcher-v0.3.5`. Ein bereits
 vorhandenes Release wird nicht überschrieben, sondern auf Ziel-Commit, Entwurfsstatus,
 exakt erwartete Assets und ZIP-Prüfsumme kontrolliert. Pull Requests und manuell
 gestartete Läufe stellen nur Actions-Artefakte bereit.

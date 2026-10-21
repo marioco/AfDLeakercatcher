@@ -63,7 +63,16 @@ def _candidate(info_hash: str, index: int) -> PeerCandidate:
 
 
 def _handshake(candidate: PeerCandidate) -> HandshakeResult:
-    control_event = PeerControlEvent(
+    bitfield_event = PeerControlEvent(
+        observed_at_utc="2026-10-20T10:00:01.500Z",
+        elapsed_seconds=0.5,
+        kind="bitfield",
+        payload_length=1,
+        non_empty=True,
+        payload_sha256="12" * 32,
+        set_bits=1,
+    )
+    unchoke_event = PeerControlEvent(
         observed_at_utc="2026-10-20T10:00:02.000Z",
         elapsed_seconds=1.0,
         kind="unchoke",
@@ -83,12 +92,12 @@ def _handshake(candidate: PeerCandidate) -> HandshakeResult:
         peer_choking_at_end=False,
         unchoked_duration_seconds=59.0,
         messages_received=2,
-        bytes_received=9,
+        bytes_received=11,
         request_messages_sent=0,
         piece_payload_bytes_received=0,
         metadata_requests_sent=0,
         termination_reason="duration_elapsed",
-        control_events=(control_event,),
+        control_events=(bitfield_event, unchoke_event),
     )
     return HandshakeResult(
         candidate=candidate,
@@ -100,7 +109,7 @@ def _handshake(candidate: PeerCandidate) -> HandshakeResult:
         local_ip="192.0.2.20",
         local_port=50_000,
         bytes_sent=73,
-        bytes_received=77,
+        bytes_received=79,
         error=None,
         availability=availability,
     )
@@ -150,6 +159,43 @@ def _record_with_legacy_gate_difference(
                     else "peer_closed"
                 ),
                 error=availability_error,
+            ),
+        ),
+    )
+
+
+def _record_with_v1_proof_difference(index: int, case: str) -> EvidenceRecord:
+    record = _record(HASH_A, index)
+    availability = record.handshake.availability
+    assert availability is not None
+    bitfield, unchoke = availability.control_events
+    if case == "duplicate_bitfield":
+        middle = replace(
+            bitfield,
+            observed_at_utc="2026-10-20T10:00:01.750Z",
+            elapsed_seconds=0.75,
+        )
+    elif case == "have_none":
+        middle = PeerControlEvent(
+            observed_at_utc="2026-10-20T10:00:01.750Z",
+            elapsed_seconds=0.75,
+            kind="have_none",
+            payload_length=0,
+        )
+    else:
+        raise AssertionError(f"Unbekannter v1-Prooffall: {case}")
+    events = (bitfield, middle, unchoke)
+    availability_bytes = 17 if case == "duplicate_bitfield" else 16
+    return replace(
+        record,
+        handshake=replace(
+            record.handshake,
+            bytes_received=68 + availability_bytes,
+            availability=replace(
+                availability,
+                messages_received=3,
+                bytes_received=availability_bytes,
+                control_events=events,
             ),
         ),
     )
@@ -924,6 +970,109 @@ def test_clean_terminal_accepts_report_slug_for_long_run_id(tmp_path: Path) -> N
     assert reconciled == []
 
 
+def test_clean_terminal_accepts_complete_intermediate_report_packages(tmp_path: Path) -> None:
+    evidence_dir = tmp_path / "evidence"
+    run_id = "run-clean-with-intermediate"
+    source_record = _record(HASH_A, 61)
+    store = _prepare_store(evidence_dir, run_id, [source_record])
+    output_dir = evidence_dir.parent / "reports" / run_id
+    report_binding = _write_report_package(output_dir, run_id)
+    _write_report_package(
+        output_dir / "zwischenstand-000001",
+        f"{run_id}-zwischenstand-000001",
+    )
+    entries = EvidenceJournal(evidence_dir / "events.jsonl").append_many(
+        (
+            _start_event(run_id),
+            _evidence_event(run_id, source_record),
+            _published_terminal_event(run_id, report_binding=report_binding),
+        )
+    )
+    expected = replace(source_record, evidence_event_sha256=entries[1].event_sha256)
+    assert store.store_evidence_batch([expected]) == 1
+    reconciled: list[RecoveredEvidenceBatch] = []
+
+    summary = recover_evidence_journal(evidence_dir, on_reconciled=reconciled.append)
+
+    assert summary == RecoverySummary(scanned_entries=3, evidence_events=1)
+    assert reconciled == []
+
+
+@pytest.mark.parametrize(
+    ("directory_name", "damage"),
+    (
+        ("zwischenstand-1", None),
+        ("zwischenstand-000001", "missing_file"),
+    ),
+)
+def test_terminal_rejects_nonstrict_or_incomplete_intermediate_package(
+    tmp_path: Path,
+    directory_name: str,
+    damage: str | None,
+) -> None:
+    evidence_dir = tmp_path / "evidence"
+    run_id = f"run-invalid-intermediate-{damage or 'name'}"
+    source_record = _record(HASH_A, 62)
+    store = _prepare_store(evidence_dir, run_id, [source_record])
+    output_dir = evidence_dir.parent / "reports" / run_id
+    report_binding = _write_report_package(output_dir, run_id)
+    intermediate_run_id = f"{run_id}-{directory_name}"
+    intermediate_dir = output_dir / directory_name
+    _write_report_package(intermediate_dir, intermediate_run_id)
+    if damage == "missing_file":
+        (intermediate_dir / f"{intermediate_run_id}_laufbericht.pdf").unlink()
+    entries = EvidenceJournal(evidence_dir / "events.jsonl").append_many(
+        (
+            _start_event(run_id),
+            _evidence_event(run_id, source_record),
+            _published_terminal_event(run_id, report_binding=report_binding),
+        )
+    )
+    expected = replace(source_record, evidence_event_sha256=entries[1].event_sha256)
+    assert store.store_evidence_batch([expected]) == 1
+    reconciled: list[RecoveredEvidenceBatch] = []
+
+    recover_evidence_journal(evidence_dir, on_reconciled=reconciled.append)
+
+    assert [batch.records for batch in reconciled] == [(expected,)]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Symlink-Rechte unterscheiden sich unter Windows")
+def test_terminal_rejects_symlinked_intermediate_package_without_touching_target(
+    tmp_path: Path,
+) -> None:
+    evidence_dir = tmp_path / "evidence"
+    run_id = "run-symlinked-intermediate"
+    source_record = _record(HASH_A, 63)
+    store = _prepare_store(evidence_dir, run_id, [source_record])
+    output_dir = evidence_dir.parent / "reports" / run_id
+    report_binding = _write_report_package(output_dir, run_id)
+    external_dir = tmp_path / "preserved-intermediate"
+    _write_report_package(external_dir, f"{run_id}-zwischenstand-000001")
+    preserved = {path.name: path.read_bytes() for path in external_dir.iterdir() if path.is_file()}
+    (output_dir / "zwischenstand-000001").symlink_to(
+        external_dir,
+        target_is_directory=True,
+    )
+    entries = EvidenceJournal(evidence_dir / "events.jsonl").append_many(
+        (
+            _start_event(run_id),
+            _evidence_event(run_id, source_record),
+            _published_terminal_event(run_id, report_binding=report_binding),
+        )
+    )
+    expected = replace(source_record, evidence_event_sha256=entries[1].event_sha256)
+    assert store.store_evidence_batch([expected]) == 1
+    reconciled: list[RecoveredEvidenceBatch] = []
+
+    recover_evidence_journal(evidence_dir, on_reconciled=reconciled.append)
+
+    assert [batch.records for batch in reconciled] == [(expected,)]
+    assert {
+        path.name: path.read_bytes() for path in external_dir.iterdir() if path.is_file()
+    } == preserved
+
+
 @pytest.mark.parametrize(
     "damage",
     (
@@ -1357,6 +1506,63 @@ def test_low_disk_aborts_and_cleans_private_same_volume_index(
 
 
 @pytest.mark.parametrize(
+    ("corruption", "expected_error"),
+    (
+        ("short_full_window", "unterschreitet"),
+        ("nonmonotonic_events", "nicht monoton"),
+        ("event_after_duration", "hinter der protokollierten"),
+    ),
+)
+def test_recovery_rejects_invalid_availability_timeline(
+    tmp_path: Path,
+    corruption: str,
+    expected_error: str,
+) -> None:
+    evidence_dir = tmp_path / "evidence"
+    run_id = f"invalid-availability-{corruption}"
+    source_record = _record(HASH_A, 64)
+    store = _prepare_store(evidence_dir, run_id, [source_record])
+    event = _evidence_event(run_id, source_record)
+    handshake = event["handshake"]
+    assert isinstance(handshake, dict)
+    availability = handshake["availability"]
+    assert isinstance(availability, dict)
+    control_events = availability["control_events"]
+    assert isinstance(control_events, tuple)
+    first_event = dict(control_events[0])
+    if corruption == "short_full_window":
+        availability["duration_seconds"] = 0.1
+    elif corruption == "nonmonotonic_events":
+        second_event = {
+            **first_event,
+            "observed_at_utc": "2026-10-20T10:00:03.000Z",
+            "elapsed_seconds": 0.25,
+            "kind": "have",
+            "payload_length": 4,
+            "piece_index": 1,
+            "non_empty": None,
+            "payload_sha256": None,
+            "set_bits": None,
+        }
+        availability["control_events"] = (first_event, second_event)
+        availability["bytes_received"] = 15
+        handshake["bytes_received"] = 83
+    elif corruption == "event_after_duration":
+        availability["messages_received"] = 1
+        availability["bytes_received"] = 6
+        availability["control_events"] = ({**first_event, "elapsed_seconds": 60.000002},)
+        handshake["bytes_received"] = 74
+    else:
+        raise AssertionError(f"Unbekannter Testfall: {corruption}")
+    EvidenceJournal(evidence_dir / "events.jsonl").append_many((_start_event(run_id), event))
+
+    with pytest.raises(EvidenceRecoveryError, match=expected_error):
+        recover_evidence_journal(evidence_dir)
+
+    assert store.evidence_count() == 0
+
+
+@pytest.mark.parametrize(
     ("completed_full_window", "availability_error"),
     (
         (False, None),
@@ -1407,6 +1613,45 @@ def test_v033_gate_only_evidence_is_skipped_runwise_without_publication(
     assert "Version 0.3.3" in notices[0].reason
 
 
+def test_v033_short_early_eof_record_does_not_block_recovery(tmp_path: Path) -> None:
+    evidence_dir = tmp_path / "evidence"
+    run_id = "v033-realistic-short-eof"
+    base_record = _record(HASH_A, 57)
+    source_record = _record_with_legacy_gate_difference(
+        57,
+        completed_full_window=False,
+        availability_error="Fruehes EOF.",
+    )
+    availability = source_record.handshake.availability
+    assert availability is not None
+    source_record = replace(
+        source_record,
+        handshake=replace(
+            source_record.handshake,
+            availability=replace(
+                availability,
+                ended_at_utc="2026-10-20T10:00:03.000Z",
+                duration_seconds=2.0,
+                unchoked_duration_seconds=2.0,
+            ),
+        ),
+    )
+    store = _prepare_store(evidence_dir, run_id, [base_record])
+    EvidenceJournal(evidence_dir / "events.jsonl").append_many(
+        (
+            _v033_start_event(run_id, software_sha256=SOFTWARE_A),
+            _evidence_event(run_id, source_record, software_sha256=SOFTWARE_A),
+        )
+    )
+    notices: list[LegacyRecoveryNotice] = []
+
+    summary = recover_evidence_journal(evidence_dir, on_legacy_skipped=notices.append)
+
+    assert summary.skipped_legacy_runs == 1
+    assert store.evidence_count() == 0
+    assert [notice.run_id for notice in notices] == [run_id]
+
+
 def test_explicit_semantics_v1_gate_only_evidence_is_skipped(tmp_path: Path) -> None:
     evidence_dir = tmp_path / "evidence"
     run_id = "explicit-v1-early-end"
@@ -1427,6 +1672,78 @@ def test_explicit_semantics_v1_gate_only_evidence_is_skipped(tmp_path: Path) -> 
     summary = recover_evidence_journal(evidence_dir, on_legacy_skipped=notices.append)
 
     assert summary.skipped_legacy_runs == 1
+    assert store.evidence_count() == 0
+    assert [notice.run_id for notice in notices] == [run_id]
+
+
+@pytest.mark.parametrize("case", ("duplicate_bitfield", "have_none"))
+def test_v033_historical_proof_semantics_are_skipped_runwise(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    evidence_dir = tmp_path / "evidence"
+    run_id = f"v033-proof-{case}"
+    source_record = _record_with_v1_proof_difference(62, case)
+    store = _prepare_store(evidence_dir, run_id, [_record(HASH_A, 62)])
+    EvidenceJournal(evidence_dir / "events.jsonl").append_many(
+        (_v033_start_event(run_id), _evidence_event(run_id, source_record))
+    )
+    notices: list[LegacyRecoveryNotice] = []
+
+    summary = recover_evidence_journal(evidence_dir, on_legacy_skipped=notices.append)
+
+    assert summary == RecoverySummary(
+        scanned_entries=2,
+        evidence_events=1,
+        skipped_legacy_runs=1,
+    )
+    assert store.evidence_count() == 0
+    assert [notice.run_id for notice in notices] == [run_id]
+
+
+@pytest.mark.parametrize("case", ("duplicate_bitfield", "have_none"))
+def test_semantics_v2_historical_proof_difference_is_fatal(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    evidence_dir = tmp_path / "evidence"
+    run_id = f"v2-proof-{case}"
+    source_record = _record_with_v1_proof_difference(63, case)
+    store = _prepare_store(evidence_dir, run_id, [_record(HASH_A, 63)])
+    EvidenceJournal(evidence_dir / "events.jsonl").append_many(
+        (_start_event(run_id), _evidence_event(run_id, source_record))
+    )
+
+    with pytest.raises(EvidenceRecoveryError, match="nicht an scan_started gebunden"):
+        recover_evidence_journal(evidence_dir)
+
+    assert store.evidence_count() == 0
+
+
+def test_v033_db_only_historical_proof_semantics_are_skipped(tmp_path: Path) -> None:
+    evidence_dir = tmp_path / "evidence"
+    run_id = "v033-db-only-duplicate-bitfield"
+    source_record = _record_with_v1_proof_difference(64, "duplicate_bitfield")
+    store = _prepare_store(evidence_dir, run_id, [_record(HASH_A, 64)])
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "UPDATE handshake_results SET result_json = ?, offering_observed = 1",
+            (
+                json.dumps(
+                    asdict(source_record.handshake),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+        connection.commit()
+    EvidenceJournal(evidence_dir / "events.jsonl").append(_v033_start_event(run_id))
+    notices: list[LegacyRecoveryNotice] = []
+
+    summary = recover_evidence_journal(evidence_dir, on_legacy_skipped=notices.append)
+
+    assert summary == RecoverySummary(scanned_entries=1, skipped_legacy_runs=1)
     assert store.evidence_count() == 0
     assert [notice.run_id for notice in notices] == [run_id]
 
@@ -1603,14 +1920,18 @@ def test_incompatible_v031_legacy_record_does_not_block_new_run(tmp_path: Path) 
             kind="bitfield",
             payload_length=1,
             non_empty=True,
+            payload_sha256="12" * 32,
             set_bits=1,
         ),
     )
     old_handshake = replace(
         legacy_source.handshake,
+        bytes_received=84,
         availability=replace(
             availability,
             peer_choking_at_end=True,
+            messages_received=3,
+            bytes_received=16,
             control_events=old_control_events,
         ),
     )
@@ -1706,3 +2027,74 @@ def test_legacy_db_only_positive_is_not_sent_to_incomplete_callback(tmp_path: Pa
     assert len(notices) == 1
     assert notices[0].run_id == run_id
     assert "keinen gebundenen Konfigurationssnapshot" in notices[0].reason
+
+
+def test_v031_db_only_old_offer_semantics_does_not_block_new_run(tmp_path: Path) -> None:
+    evidence_dir = tmp_path / "evidence"
+    run_id = "legacy-db-only-old-offer"
+    source_record = _record(HASH_A, 61)
+    availability = source_record.handshake.availability
+    assert availability is not None
+    old_handshake = replace(
+        source_record.handshake,
+        bytes_received=84,
+        availability=replace(
+            availability,
+            peer_choking_at_end=True,
+            messages_received=3,
+            bytes_received=16,
+            control_events=(
+                PeerControlEvent(
+                    observed_at_utc="2026-10-20T10:00:02.000Z",
+                    elapsed_seconds=1.0,
+                    kind="unchoke",
+                    payload_length=0,
+                ),
+                PeerControlEvent(
+                    observed_at_utc="2026-10-20T10:00:03.000Z",
+                    elapsed_seconds=2.0,
+                    kind="choke",
+                    payload_length=0,
+                ),
+                PeerControlEvent(
+                    observed_at_utc="2026-10-20T10:00:04.000Z",
+                    elapsed_seconds=3.0,
+                    kind="bitfield",
+                    payload_length=1,
+                    non_empty=True,
+                    payload_sha256="12" * 32,
+                    set_bits=1,
+                ),
+            ),
+        ),
+    )
+    assert not old_handshake.offering_observed
+    store = _prepare_store(evidence_dir, run_id, [source_record])
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            """
+            UPDATE handshake_results
+            SET result_json = ?, offering_observed = 1
+            """,
+            (
+                json.dumps(
+                    asdict(old_handshake),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+        connection.commit()
+    EvidenceJournal(evidence_dir / "events.jsonl").append(_legacy_start_event(run_id))
+    notices: list[LegacyRecoveryNotice] = []
+
+    summary = recover_evidence_journal(
+        evidence_dir,
+        on_legacy_skipped=notices.append,
+    )
+
+    assert summary == RecoverySummary(scanned_entries=1, skipped_legacy_runs=1)
+    assert store.evidence_count() == 0
+    assert [notice.run_id for notice in notices] == [run_id]
+    assert "frueherer Positivsemantik" in notices[0].reason

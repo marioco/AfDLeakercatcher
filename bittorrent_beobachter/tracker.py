@@ -25,6 +25,7 @@ from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
 
+from .config import MAX_TRACKERS_PER_TARGET
 from .dht import normalize_global_endpoint
 from .models import PeerCandidate, Target
 
@@ -542,7 +543,10 @@ async def discover_tracker_peers(
     ebenfalls an den Callback weitergereicht und koennen beim persistenten
     Schreiben dedupliziert werden. Im expliziten Kompatibilitaetsmodus
     ``collect=True`` werden eindeutige Kandidaten gesammelt und zurueckgegeben.
-    Die begrenzte Parallelitaet ist nur eine Arbeitsbreite und kein Mengenlimit.
+    Die Zahl der Discovery-Quellen ist auf ``MAX_TRACKERS_PER_TARGET`` begrenzt
+    und wird von einer festen Workerzahl abgearbeitet. Die Anzahl gefundener
+    Peer-Kandidaten und ihrer direkten Pruefungen bleibt davon unberuehrt und
+    unbegrenzt.
     """
     if not isinstance(target, Target):
         raise TypeError("target muss ein Target sein.")
@@ -558,7 +562,11 @@ async def discover_tracker_peers(
     if stats is not None and not isinstance(stats, TrackerDiscoveryStats):
         raise TypeError("stats muss TrackerDiscoveryStats sein.")
 
-    trackers = tuple(parse_tracker_url(value) for value in tracker_urls)
+    trackers: list[TrackerURL] = []
+    for value in tracker_urls:
+        if len(trackers) >= MAX_TRACKERS_PER_TARGET:
+            raise ValueError(f"Höchstens {MAX_TRACKERS_PER_TARGET} Tracker pro Ziel sind erlaubt.")
+        trackers.append(parse_tracker_url(value))
     if stats is not None:
         stats.trackers_configured += len(trackers)
     peer_id = secrets.token_bytes(20)
@@ -629,7 +637,23 @@ async def discover_tracker_peers(
             await asyncio.gather(*endpoint_tasks, return_exceptions=True)
             raise
 
-    producer_tasks = [asyncio.create_task(query_tracker(tracker)) for tracker in trackers]
+    tracker_queue: asyncio.Queue[TrackerURL] = asyncio.Queue(maxsize=MAX_TRACKERS_PER_TARGET)
+    for tracker in trackers:
+        tracker_queue.put_nowait(tracker)
+
+    async def tracker_worker() -> None:
+        while True:
+            try:
+                tracker = tracker_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                await query_tracker(tracker)
+            finally:
+                tracker_queue.task_done()
+
+    worker_count = min(TRACKER_DISCOVERY_CONCURRENCY, len(trackers))
+    producer_tasks = [asyncio.create_task(tracker_worker()) for _ in range(worker_count)]
 
     async def supervise_producers() -> None:
         outcomes = await asyncio.gather(*producer_tasks, return_exceptions=True)

@@ -169,6 +169,86 @@ def test_cancellation_between_sources_skips_remaining_lookup(tmp_path: Path) -> 
     assert f"RIPEstat: {ENRICHMENT_CANCELLED_REASON}" in (result.error or "")
 
 
+def test_cancellation_after_failure_prevents_retry(
+    tmp_path: Path,
+) -> None:
+    cancel_event = Event()
+    calls: list[str] = []
+
+    def fail_and_cancel(request: Any, *, timeout: float) -> _JsonResponse:
+        del timeout
+        calls.append(request.full_url)
+        cancel_event.set()
+        raise urllib.error.URLError("temporär nicht erreichbar")
+
+    def forbidden_sleep(_delay: float) -> None:
+        raise AssertionError("Nach einem Abbruch darf kein Retry-Backoff starten")
+
+    result = NetworkEnricher(
+        tmp_path,
+        external_lookup_enabled=True,
+        max_retries=3,
+        urlopen=fail_and_cancel,
+        sleep=forbidden_sleep,
+        now=lambda: FIXED_NOW,
+    ).enrich("8.8.8.8", cancel_event=cancel_event)
+
+    assert calls == ["https://rdap.org/ip/8.8.8.8"]
+    assert result.source_urls == ("https://rdap.org/ip/8.8.8.8",)
+    assert result.error == (
+        f"RDAP: {ENRICHMENT_CANCELLED_REASON}; RIPEstat: {ENRICHMENT_CANCELLED_REASON}"
+    )
+
+
+def test_cancellation_interrupts_retry_backoff(tmp_path: Path) -> None:
+    class CancellingEvent:
+        def __init__(self) -> None:
+            self.cancelled = False
+            self.waits: list[float] = []
+
+        def is_set(self) -> bool:
+            return self.cancelled
+
+        def wait(self, timeout: float) -> bool:
+            self.waits.append(timeout)
+            self.cancelled = True
+            return True
+
+    cancel_event = CancellingEvent()
+    calls: list[str] = []
+
+    def transient_failure(request: Any, *, timeout: float) -> _JsonResponse:
+        del timeout
+        calls.append(request.full_url)
+        raise urllib.error.HTTPError(
+            request.full_url,
+            503,
+            "temporary",
+            Message(),
+            None,
+        )
+
+    def forbidden_sleep(_delay: float) -> None:
+        raise AssertionError("Ein abbrechbarer Backoff darf nicht time.sleep verwenden")
+
+    result = NetworkEnricher(
+        tmp_path,
+        external_lookup_enabled=True,
+        max_retries=3,
+        retry_backoff_seconds=0.25,
+        urlopen=transient_failure,
+        sleep=forbidden_sleep,
+        now=lambda: FIXED_NOW,
+    ).enrich("8.8.8.8", cancel_event=cancel_event)  # type: ignore[arg-type]
+
+    assert calls == ["https://rdap.org/ip/8.8.8.8"]
+    assert cancel_event.waits == [0.25]
+    assert result.source_urls == ("https://rdap.org/ip/8.8.8.8",)
+    assert result.error == (
+        f"RDAP: {ENRICHMENT_CANCELLED_REASON}; RIPEstat: {ENRICHMENT_CANCELLED_REASON}"
+    )
+
+
 def test_default_http_client_ignores_proxy_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

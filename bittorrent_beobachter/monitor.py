@@ -13,6 +13,7 @@ import hashlib
 import os
 import secrets
 import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -50,6 +51,12 @@ from .evidence import (
     canonical_json_bytes,
 )
 from .models import (
+    MAX_PEER_OBSERVATION_BYTES,
+    MAX_PEER_OBSERVATION_MESSAGES,
+    MAX_RETAINED_PEER_CONTROL_EVENTS,
+    OBSERVATION_ROUNDING_TOLERANCE_SECONDS,
+    REQUIRED_PEER_OBSERVATION_SECONDS,
+    TERMINAL_PEER_DIAGNOSTIC_KINDS,
     EvidenceRecord,
     HandshakeResult,
     NetworkEnrichment,
@@ -59,6 +66,7 @@ from .models import (
     TargetScanMetrics,
     VpnClassification,
 )
+from .path_safety import is_link_like, path_has_link_like_component
 from .peer import PeerVerifier
 from .recovery import (
     EvidenceRecoveryError,
@@ -122,9 +130,23 @@ def _safe_error(error: BaseException) -> str:
     return (f"{label}: {text}" if text else label)[:500]
 
 
+def _path_has_symlink_component(path: Path) -> bool:
+    return path_has_link_like_component(path)
+
+
 def _ensure_private_directory(path: Path, *, app_owned: bool = False) -> Path:
+    path = Path(path)
+    if _path_has_symlink_component(path):
+        raise MonitorError(f"Anwendungspfad darf keine Symlink-Komponente enthalten: {path}")
     existed = path.exists()
-    path.mkdir(parents=True, exist_ok=True)
+    if existed and not path.is_dir():
+        raise MonitorError(f"Anwendungspfad ist kein Verzeichnis: {path}")
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise MonitorError(f"Anwendungsverzeichnis kann nicht angelegt werden: {path}") from exc
+    if _path_has_symlink_component(path) or not path.is_dir():
+        raise MonitorError(f"Anwendungspfad ist kein sicheres Verzeichnis: {path}")
     if existed and not app_owned:
         return path
     if os.name == "nt":  # pragma: no cover - Windows ACLs do not use POSIX modes
@@ -186,10 +208,31 @@ def single_instance_lock(path: Path) -> Iterator[None]:
 
     lock_path = Path(path)
     _ensure_private_directory(lock_path.parent)
-    with lock_path.open("a+b", buffering=0) as file_handle:
-        with suppress(OSError):
-            lock_path.chmod(0o600)
+    if is_link_like(lock_path):
+        raise MonitorError(f"Sperrdatei darf kein symbolischer Link sein: {lock_path}")
 
+    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP or is_link_like(lock_path):
+            raise MonitorError(f"Sperrdatei darf kein symbolischer Link sein: {lock_path}") from exc
+        raise MonitorError(f"Sperrdatei kann nicht sicher geoeffnet werden: {lock_path}") from exc
+
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise MonitorError(f"Sperrdatei ist keine regulaere Datei: {lock_path}")
+        if os.name != "nt":
+            os.fchmod(descriptor, 0o600)
+        file_handle = os.fdopen(descriptor, "a+b", buffering=0)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+    with file_handle:
         if os.name == "nt":  # pragma: no cover - Windows only
             _lock_windows(file_handle)
             try:
@@ -352,6 +395,7 @@ async def _discover_target_until_quiet(
     rounds = 0
     dht_issue_count = 0
     tracker_outer_failures = 0
+    tracker_cleanup_failures = 0
     crawler = (
         DHTCrawler(
             bootstrap_nodes,
@@ -377,6 +421,66 @@ async def _discover_target_until_quiet(
                 f"{target.label}: {inserted} neue eindeutige Kandidat(en) dauerhaft gespeichert."
             )
 
+    async def discover_dht_round() -> bool:
+        """Fuehrt genau einen DHT-Zeitschnitt mit isolierter Bilanz aus."""
+
+        nonlocal dht_issue_count
+        if crawler is None:
+            return False
+        try:
+            await crawler.discover(
+                target,
+                candidate_callback=persist_candidates,
+                collect=False,
+            )
+        except (OSError, TimeoutError) as exc:
+            runtime.dht_queries_failed += 1
+            dht_issue_count += 1
+            progress(
+                f"DHT-Runde fuer {target.label} hatte ein technisches Teilproblem "
+                f"({type(exc).__name__})."
+            )
+        finally:
+            runtime.dht_queries_started += crawler.queries_started
+            runtime.dht_queries_completed += crawler.queries_completed
+            runtime.dht_queries_failed += crawler.queries_failed
+            dht_issue_count += crawler.issue_count
+        return crawler.has_pending_work
+
+    async def discover_tracker_round() -> None:
+        """Fuehrt genau eine Tracker-Runde mit isolierter Bilanz aus."""
+
+        nonlocal tracker_cleanup_failures, tracker_outer_failures
+        if not target.trackers:
+            return
+        tracker_stats = TrackerDiscoveryStats()
+        try:
+            await discover_tracker_peers(
+                target,
+                target.trackers,
+                timeout=config.dht.timeout_seconds,
+                candidate_callback=persist_candidates,
+                collect=False,
+                stats=tracker_stats,
+            )
+        except (OSError, TimeoutError) as exc:
+            runtime.tracker_queries_completed += tracker_stats.queries_completed
+            runtime.tracker_queries_failed += (
+                tracker_stats.queries_failed + tracker_stats.stop_queries_failed + 1
+            )
+            tracker_cleanup_failures += tracker_stats.stop_queries_failed
+            tracker_outer_failures += 1
+            progress(
+                f"Tracker-Runde fuer {target.label} hatte ein technisches Teilproblem "
+                f"({type(exc).__name__})."
+            )
+        else:
+            runtime.tracker_queries_completed += tracker_stats.queries_completed
+            runtime.tracker_queries_failed += (
+                tracker_stats.queries_failed + tracker_stats.stop_queries_failed
+            )
+            tracker_cleanup_failures += tracker_stats.stop_queries_failed
+
     try:
         while True:
             rounds += 1
@@ -384,49 +488,23 @@ async def _discover_target_until_quiet(
             dht_pending_work = False
             progress(f"Peer-Suche {target.label}: Runde {rounds} gestartet.")
 
-            if crawler is not None:
-                try:
-                    await crawler.discover(
-                        target,
-                        candidate_callback=persist_candidates,
-                        collect=False,
-                    )
-                except (OSError, TimeoutError) as exc:
-                    runtime.dht_queries_failed += 1
-                    dht_issue_count += 1
-                    progress(
-                        f"DHT-Runde fuer {target.label} hatte ein technisches Teilproblem "
-                        f"({type(exc).__name__})."
-                    )
-                finally:
-                    runtime.dht_queries_started += crawler.queries_started
-                    runtime.dht_queries_completed += crawler.queries_completed
-                    runtime.dht_queries_failed += crawler.queries_failed
-                    dht_issue_count += crawler.issue_count
-
-                dht_pending_work = crawler.has_pending_work
-            if target.trackers:
-                tracker_stats = TrackerDiscoveryStats()
-                try:
-                    await discover_tracker_peers(
-                        target,
-                        target.trackers,
-                        timeout=config.dht.timeout_seconds,
-                        candidate_callback=persist_candidates,
-                        collect=False,
-                        stats=tracker_stats,
-                    )
-                except (OSError, TimeoutError) as exc:
-                    runtime.tracker_queries_completed += tracker_stats.queries_completed
-                    runtime.tracker_queries_failed += tracker_stats.queries_failed + 1
-                    tracker_outer_failures += 1
-                    progress(
-                        f"Tracker-Runde fuer {target.label} hatte ein technisches Teilproblem "
-                        f"({type(exc).__name__})."
-                    )
-                else:
-                    runtime.tracker_queries_completed += tracker_stats.queries_completed
-                    runtime.tracker_queries_failed += tracker_stats.queries_failed
+            dht_task = asyncio.create_task(discover_dht_round()) if crawler is not None else None
+            tracker_task = (
+                asyncio.create_task(discover_tracker_round()) if target.trackers else None
+            )
+            source_tasks = tuple(task for task in (dht_task, tracker_task) if task is not None)
+            if len(source_tasks) > 2:  # pragma: no cover - strukturelle Invariante
+                raise AssertionError("Pro Ziel duerfen hoechstens zwei Peer-Quellen laufen.")
+            try:
+                await asyncio.gather(*source_tasks)
+            except BaseException:
+                for task in source_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*source_tasks, return_exceptions=True)
+                raise
+            if dht_task is not None:
+                dht_pending_work = dht_task.result()
 
             round_completed_at = time.monotonic()
             if dht_pending_work:
@@ -462,6 +540,14 @@ async def _discover_target_until_quiet(
         notice = (
             f"Tracker-Suche fuer {target.label}: {tracker_outer_failures} Runde(n) mit "
             "technischen Teilproblemen; die DHT-Suche und weitere Runden liefen weiter."
+        )
+        notices.append(notice)
+        progress(notice)
+    if tracker_cleanup_failures:
+        notice = (
+            f"Tracker-Suche fuer {target.label}: STOPPED-Aufraeumen schlug bei "
+            f"{tracker_cleanup_failures} Anfrage(n) fehl; kurzlebige Tracker-Eintraege "
+            "koennen bis zu ihrem Ablauf sichtbar bleiben."
         )
         notices.append(notice)
         progress(notice)
@@ -558,6 +644,58 @@ def _handshake_quality(result: HandshakeResult) -> tuple[int, int, int, int, int
     )
 
 
+def _is_conclusive_full_window(result: HandshakeResult, requested_seconds: float) -> bool:
+    """Erkennt nur intern konsistente, technisch fehlerfreie Vollbeobachtungen."""
+
+    observation = result.availability
+    if observation is None:
+        return False
+    minimum_control_bytes = HandshakeResult._minimum_recorded_control_bytes(
+        observation.control_events
+    )
+    if (
+        type(observation.messages_received) is not int
+        or not 0 <= observation.messages_received <= MAX_PEER_OBSERVATION_MESSAGES
+        or len(observation.control_events)
+        != min(observation.messages_received, MAX_RETAINED_PEER_CONTROL_EVENTS)
+        or type(observation.bytes_received) is not int
+        or not 0 <= observation.bytes_received <= MAX_PEER_OBSERVATION_BYTES
+        or minimum_control_bytes is None
+    ):
+        return False
+    minimum_control_bytes += 4 * (observation.messages_received - len(observation.control_events))
+    exact_control_bytes = (
+        observation.bytes_received == minimum_control_bytes
+        if observation.messages_received <= MAX_RETAINED_PEER_CONTROL_EVENTS
+        else observation.bytes_received >= minimum_control_bytes
+    )
+    return bool(
+        result.confirmed
+        and result.error is None
+        and result.bytes_sent == 73
+        and result.bytes_received == 68 + observation.bytes_received
+        and observation.completed_full_window
+        and observation.error is None
+        and observation.interested_sent
+        and observation.termination_reason == "duration_elapsed"
+        and abs(requested_seconds - REQUIRED_PEER_OBSERVATION_SECONDS)
+        <= OBSERVATION_ROUNDING_TOLERANCE_SECONDS
+        and abs(observation.requested_duration_seconds - requested_seconds)
+        <= OBSERVATION_ROUNDING_TOLERANCE_SECONDS
+        and observation.duration_seconds + OBSERVATION_ROUNDING_TOLERANCE_SECONDS
+        >= observation.requested_duration_seconds
+        and HandshakeResult._wall_clock_duration_is_consistent(observation)
+        and HandshakeResult._control_event_times_are_consistent(observation)
+        and exact_control_bytes
+        and not any(
+            event.kind in TERMINAL_PEER_DIAGNOSTIC_KINDS for event in observation.control_events
+        )
+        and observation.request_messages_sent == 0
+        and observation.piece_payload_bytes_received == 0
+        and observation.metadata_requests_sent == 0
+    )
+
+
 async def _verify_candidate_with_retries(
     candidate: PeerCandidate,
     info_hash: bytes,
@@ -576,7 +714,11 @@ async def _verify_candidate_with_retries(
             raise MonitorError("Peer-Pruefung lieferte ein Ergebnis fuer einen anderen Kandidaten.")
         if best is None or _handshake_quality(current) > _handshake_quality(best):
             best = current
-        if current.offering_observed:
+        conclusive_full_window = _is_conclusive_full_window(
+            current,
+            config.peer.observation_seconds,
+        )
+        if current.offering_observed or conclusive_full_window:
             break
         if attempt < config.peer.retry_attempts and config.peer.retry_backoff_seconds:
             await asyncio.sleep(config.peer.retry_backoff_seconds)
@@ -591,21 +733,27 @@ async def _verify_candidate_batch(
     verifier: PeerVerifier,
     config: AppConfig,
     runtimes: dict[str, _TargetRuntimeMetrics],
+    completed_results: list[HandshakeResult | None],
 ) -> tuple[HandshakeResult, ...]:
-    async def verify(candidate: PeerCandidate) -> HandshakeResult:
+    if len(completed_results) != len(batch):
+        raise MonitorError("Ergebnisspeicher und Kandidatenbatch haben verschiedene Laengen.")
+
+    async def verify(index: int, candidate: PeerCandidate) -> HandshakeResult:
         info_hash = info_hashes.get(candidate.info_hash_hex)
         runtime = runtimes.get(candidate.info_hash_hex)
         if info_hash is None or runtime is None:
             raise MonitorError("Handshake-Kandidat gehoert zu keinem konfigurierten Ziel.")
-        return await _verify_candidate_with_retries(
+        result = await _verify_candidate_with_retries(
             candidate,
             info_hash,
             verifier,
             config,
             runtime,
         )
+        completed_results[index] = result
+        return result
 
-    tasks = [asyncio.create_task(verify(candidate)) for candidate in batch]
+    tasks = [asyncio.create_task(verify(index, candidate)) for index, candidate in enumerate(batch)]
     try:
         return tuple(await asyncio.gather(*tasks))
     except BaseException:
@@ -636,13 +784,14 @@ async def _verify_all_candidates(
         timeout=config.peer.timeout_seconds,
         observation_seconds=config.peer.observation_seconds,
     )
-    checked = sum(
-        metric.handshake_results for metric in store.metrics_by_hash(target_hashes).values()
-    )
+    checked = store.handshake_result_count(target_hashes)
 
     active_tasks: set[asyncio.Task[tuple[HandshakeResult, ...]]] = set()
     unpersisted_tasks: set[asyncio.Task[tuple[HandshakeResult, ...]]] = set()
     task_order: dict[asyncio.Task[tuple[HandshakeResult, ...]], int] = {}
+    partial_results: dict[
+        asyncio.Task[tuple[HandshakeResult, ...]], list[HandshakeResult | None]
+    ] = {}
     next_task_order = 0
 
     def fill_available_slots() -> None:
@@ -651,6 +800,7 @@ async def _verify_all_candidates(
             batch = store.claim_candidate_batch(target_hashes, size=PERSIST_BATCH_SIZE)
             if not batch:
                 break
+            completed_results: list[HandshakeResult | None] = [None] * len(batch)
             task = asyncio.create_task(
                 _verify_candidate_batch(
                     batch,
@@ -658,27 +808,27 @@ async def _verify_all_candidates(
                     verifier,
                     config,
                     runtimes,
+                    completed_results,
                 )
             )
             active_tasks.add(task)
             unpersisted_tasks.add(task)
             task_order[task] = next_task_order
+            partial_results[task] = completed_results
             next_task_order += 1
 
-    def persist_completed_task(
+    def persist_results(
         task: asyncio.Task[tuple[HandshakeResult, ...]],
+        result_batch: tuple[HandshakeResult, ...],
         *,
         failure_completion: bool,
     ) -> tuple[HandshakeResult, ...]:
         nonlocal checked
-        result_batch = task.result()
         _enforce_storage_capacity(data_dir)
-        store.store_handshake_batch(result_batch)
+        checked += store.store_handshake_batch(result_batch, count_new_only=True)
         unpersisted_tasks.remove(task)
         task_order.pop(task)
-        checked = sum(
-            metric.handshake_results for metric in store.metrics_by_hash(target_hashes).values()
-        )
+        partial_results.pop(task)
         if failure_completion:
             progress(
                 f"Fehlerabschluss: {checked} eindeutige Kandidat(en) mindestens einmal "
@@ -690,6 +840,17 @@ async def _verify_all_candidates(
                 "einmal dauerhaft geprüft."
             )
         return result_batch
+
+    def persist_completed_task(
+        task: asyncio.Task[tuple[HandshakeResult, ...]],
+        *,
+        failure_completion: bool,
+    ) -> tuple[HandshakeResult, ...]:
+        return persist_results(
+            task,
+            task.result(),
+            failure_completion=failure_completion,
+        )
 
     try:
         while True:
@@ -720,12 +881,13 @@ async def _verify_all_candidates(
             await asyncio.gather(*unpersisted_tasks, return_exceptions=True)
         try:
             for task in sorted(tuple(unpersisted_tasks), key=task_order.__getitem__):
-                if task.cancelled():
-                    continue
-                task_error = task.exception()
-                if task_error is not None:
-                    continue
-                persist_completed_task(task, failure_completion=True)
+                result_batch = (
+                    task.result()
+                    if not task.cancelled() and task.exception() is None
+                    else tuple(result for result in partial_results[task] if result is not None)
+                )
+                if result_batch:
+                    persist_results(task, result_batch, failure_completion=True)
         except BaseException as drain_error:
             exc.add_note(
                 "Ein bereits fertiger Kandidatenbatch konnte beim Fehlerabschluss nicht "
@@ -1094,7 +1256,7 @@ def _load_recovery_config(
         return current_config if _config_sha256(current_config) == config_sha256 else None
 
     snapshot_path = evidence_dir / "runs" / config_snapshot
-    if snapshot_path.is_symlink() or not snapshot_path.is_file():
+    if is_link_like(snapshot_path) or not snapshot_path.is_file():
         raise MonitorError(f"Konfigurationssnapshot fuer Lauf {run_id!r} fehlt.")
     try:
         snapshot_file_hash = _file_sha256(snapshot_path)
@@ -1121,13 +1283,13 @@ def _recovery_report_is_complete(output_dir: Path, report_run_id: str) -> bool:
     manifest_path = output_dir / f"{report_run_id}_SHA256SUMS.txt"
     try:
         if (
-            output_dir.is_symlink()
+            is_link_like(output_dir)
             or not output_dir.is_dir()
-            or output_dir.parent.is_symlink()
+            or is_link_like(output_dir.parent)
             or output_dir.resolve(strict=True).parent != output_dir.parent.resolve(strict=True)
         ):
             return False
-        if manifest_path.is_symlink() or not manifest_path.is_file():
+        if is_link_like(manifest_path) or not manifest_path.is_file():
             return False
         if manifest_path.stat().st_size > 4_000_000:
             return False
@@ -1164,7 +1326,7 @@ def _recovery_report_is_complete(output_dir: Path, report_run_id: str) -> bool:
                 ):
                     return False
                 report_path = output_dir / file_name
-                if report_path.is_symlink() or not report_path.is_file():
+                if is_link_like(report_path) or not report_path.is_file():
                     return False
                 if not secrets.compare_digest(_file_sha256(report_path), digest):
                     return False
@@ -1175,7 +1337,7 @@ def _recovery_report_is_complete(output_dir: Path, report_run_id: str) -> bool:
         actual_names: set[str] = set()
         with os.scandir(output_dir) as entries:
             for entry in entries:
-                if entry.is_symlink():
+                if is_link_like(Path(entry.path)):
                     return False
                 if entry.is_dir(follow_symlinks=False):
                     return False
@@ -1200,7 +1362,7 @@ def _quarantine_invalid_recovery_report_directory(output_dir: Path) -> None:
     """Verschiebt ein defektes app-eigenes Batchverzeichnis verlustfrei beiseite."""
 
     try:
-        if not output_dir.is_symlink():
+        if not is_link_like(output_dir):
             with os.scandir(output_dir) as entries:
                 if next(entries, None) is None:
                     return
@@ -1212,7 +1374,7 @@ def _quarantine_invalid_recovery_report_directory(output_dir: Path) -> None:
     parent = output_dir.parent
     for _attempt in range(100):
         quarantine_dir = parent / f".{output_dir.name}.defekt-{secrets.token_hex(4)}"
-        if quarantine_dir.exists() or quarantine_dir.is_symlink():
+        if quarantine_dir.exists() or is_link_like(quarantine_dir):
             continue
         try:
             os.replace(output_dir, quarantine_dir)
@@ -1242,17 +1404,17 @@ def _publish_recovered_batch(
     ).hexdigest()[:16]
     report_run_id = f"recovery-{batch.run_id[-32:]}-{digest}"
     reports_root = data_dir / "reports"
-    if reports_root.is_symlink():
+    if is_link_like(reports_root):
         raise MonitorError(f"Recovery-Berichtswurzel darf kein Symlink sein: {reports_root}")
     reports_root = _ensure_private_directory(reports_root, app_owned=True)
     run_output_path = reports_root / batch.run_id
-    if run_output_path.is_symlink():
+    if is_link_like(run_output_path):
         raise MonitorError(f"Recovery-Laufverzeichnis darf kein Symlink sein: {run_output_path}")
     run_output_dir = _ensure_private_directory(run_output_path, app_owned=True)
     batch_output_path = run_output_dir / f"wiederhergestellt-{digest}"
     batch_output_dir = (
         batch_output_path
-        if batch_output_path.is_symlink()
+        if is_link_like(batch_output_path)
         else _ensure_private_directory(batch_output_path, app_owned=True)
     )
     if not _recovery_report_is_complete(batch_output_dir, report_run_id):
@@ -1483,7 +1645,6 @@ def _run_scan_locked_impl(
             raise MonitorError("Zwischenbericht erhielt keinen gueltigen Fuenferbatch.")
         intermediate_batch_number += 1
         result.known_vpn_total += sum(record.vpn.status == "known_vpn" for record in records)
-        _refresh_result_metrics(result, config, store, runtimes)
         generated_at = _utc_now_text()
         batch_run_id = f"{run_id}-zwischenstand-{intermediate_batch_number:06d}"
         batch_result = ScanResult(
@@ -1740,7 +1901,12 @@ def run_scan(
     validated_config = config_from_dict(config_to_dict(config))
     if not validated_config.targets:
         raise MonitorError("Mindestens ein Ziel ist fuer einen Prueflauf erforderlich.")
-    runtime_dir = Path(data_dir).expanduser().resolve()
+    requested_runtime_dir = Path(data_dir).expanduser().absolute()
+    if _path_has_symlink_component(requested_runtime_dir):
+        raise MonitorError(
+            f"Der Datenpfad darf keine Symlink-Komponente enthalten: {requested_runtime_dir}"
+        )
+    runtime_dir = requested_runtime_dir.resolve()
     forbidden_data_dirs = {
         Path(runtime_dir.anchor),
         Path.home().resolve(),
@@ -1751,7 +1917,11 @@ def run_scan(
             "Der Datenpfad muss ein eigener Anwendungsordner sein; ein "
             "Wurzel-, Home- oder gemeinsamer Temp-Ordner ist nicht zulaessig."
         )
-    _ensure_private_directory(runtime_dir, app_owned=True)
+    # Ein ausdrücklich gewählter, bereits vorhandener Stammordner kann auch
+    # anderweitig genutzt werden. Seine Zugriffsrechte werden deshalb niemals
+    # still verändert; nur neu angelegte Stammordner und unsere eigenen
+    # Unterordner werden auf private Rechte gesetzt.
+    _ensure_private_directory(runtime_dir, app_owned=False)
     callback = progress or (lambda _message: None)
     with single_instance_lock(runtime_dir / "monitor.lock"):
         return _run_scan_locked(

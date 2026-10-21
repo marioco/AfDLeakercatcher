@@ -6,17 +6,20 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
 from collections.abc import Callable, Mapping
 from contextlib import closing
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from .evidence import EvidenceJournal, canonical_json_bytes
 from .models import EvidenceRecord, HandshakeResult
+from .path_safety import is_link_like, path_has_link_like_component
 from .run_store import RunStore, RunStoreError, decode_evidence_journal_event
 
 MAX_RECOVERY_BATCH_SIZE = 5
@@ -24,6 +27,7 @@ RECOVERY_MIN_FREE_SPACE_BYTES = 100_000_000
 _PUBLISH_STATE_FILENAME = ".recovery-publish-state.sqlite3"
 _MAX_REPORT_MANIFEST_BYTES = 4_000_000
 _MAX_REPORT_MANIFEST_LINE_LENGTH = 4_096
+_INTERMEDIATE_REPORT_DIRECTORY = re.compile(r"^zwischenstand-(?P<batch_number>[0-9]{6})$")
 _REQUIRED_REPORT_SUFFIXES = (
     "_laufbericht.pdf",
     "_beobachtungen.csv",
@@ -568,12 +572,12 @@ def _mark_terminal_event(
 
 def _safe_run_store_path(evidence_dir: Path, run_id: str) -> Path:
     runs_dir = evidence_dir / "runs"
-    if runs_dir.is_symlink() or not runs_dir.is_dir():
+    if is_link_like(runs_dir) or not runs_dir.is_dir():
         raise EvidenceRecoveryError(
             f"Laufdatenbank-Verzeichnis fehlt oder ist unsicher: {runs_dir}"
         )
     database_path = runs_dir / f"{run_id}.sqlite3"
-    if database_path.is_symlink() or not database_path.is_file():
+    if is_link_like(database_path) or not database_path.is_file():
         raise EvidenceRecoveryError(
             f"Laufdatenbank fuer {run_id!r} fehlt oder ist unsicher: {database_path}"
         )
@@ -606,7 +610,7 @@ def _enforce_recovery_capacity(path: Path) -> None:
 
 def _open_publish_state(evidence_dir: Path) -> sqlite3.Connection:
     state_path = evidence_dir / _PUBLISH_STATE_FILENAME
-    if state_path.is_symlink() or (state_path.exists() and not state_path.is_file()):
+    if is_link_like(state_path) or (state_path.exists() and not state_path.is_file()):
         raise EvidenceRecoveryError(
             f"Recovery-Publikationsstatus fehlt oder ist unsicher: {state_path}"
         )
@@ -955,7 +959,7 @@ def _safe_existing_report_directory(
     components: tuple[str, ...],
 ) -> Path | None:
     reports_root = evidence_dir.parent / "reports"
-    if reports_root.is_symlink() or not reports_root.is_dir():
+    if is_link_like(reports_root) or not reports_root.is_dir():
         return None
     try:
         resolved_parent = evidence_dir.parent.resolve(strict=True)
@@ -972,7 +976,7 @@ def _safe_existing_report_directory(
         except EvidenceRecoveryError:
             return None
         candidate = directory / component
-        if candidate.is_symlink() or not candidate.is_dir():
+        if is_link_like(candidate) or not candidate.is_dir():
             return None
         try:
             resolved_candidate = candidate.resolve(strict=True)
@@ -1006,6 +1010,7 @@ def _inspect_report_package(
     manifest_name: str,
     expected_manifest_sha256: str | None = None,
     expected_file_count: int | None = None,
+    allow_intermediate_packages: bool = False,
 ) -> _ReportPackageBinding | None:
     """Prueft ein Berichtspaket vollstaendig und speicherbegrenzt."""
 
@@ -1033,7 +1038,7 @@ def _inspect_report_package(
         return None
     manifest_path = output_dir / validated_manifest_name
     try:
-        if manifest_path.is_symlink() or not manifest_path.is_file():
+        if is_link_like(manifest_path) or not manifest_path.is_file():
             return None
         if manifest_path.resolve(strict=True).parent != output_dir.resolve(strict=True):
             return None
@@ -1076,7 +1081,7 @@ def _inspect_report_package(
                     return None
                 report_path = output_dir / file_name
                 try:
-                    if report_path.is_symlink() or not report_path.is_file():
+                    if is_link_like(report_path) or not report_path.is_file():
                         return None
                     if report_path.resolve(strict=True).parent != output_dir.resolve(strict=True):
                         return None
@@ -1101,10 +1106,43 @@ def _inspect_report_package(
         actual_file_count = 0
         with os.scandir(output_dir) as directory_entries:
             for entry in directory_entries:
-                if entry.is_symlink():
+                if is_link_like(Path(entry.path)):
                     return None
                 if entry.is_dir(follow_symlinks=False):
-                    return None
+                    match = _INTERMEDIATE_REPORT_DIRECTORY.fullmatch(entry.name)
+                    if (
+                        not allow_intermediate_packages
+                        or match is None
+                        or int(match.group("batch_number")) < 1
+                    ):
+                        return None
+                    intermediate_manifest: str | None = None
+                    try:
+                        with os.scandir(entry.path) as intermediate_entries:
+                            for intermediate_entry in intermediate_entries:
+                                if is_link_like(Path(intermediate_entry.path)):
+                                    return None
+                                if intermediate_entry.is_file(
+                                    follow_symlinks=False
+                                ) and intermediate_entry.name.endswith(manifest_suffix):
+                                    if intermediate_manifest is not None:
+                                        return None
+                                    intermediate_manifest = intermediate_entry.name
+                    except OSError:
+                        return None
+                    if intermediate_manifest is None:
+                        return None
+                    intermediate_run_id = f"{report_run_id}-{entry.name}"
+                    intermediate_package = _inspect_report_package(
+                        evidence_dir,
+                        binding_index,
+                        directory_components=(*directory_components, entry.name),
+                        report_run_id=intermediate_run_id,
+                        manifest_name=intermediate_manifest,
+                    )
+                    if intermediate_package is None:
+                        return None
+                    continue
                 if not entry.is_file(follow_symlinks=False):
                     return None
                 actual_file_count += 1
@@ -1204,6 +1242,7 @@ def _original_report_is_complete(
                 manifest_name=binding.report_manifest or "",
                 expected_manifest_sha256=binding.report_manifest_sha256,
                 expected_file_count=binding.report_file_count,
+                allow_intermediate_packages=True,
             )
             complete = package is not None
     binding_index.execute(
@@ -1363,8 +1402,37 @@ def _event_with_current_availability_gates(event: Mapping[str, Any]) -> dict[str
         return None
 
     patched_availability = dict(availability_value)
+    requested_duration = patched_availability.get("requested_duration_seconds")
+    duration = patched_availability.get("duration_seconds")
+    if (
+        isinstance(requested_duration, bool)
+        or not isinstance(requested_duration, (int, float))
+        or isinstance(duration, bool)
+        or not isinstance(duration, (int, float))
+    ):
+        return None
     patched_availability["completed_full_window"] = True
     patched_availability["error"] = None
+    patched_availability["termination_reason"] = "duration_elapsed"
+    # Die strengere Dauerinvariante gehört wie completed_full_window selbst
+    # erst zur Semantik 2. Für den eng begrenzten v1-Klassifikationstest wird
+    # sie nur in der Prüfkopie normalisiert; Originaldaten werden nie migriert.
+    patched_duration = max(duration, requested_duration)
+    started_at_utc = patched_availability.get("started_at_utc")
+    if not isinstance(started_at_utc, str):
+        return None
+    try:
+        started_at = datetime.fromisoformat(started_at_utc.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if started_at.utcoffset() is None:
+        return None
+    patched_availability["duration_seconds"] = patched_duration
+    patched_availability["ended_at_utc"] = (
+        (started_at.astimezone(UTC) + timedelta(seconds=patched_duration))
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
     patched_handshake = dict(handshake_value)
     patched_handshake["availability"] = patched_availability
     patched_event = dict(event)
@@ -1372,12 +1440,118 @@ def _event_with_current_availability_gates(event: Mapping[str, Any]) -> dict[str
     return patched_event
 
 
-def _is_v1_availability_gate_only_record(
+def _event_with_v1_proof_semantics(event: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Neutralisiert nur historisch erzeugbare v1-Zustandsresets in einer Prüfkopie."""
+
+    handshake_value = event.get("handshake")
+    if not isinstance(handshake_value, dict):
+        return None
+    availability_value = handshake_value.get("availability")
+    if not isinstance(availability_value, dict):
+        return None
+    control_events = availability_value.get("control_events")
+    if not isinstance(control_events, (list, tuple)):
+        return None
+
+    bitfield_indexes: list[int] = []
+    non_empty_bitfield_index: int | None = None
+    for index, raw_event in enumerate(control_events):
+        if not isinstance(raw_event, dict):
+            continue
+        kind = raw_event.get("kind")
+        if kind == "bitfield":
+            payload_length = raw_event.get("payload_length")
+            non_empty = raw_event.get("non_empty")
+            payload_sha256 = raw_event.get("payload_sha256")
+            set_bits = raw_event.get("set_bits")
+            if (
+                isinstance(payload_length, bool)
+                or not isinstance(payload_length, int)
+                or payload_length < 1
+                or raw_event.get("piece_index") is not None
+                or not isinstance(non_empty, bool)
+                or not isinstance(payload_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", payload_sha256) is None
+                or isinstance(set_bits, bool)
+                or not isinstance(set_bits, int)
+                or not 0 <= set_bits <= payload_length * 8
+                or non_empty != (set_bits > 0)
+            ):
+                return None
+            bitfield_indexes.append(index)
+            if non_empty and non_empty_bitfield_index is None:
+                non_empty_bitfield_index = index
+        elif kind == "have_none" and (
+            raw_event.get("payload_length") != 0
+            or any(
+                raw_event.get(field) is not None
+                for field in ("piece_index", "non_empty", "payload_sha256", "set_bits")
+            )
+        ):
+            return None
+
+    requires_patch = len(bitfield_indexes) > 1 or any(
+        isinstance(raw_event, dict)
+        and (
+            raw_event.get("kind") == "have_none"
+            or (raw_event.get("kind") == "bitfield" and raw_event.get("non_empty") is False)
+        )
+        for raw_event in control_events
+    )
+    if not requires_patch:
+        return None
+
+    selected_bitfield = non_empty_bitfield_index
+    patched_events: list[object] = []
+    for index, raw_event in enumerate(control_events):
+        if not isinstance(raw_event, dict):
+            patched_events.append(raw_event)
+            continue
+        kind = raw_event.get("kind")
+        if kind == "have_none":
+            patched_events.append({**raw_event, "kind": "peer_not_interested"})
+        elif kind == "bitfield" and index != selected_bitfield:
+            patched_events.append(
+                {
+                    **raw_event,
+                    "kind": "extension_handshake",
+                    "piece_index": None,
+                    "non_empty": None,
+                    "set_bits": None,
+                }
+            )
+        else:
+            patched_events.append(raw_event)
+
+    patched_availability = dict(availability_value)
+    patched_availability["control_events"] = tuple(patched_events)
+    patched_handshake = dict(handshake_value)
+    patched_handshake["availability"] = patched_availability
+    patched_event = dict(event)
+    patched_event["handshake"] = patched_handshake
+    return patched_event
+
+
+def _event_with_v1_legacy_semantics(event: Mapping[str, Any]) -> dict[str, Any] | None:
+    patched: Mapping[str, Any] = event
+    changed = False
+    proof_patch = _event_with_v1_proof_semantics(patched)
+    if proof_patch is not None:
+        patched = proof_patch
+        changed = True
+    gate_patch = _event_with_current_availability_gates(patched)
+    if gate_patch is not None:
+        patched = gate_patch
+        changed = True
+    return dict(patched) if changed else None
+
+
+def _is_v1_legacy_positive_record(
     event: Mapping[str, Any],
     event_sha256: str,
     binding: _StartedRun,
 ) -> bool:
-    patched_event = _event_with_current_availability_gates(event)
+    patched_event = _event_with_v1_legacy_semantics(event)
     if patched_event is None:
         return False
     try:
@@ -1399,14 +1573,96 @@ def _handshake_with_current_availability_gates(
     observation = handshake.availability
     if observation is None or (observation.completed_full_window and observation.error is None):
         return None
+    patched_duration = max(
+        observation.duration_seconds,
+        observation.requested_duration_seconds,
+    )
+    try:
+        started_at = datetime.fromisoformat(observation.started_at_utc.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if started_at.utcoffset() is None:
+        return None
+    patched_ended_at = (
+        (started_at.astimezone(UTC) + timedelta(seconds=patched_duration))
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
     return replace(
         handshake,
         availability=replace(
             observation,
             completed_full_window=True,
+            ended_at_utc=patched_ended_at,
+            duration_seconds=patched_duration,
+            termination_reason="duration_elapsed",
             error=None,
         ),
     )
+
+
+def _handshake_with_v1_proof_semantics(
+    handshake: HandshakeResult,
+) -> HandshakeResult | None:
+    observation = handshake.availability
+    if observation is None:
+        return None
+    bitfields = [
+        (index, event)
+        for index, event in enumerate(observation.control_events)
+        if event.kind == "bitfield"
+    ]
+    if any(
+        not HandshakeResult._is_valid_bitfield_event(event) for _index, event in bitfields
+    ) or any(
+        event.kind == "have_none" and not HandshakeResult._is_empty_control_event(event)
+        for event in observation.control_events
+    ):
+        return None
+    selected_bitfield = next(
+        (index for index, event in bitfields if event.non_empty is True),
+        None,
+    )
+    requires_patch = len(bitfields) > 1 or any(
+        event.kind == "have_none" or (event.kind == "bitfield" and event.non_empty is False)
+        for event in observation.control_events
+    )
+    if not requires_patch:
+        return None
+    patched_events = tuple(
+        replace(event, kind="peer_not_interested")
+        if event.kind == "have_none"
+        else replace(
+            event,
+            kind="extension_handshake",
+            piece_index=None,
+            non_empty=None,
+            set_bits=None,
+        )
+        if event.kind == "bitfield" and index != selected_bitfield
+        else event
+        for index, event in enumerate(observation.control_events)
+    )
+    return replace(
+        handshake,
+        availability=replace(observation, control_events=patched_events),
+    )
+
+
+def _handshake_with_v1_legacy_semantics(
+    handshake: HandshakeResult,
+) -> HandshakeResult | None:
+    patched = handshake
+    changed = False
+    proof_patch = _handshake_with_v1_proof_semantics(patched)
+    if proof_patch is not None:
+        patched = proof_patch
+        changed = True
+    gate_patch = _handshake_with_current_availability_gates(patched)
+    if gate_patch is not None:
+        patched = gate_patch
+        changed = True
+    return patched if changed else None
 
 
 def _decode_evidence_for_started_run(
@@ -1420,7 +1676,7 @@ def _decode_evidence_for_started_run(
     if binding.legacy_skip_reason is not None:
         return binding, None
     patched_gate_event = _event_with_current_availability_gates(event_data)
-    if binding.evidence_semantics_version == 1 and _is_v1_availability_gate_only_record(
+    if binding.evidence_semantics_version == 1 and _is_v1_legacy_positive_record(
         event_data,
         event_sha256,
         binding,
@@ -1428,10 +1684,9 @@ def _decode_evidence_for_started_run(
         _mark_legacy_skip(
             connection,
             binding,
-            "Lauf verwendet eine bis Version 0.3.3 gueltige Positivsemantik: "
-            "Stueckverfuegbarkeit und UNCHOKE wurden gemeldet, die Beobachtung "
-            "endete jedoch vor dem vollstaendigen Zeitfenster oder mit einem "
-            "Verbindungsfehler; der Lauf wird nicht erneut veroeffentlicht.",
+            "Lauf verwendet eine bis Version 0.3.3 gueltige Positivsemantik; "
+            "der historische Befund wird unter den heutigen strengeren "
+            "Verfuegbarkeits- und Protokollinvarianten nicht erneut veroeffentlicht.",
         )
         return binding, None
     if binding.evidence_semantics_version >= 2 and patched_gate_event is not None:
@@ -1785,6 +2040,7 @@ def _notify_incomplete_runs(
                 )
                 has_unpersisted_offering = False
                 legacy_gate_only_handshake = False
+                legacy_incompatible_handshake = False
                 try:
                     for handshake in unpersisted:
                         has_unpersisted_offering = True
@@ -1795,7 +2051,10 @@ def _notify_incomplete_runs(
                         )
                         if handshake.offering_observed:
                             continue
-                        patched_handshake = _handshake_with_current_availability_gates(handshake)
+                        if binding.legacy_schema:
+                            legacy_incompatible_handshake = True
+                            break
+                        patched_handshake = _handshake_with_v1_legacy_semantics(handshake)
                         if patched_handshake is None or not patched_handshake.offering_observed:
                             raise EvidenceRecoveryError(
                                 f"Laufdatenbank fuer {run_id!r} enthaelt einen als positiv "
@@ -1812,15 +2071,26 @@ def _notify_incomplete_runs(
                     unpersisted.close()
             except (OSError, sqlite3.Error, RunStoreError, ValueError, TypeError) as exc:
                 if (
-                    binding.legacy_schema
+                    binding.evidence_semantics_version == 1
                     and isinstance(exc, RunStoreError)
-                    and str(exc) == _LEGACY_OFFERING_ERROR
+                    and str(exc)
+                    == "Eine Verfuegbarkeitsbeobachtung darf nur ein BITFIELD enthalten."
                 ):
                     _mark_legacy_skip(
                         binding_index,
                         binding,
-                        "Die Legacy-Laufdatenbank enthaelt Evidenz nach der frueheren "
-                        "Positivsemantik; automatische Migration wurde ausgelassen.",
+                        "Die Laufdatenbank enthaelt einen unter Semantik Version 1 "
+                        "erzeugbaren mehrfachen BITFIELD-Verlauf; der historische "
+                        "Befund wird nicht nachtraeglich veroeffentlicht.",
+                    )
+                    continue
+                if binding.legacy_schema and isinstance(exc, RunStoreError):
+                    _mark_legacy_skip(
+                        binding_index,
+                        binding,
+                        "Die Legacy-Laufdatenbank ist unter den heutigen strengen "
+                        "Evidenzinvarianten nicht sicher auswertbar; automatische "
+                        "Migration und Veroeffentlichung wurden ausgelassen.",
                     )
                     continue
                 raise EvidenceRecoveryError(
@@ -1828,13 +2098,22 @@ def _notify_incomplete_runs(
                 ) from exc
             if not has_unpersisted_offering:
                 continue
+            if legacy_incompatible_handshake:
+                _mark_legacy_skip(
+                    binding_index,
+                    binding,
+                    "Die Legacy-Laufdatenbank enthaelt einen nach frueherer "
+                    "Positivsemantik markierten Befund; automatische Migration und "
+                    "Veroeffentlichung wurden ausgelassen.",
+                )
+                continue
             if legacy_gate_only_handshake:
                 _mark_legacy_skip(
                     binding_index,
                     binding,
                     "Laufdatenbank verwendet eine bis Version 0.3.3 gueltige "
-                    "Positivsemantik mit vorzeitigem Ende oder Verbindungsfehler; "
-                    "der Lauf wird nicht nachtraeglich veroeffentlicht.",
+                    "Positivsemantik; der historische Befund wird unter den heutigen "
+                    "strengeren Invarianten nicht nachtraeglich veroeffentlicht.",
                 )
                 continue
             if binding.legacy_schema:
@@ -1916,10 +2195,10 @@ def recover_evidence_journal(
         raise TypeError("on_incomplete_run muss aufrufbar sein.")
     if on_legacy_skipped is not None and not callable(on_legacy_skipped):
         raise TypeError("on_legacy_skipped muss aufrufbar sein.")
-    if root.is_symlink():
+    if path_has_link_like_component(root):
         raise EvidenceRecoveryError(f"Evidenzverzeichnis darf kein Symlink sein: {root}")
     journal_path = root / "events.jsonl"
-    if journal_path.is_symlink():
+    if is_link_like(journal_path):
         raise EvidenceRecoveryError(f"Evidenzjournal darf kein Symlink sein: {journal_path}")
     pending_journal_path = root / f".{journal_path.name}.pending"
     if not journal_path.exists() and not pending_journal_path.exists():

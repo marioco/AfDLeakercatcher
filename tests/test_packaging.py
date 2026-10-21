@@ -60,7 +60,7 @@ def test_public_product_name_is_consistent_in_program_and_release() -> None:
     assert f'APP_NAME = "{PRODUCT_NAME}"' in init_source
     assert "prog=APP_NAME" in cli_source
     assert 'root.title(f"{APP_NAME} {VERSION}")' in gui_source
-    assert 'text=APP_NAME, font=("TkDefaultFont", 18, "bold")' in gui_source
+    assert 'ttk.Label(hero, text=APP_NAME, style="Hero.TLabel")' in gui_source
     assert reports_source.count("canvas.setCreator(APP_NAME)") == 2
     assert spec.count(f'name="{PRODUCT_NAME}"') == 2
     assert f'"{PACKAGE_DIRECTORY}/{EXE_NAME}"' in workflow
@@ -260,7 +260,7 @@ def test_version_sources_tag_checks_and_direct_download_are_consistent() -> None
     project = tomllib.loads(_text("pyproject.toml"))
     version = project["project"]["version"]
 
-    assert version == _app_version() == "0.3.4"
+    assert version == _app_version() == "0.3.5"
     assert f"Windows-Download \N{EN DASH} Version {version}" in readme
     release_path = f"releases/download/afdleakercatcher-v{version}/"
     assert readme.count(release_path) >= 2

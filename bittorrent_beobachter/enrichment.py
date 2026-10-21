@@ -685,11 +685,32 @@ class NetworkEnricher:
             return None
         return min(max(seconds, 0.0), 10.0)
 
-    def _request_json(self, source: str, url: str) -> tuple[Any, str, tuple[str, ...]]:
+    @staticmethod
+    def _raise_if_cancelled(
+        cancel_event: Event | None, *, cause: BaseException | None = None
+    ) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise EnrichmentError(ENRICHMENT_CANCELLED_REASON) from cause
+
+    def _wait_before_retry(self, delay: float, cancel_event: Event | None) -> None:
+        if cancel_event is None:
+            self._sleep(delay)
+            return
+        if cancel_event.wait(delay):
+            raise EnrichmentError(ENRICHMENT_CANCELLED_REASON)
+
+    def _request_json(
+        self,
+        source: str,
+        url: str,
+        *,
+        cancel_event: Event | None = None,
+    ) -> tuple[Any, str, tuple[str, ...]]:
         requested_ip = _validate_service_url(url, source, initial=True)
         last_error: BaseException | None = None
         attempts = self.max_retries + 1
         for attempt in range(attempts):
+            self._raise_if_cancelled(cancel_event, cause=last_error)
             request = urllib.request.Request(
                 url,
                 headers={"Accept": "application/json", "User-Agent": USER_AGENT},
@@ -752,11 +773,12 @@ class NetworkEnricher:
             ) as exc:
                 last_error = exc
 
+            self._raise_if_cancelled(cancel_event, cause=last_error)
             if attempt >= attempts - 1:
                 break
             if retry_delay is None:
                 retry_delay = min(self.retry_backoff_seconds * (2**attempt), 10.0)
-            self._sleep(retry_delay)
+            self._wait_before_retry(retry_delay, cancel_event)
 
         detail = type(last_error).__name__ if last_error is not None else "unbekannter Fehler"
         raise EnrichmentError(
@@ -770,12 +792,15 @@ class NetworkEnricher:
         url: str,
         projector: Callable[[Any], dict[str, Any]],
         cache_normalizer: Callable[[Any], dict[str, Any]],
+        cancel_event: Event | None = None,
     ) -> _SourceResult:
         _validate_service_url(url, source, initial=True)
         cached = self._load_cache(source, url, cache_normalizer)
         if cached is not None:
             return cached
-        payload, final_url, redirect_urls = self._request_json(source, url)
+        payload, final_url, redirect_urls = self._request_json(
+            source, url, cancel_event=cancel_event
+        )
         projected = projector(payload)
         fetched_at_utc = _utc_text(self._current_time())
         self._store_cache(
@@ -819,6 +844,7 @@ class NetworkEnricher:
                     url=rdap_url,
                     projector=lambda payload: _project_rdap(payload, normalized_ip),
                     cache_normalizer=_normalize_cached_rdap,
+                    cancel_event=cancel_event,
                 )
                 rdap = rdap_result.data
                 source_results.append(("rdap", rdap_result))
@@ -834,6 +860,7 @@ class NetworkEnricher:
                     url=ripestat_url,
                     projector=lambda payload: _project_ripestat(payload, normalized_ip),
                     cache_normalizer=_normalize_cached_ripestat,
+                    cancel_event=cancel_event,
                 )
                 ripestat = ripestat_result.data
                 source_results.append(("ripestat-prefix-overview", ripestat_result))

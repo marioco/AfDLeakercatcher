@@ -31,6 +31,7 @@ from bittorrent_beobachter.models import (
     NetworkEnrichment,
     PeerAvailabilityObservation,
     PeerCandidate,
+    PeerControlEvent,
     ScanResult,
     TargetScanMetrics,
     VpnClassification,
@@ -153,6 +154,38 @@ class _ScreenRootDouble:
         self.minimum_size = (width, height)
 
 
+class _ThemeRootDouble:
+    def __init__(self) -> None:
+        self.options: dict[str, str] = {}
+        self.option_database: dict[str, str] = {}
+
+    def configure(self, **kwargs: str) -> None:
+        self.options.update(kwargs)
+
+    def option_add(self, pattern: str, value: str) -> None:
+        self.option_database[pattern] = value
+
+
+class _StyleDouble:
+    def __init__(self, root: object) -> None:
+        self.root = root
+        self.selected_theme: str | None = None
+        self.configurations: dict[str, dict[str, Any]] = {}
+        self.mappings: dict[str, dict[str, Any]] = {}
+
+    def theme_names(self) -> tuple[str, ...]:
+        return ("vista", "clam")
+
+    def theme_use(self, theme: str) -> None:
+        self.selected_theme = theme
+
+    def configure(self, style_name: str, **kwargs: Any) -> None:
+        self.configurations[style_name] = kwargs
+
+    def map(self, style_name: str, **kwargs: Any) -> None:
+        self.mappings[style_name] = kwargs
+
+
 def _bare_app(config_path: Path) -> Any:
     app = gui.ObserverApp.__new__(gui.ObserverApp)
     app.config_path = config_path
@@ -179,6 +212,7 @@ def _runtime_app(tmp_path: Path, config: AppConfig | None = None) -> Any:
     app.progress = _WidgetDouble()
     app.result_tree = _WidgetDouble()
     app.status_text = _WidgetDouble()
+    app.status_label = _WidgetDouble()
     app.config_controls = (_WidgetDouble(), _WidgetDouble(), _WidgetDouble())
     return app
 
@@ -246,6 +280,7 @@ def test_observer_app_shows_logging_startup_warning(
             pass
 
     root = WarningRoot()
+    monkeypatch.setattr(gui, "_configure_cyberpunk_theme", lambda _root: None)
     monkeypatch.setattr(gui, "_configure_window_geometry", lambda _root: None)
     monkeypatch.setattr(gui.ObserverApp, "_load_initial_config", lambda _app: AppConfig(targets=()))
     monkeypatch.setattr(gui.ObserverApp, "_build_ui", lambda _app: None)
@@ -329,6 +364,145 @@ def test_main_window_keeps_normal_desktop_dimensions() -> None:
     assert root.minimum_size == (880, 600)
 
 
+def test_cyberpunk_theme_configures_cross_platform_focus_and_disabled_states(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _ThemeRootDouble()
+    style = _StyleDouble(root)
+    monkeypatch.setattr(gui.ttk, "Style", lambda received_root: style, raising=False)
+
+    configured_style = gui._configure_cyberpunk_theme(root)
+
+    assert configured_style is style
+    assert style.selected_theme == "clam"
+    assert root.options["background"] == gui.CYBER_COLORS["background"]
+    assert root.option_database == {
+        "*selectBackground": gui.CYBER_COLORS["accent"],
+        "*selectForeground": gui.CYBER_COLORS["background"],
+        "*insertBackground": gui.CYBER_COLORS["accent"],
+    }
+    assert {
+        "Hero.TLabel",
+        "Status.Ready.TLabel",
+        "Status.Running.TLabel",
+        "Status.Success.TLabel",
+        "Status.Warning.TLabel",
+        "Status.Error.TLabel",
+        "Accent.TButton",
+        "Danger.TButton",
+        "Treeview",
+        "Treeview.Heading",
+        "Cyber.Horizontal.TProgressbar",
+    }.issubset(style.configurations)
+    assert style.configurations["Treeview"]["rowheight"] >= 28
+    assert ("focus", gui.CYBER_COLORS["accent"]) in style.mappings["TButton"]["bordercolor"]
+    assert ("disabled", gui.CYBER_COLORS["muted"]) in style.mappings["TButton"]["foreground"]
+    for button_style in ("Accent.TButton", "Danger.TButton"):
+        assert (
+            "disabled",
+            gui.CYBER_COLORS["surface_raised"],
+        ) in style.mappings[button_style]["background"]
+        assert ("disabled", gui.CYBER_COLORS["muted"]) in style.mappings[button_style]["foreground"]
+    assert ("selected", gui.CYBER_COLORS["accent"]) in style.mappings["TCheckbutton"][
+        "indicatorcolor"
+    ]
+
+
+def test_cyberpunk_text_and_status_colors_have_accessible_contrast() -> None:
+    def relative_luminance(color: str) -> float:
+        channels = [int(color[index : index + 2], 16) / 255 for index in (1, 3, 5)]
+        linear = [
+            channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4
+            for channel in channels
+        ]
+        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+    def contrast_ratio(foreground: str, background: str) -> float:
+        light, dark = sorted(
+            (relative_luminance(foreground), relative_luminance(background)),
+            reverse=True,
+        )
+        return (light + 0.05) / (dark + 0.05)
+
+    colors = gui.CYBER_COLORS
+    text_pairs = (
+        ("text", "background"),
+        ("muted", "background"),
+        ("text", "surface"),
+        ("muted", "surface"),
+        ("accent", "surface"),
+        ("success", "surface"),
+        ("warning", "surface"),
+        ("danger", "surface"),
+        ("background", "accent"),
+        ("background", "magenta"),
+        ("accent", "positive_surface"),
+        ("warning", "warning_surface"),
+    )
+
+    for foreground, background in text_pairs:
+        assert contrast_ratio(colors[foreground], colors[background]) >= 4.5
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_style"),
+    tuple(gui.STATUS_STYLE_BY_STATE.items()),
+)
+def test_status_state_keeps_explanatory_text_and_sets_distinct_style(
+    tmp_path: Path,
+    state: str,
+    expected_style: str,
+) -> None:
+    app = _runtime_app(tmp_path)
+
+    app._set_status(f"Klartext für {state}", state=state)
+
+    assert app.status_text.value == f"Klartext für {state}"
+    assert app.status_label.options["style"] == expected_style
+
+
+class _SettingsScreenDouble(_ScreenRootDouble):
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        requested_width: int,
+        requested_height: int,
+    ) -> None:
+        super().__init__(width, height)
+        self.requested_width = requested_width
+        self.requested_height = requested_height
+        self.updated = False
+
+    def update_idletasks(self) -> None:
+        self.updated = True
+
+    def winfo_reqwidth(self) -> int:
+        return self.requested_width
+
+    def winfo_reqheight(self) -> int:
+        return self.requested_height
+
+
+def test_settings_dialog_fits_small_high_dpi_desktop() -> None:
+    dialog = _SettingsScreenDouble(800, 500, 900, 700)
+
+    gui._configure_settings_dialog_geometry(dialog)
+
+    assert dialog.updated is True
+    assert dialog.geometry_value == "760x450"
+    assert dialog.minimum_size == (320, 240)
+
+
+def test_settings_dialog_keeps_comfortable_size_on_normal_desktop() -> None:
+    assert gui._fit_settings_dialog_to_screen(1920, 1080, 500, 280) == (
+        540,
+        330,
+        320,
+        240,
+    )
+
+
 def test_main_mousewheel_scrolls_page_but_not_result_table(tmp_path: Path) -> None:
     app = _runtime_app(tmp_path)
     app._content_canvas = _WidgetDouble()
@@ -374,12 +548,28 @@ def _handshake(*, confirmed: bool = True, ipv6: bool = False) -> HandshakeResult
             peer_choking_at_end=False,
             unchoked_duration_seconds=58.0,
             messages_received=2,
-            bytes_received=8,
+            bytes_received=11,
             request_messages_sent=0,
             piece_payload_bytes_received=0,
             metadata_requests_sent=0,
             termination_reason="duration_elapsed",
-            control_events=(),
+            control_events=(
+                PeerControlEvent(
+                    observed_at_utc="2026-10-20T10:00:02.200Z",
+                    elapsed_seconds=0.2,
+                    kind="bitfield",
+                    payload_length=1,
+                    non_empty=True,
+                    payload_sha256="12" * 32,
+                    set_bits=1,
+                ),
+                PeerControlEvent(
+                    observed_at_utc="2026-10-20T10:00:02.300Z",
+                    elapsed_seconds=0.3,
+                    kind="unchoke",
+                    payload_length=0,
+                ),
+            ),
         )
         if confirmed
         else None
@@ -393,8 +583,8 @@ def _handshake(*, confirmed: bool = True, ipv6: bool = False) -> HandshakeResult
         reserved_bits_hex="00" * 8 if confirmed else None,
         local_ip="192.0.2.1" if confirmed else None,
         local_port=50000 if confirmed else None,
-        bytes_sent=68 if confirmed else 0,
-        bytes_received=68 if confirmed else 0,
+        bytes_sent=73 if confirmed else 0,
+        bytes_received=79 if confirmed else 0,
         error=None if confirmed else "Zeitüberschreitung",
         availability=availability,
     )
@@ -1219,6 +1409,7 @@ def test_result_table_uses_plain_language_and_ipv6_endpoint(tmp_path: Path) -> N
     app._show_result(result)
 
     values = app.result_tree.inserted[0][1]["values"]
+    assert app.result_tree.inserted[0][1]["tags"] == ("known_vpn",)
     assert values[2] == "[2001:4860:4860::8888]:51413"
     assert values[3] == "Teile gemeldet; Anfragen erlaubt"
     assert values[4] == "Beispielnetz"
@@ -1285,6 +1476,7 @@ def test_result_table_streams_only_positive_database_records_and_uses_totals(
     assert batch_sizes == [5]
     assert len(app.result_tree.inserted) == 1
     values = app.result_tree.inserted[0][1]["values"]
+    assert app.result_tree.inserted[0][1]["tags"] == ("availability",)
     assert values[2] == "[2001:4860:4860::8888]:51413"
     assert values[4] == "Datenbanknetz"
     assert "307 Kandidaten gefunden, 305 direkt geprüft" in app.status_text.value

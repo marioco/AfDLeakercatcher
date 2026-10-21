@@ -33,6 +33,8 @@ from bittorrent_beobachter.models import (
     NetworkEnrichment,
     PeerAvailabilityObservation,
     PeerCandidate,
+    PeerControlEvent,
+    ScanResult,
     Target,
     VpnClassification,
 )
@@ -64,9 +66,32 @@ def _handshake(
     offering: bool = True,
     completed_full_window: bool = True,
 ) -> HandshakeResult:
+    control_events = (
+        (
+            PeerControlEvent(
+                observed_at_utc="2026-10-20T10:00:01.200Z",
+                elapsed_seconds=0.2,
+                kind="bitfield",
+                payload_length=1,
+                non_empty=True,
+                payload_sha256="12" * 32,
+                set_bits=1,
+            ),
+            PeerControlEvent(
+                observed_at_utc="2026-10-20T10:00:01.300Z",
+                elapsed_seconds=0.3,
+                kind="unchoke",
+                payload_length=0,
+            ),
+        )
+        if offering
+        else ()
+    )
     availability = PeerAvailabilityObservation(
         started_at_utc="2026-10-20T10:00:01.000Z",
-        ended_at_utc="2026-10-20T10:00:02.000Z",
+        ended_at_utc=(
+            "2026-10-20T10:01:01.000Z" if completed_full_window else "2026-10-20T10:00:02.000Z"
+        ),
         requested_duration_seconds=60.0,
         duration_seconds=1.0 if not completed_full_window else 60.0,
         completed_full_window=completed_full_window,
@@ -78,12 +103,12 @@ def _handshake(
         peer_choking_at_end=not offering,
         unchoked_duration_seconds=1.0 if offering else 0.0,
         messages_received=2,
-        bytes_received=8,
+        bytes_received=11 if offering else 0,
         request_messages_sent=0,
         piece_payload_bytes_received=0,
         metadata_requests_sent=0,
         termination_reason="peer_closed" if not completed_full_window else "duration_elapsed",
-        control_events=(),
+        control_events=control_events,
         error="Peer schloss nach positiven Signalen." if not completed_full_window else None,
     )
     return HandshakeResult(
@@ -96,7 +121,7 @@ def _handshake(
         local_ip="192.0.2.20",
         local_port=50_000,
         bytes_sent=73,
-        bytes_received=77,
+        bytes_received=79 if offering else 68,
         error=None,
         availability=availability,
     )
@@ -165,6 +190,112 @@ def test_config_requires_exact_one_minute_peer_observation() -> None:
 
     with pytest.raises(ConfigError, match=r"peer\.observation_seconds"):
         config_from_dict(raw)
+
+
+def test_run_scan_preserves_existing_data_root_permissions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root = tmp_path / "shared-data"
+    data_root.mkdir(mode=0o755)
+    if os.name != "nt":
+        data_root.chmod(0o755)
+    expected = ScanResult(run_id="permissions", started_at_utc="2026-10-20T10:00:00Z")
+    monkeypatch.setattr(monitor, "_run_scan_locked", lambda *_args, **_kwargs: expected)
+
+    assert run_scan(_config(enrichment_enabled=False), data_root) is expected
+    if os.name != "nt":
+        assert stat.S_IMODE(data_root.stat().st_mode) == 0o755
+
+
+def test_run_scan_creates_new_data_root_privately(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root = tmp_path / "new-data"
+    expected = ScanResult(run_id="private", started_at_utc="2026-10-20T10:00:00Z")
+    monkeypatch.setattr(monitor, "_run_scan_locked", lambda *_args, **_kwargs: expected)
+
+    assert run_scan(_config(enrichment_enabled=False), data_root) is expected
+    if os.name != "nt":
+        assert stat.S_IMODE(data_root.stat().st_mode) == 0o700
+
+
+def test_run_scan_rejects_file_as_data_root(tmp_path: Path) -> None:
+    data_root = tmp_path / "not-a-directory"
+    data_root.write_text("kein Verzeichnis", encoding="utf-8")
+
+    with pytest.raises(MonitorError, match="kein Verzeichnis"):
+        run_scan(_config(enrichment_enabled=False), data_root)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Symlink-Erzeugung ist unter Windows eingeschränkt")
+def test_run_scan_rejects_data_root_symlink_without_touching_target(tmp_path: Path) -> None:
+    target = tmp_path / "external-data"
+    target.mkdir(mode=0o755)
+    target.chmod(0o755)
+    linked = tmp_path / "linked-data"
+    linked.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(MonitorError, match="Symlink"):
+        run_scan(_config(enrichment_enabled=False), linked)
+
+    assert linked.is_symlink()
+    assert stat.S_IMODE(target.stat().st_mode) == 0o755
+    assert tuple(target.iterdir()) == ()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Symlink-Erzeugung ist unter Windows eingeschränkt")
+def test_single_instance_lock_rejects_symlink_without_touching_target(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "external.lock"
+    target.write_bytes(b"unveraendert")
+    target.chmod(0o640)
+    target_mode = stat.S_IMODE(target.stat().st_mode)
+    linked = tmp_path / "monitor.lock"
+    linked.symlink_to(target)
+
+    with (
+        pytest.raises(MonitorError, match="symbolischer Link"),
+        monitor.single_instance_lock(linked),
+    ):
+        raise AssertionError("Symlink darf nicht gesperrt werden")
+
+    assert linked.is_symlink()
+    assert target.read_bytes() == b"unveraendert"
+    assert stat.S_IMODE(target.stat().st_mode) == target_mode
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Symlink-Erzeugung ist unter Windows eingeschränkt")
+def test_run_scan_rejects_symlink_ancestor_without_touching_target(tmp_path: Path) -> None:
+    target = tmp_path / "external-parent"
+    target.mkdir(mode=0o755)
+    target.chmod(0o755)
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(MonitorError, match="Symlink-Komponente"):
+        run_scan(_config(enrichment_enabled=False), linked_parent / "data")
+
+    assert tuple(target.iterdir()) == ()
+    assert stat.S_IMODE(target.stat().st_mode) == 0o755
+
+
+def test_app_owned_directory_rejects_symlink_without_touching_target(tmp_path: Path) -> None:
+    target = tmp_path / "external"
+    target.mkdir(mode=0o755)
+    if os.name != "nt":
+        target.chmod(0o755)
+    linked = tmp_path / "reports"
+    linked.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(MonitorError, match="Symlink"):
+        monitor._ensure_private_directory(linked, app_owned=True)
+
+    assert linked.is_symlink()
+    if os.name != "nt":
+        assert stat.S_IMODE(target.stat().st_mode) == 0o755
 
 
 def test_parse_magnet_ignores_display_name_but_keeps_udp_tracker() -> None:
@@ -578,6 +709,76 @@ def test_controlled_cancel_flushes_partial_batch_and_writes_final_reports(
     assert events[-1] == "scan_cancelled"
 
 
+def test_cancel_persists_four_finished_results_and_requeues_only_blocked_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        config = _config(enrichment_enabled=False)
+        target = config.targets[0]
+        store = RunStore(tmp_path / "cancel-partial.sqlite3")
+        candidates = tuple(_candidate(target, index) for index in range(5))
+        assert store.add_candidates(candidates) == 5
+
+        four_finished = asyncio.Event()
+        blocked_forever = asyncio.Event()
+        finished_count = 0
+
+        class BlockingVerifier:
+            def __init__(self, **_kwargs: Any) -> None:
+                pass
+
+            async def verify(
+                self,
+                candidate: PeerCandidate,
+                info_hash: bytes,
+            ) -> HandshakeResult:
+                nonlocal finished_count
+                assert info_hash == target.info_hash
+                if candidate.port == candidates[-1].port:
+                    await blocked_forever.wait()
+                result = _handshake(candidate)
+                finished_count += 1
+                if finished_count == 4:
+                    four_finished.set()
+                return result
+
+        monkeypatch.setattr(monitor, "PeerVerifier", BlockingVerifier)
+        runtimes = {
+            configured_target.info_hash_hex: monitor._TargetRuntimeMetrics(target=configured_target)
+            for configured_target in config.targets
+        }
+        producers_done = asyncio.Event()
+        producers_done.set()
+        progress_messages: list[str] = []
+        verification = asyncio.create_task(
+            monitor._verify_all_candidates(
+                config,
+                store,
+                tmp_path,
+                runtimes,
+                progress_messages.append,
+                producers_done,
+            )
+        )
+
+        await asyncio.wait_for(four_finished.wait(), timeout=1.0)
+        verification.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await verification
+
+        metrics = store.metrics_by_hash((target.info_hash_hex,))[target.info_hash_hex]
+        assert metrics.candidates == 5
+        assert metrics.done == 4
+        assert metrics.pending == 1
+        assert metrics.in_progress == 0
+        assert metrics.handshake_results == 4
+        assert metrics.offering_observed == 4
+        assert any(message.startswith("Fehlerabschluss: 4 ") for message in progress_messages)
+
+    asyncio.run(scenario())
+
+
 def test_metrics_keep_unique_checked_candidate_while_recheck_is_pending(
     tmp_path: Path,
 ) -> None:
@@ -904,5 +1105,251 @@ def test_discovery_fails_when_no_configured_source_answers(
                 [],
                 lambda _message: None,
             )
+
+    asyncio.run(scenario())
+
+
+def test_tracker_stopped_cleanup_failures_are_counted_and_reported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        target = Target(
+            "Tracker-Ziel",
+            HASH_A,
+            trackers=("udp://tracker.example:6969/announce",),
+        )
+        config = AppConfig(
+            targets=(target,),
+            dht=DhtSettings(
+                timeout_seconds=1.0,
+                overall_timeout_seconds=1.1,
+                concurrency=1,
+                quiet_seconds=1.0,
+                refresh_interval_seconds=1.0,
+                bootstrap_nodes=(),
+            ),
+        )
+        store = RunStore(tmp_path / "tracker-cleanup.sqlite3")
+        runtime = monitor._TargetRuntimeMetrics(target=target)
+        notices: list[str] = []
+        progress_messages: list[str] = []
+        clock = [0.0]
+        real_sleep = asyncio.sleep
+
+        async def fake_sleep(delay: float) -> None:
+            clock[0] += delay
+            await real_sleep(0)
+
+        async def fake_tracker_discovery(
+            _target: Target,
+            _trackers: tuple[str, ...],
+            **kwargs: Any,
+        ) -> list[PeerCandidate]:
+            stats = kwargs["stats"]
+            assert isinstance(stats, monitor.TrackerDiscoveryStats)
+            stats.queries_completed += 1
+            stats.stop_queries_failed += 1
+            return []
+
+        monkeypatch.setattr(monitor, "discover_tracker_peers", fake_tracker_discovery)
+        monkeypatch.setattr(monitor.time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(monitor.asyncio, "sleep", fake_sleep)
+
+        await monitor._discover_target_until_quiet(
+            config,
+            target,
+            (),
+            b"n" * 20,
+            store,
+            runtime,
+            tmp_path,
+            notices,
+            progress_messages.append,
+        )
+
+        assert runtime.tracker_queries_completed == 2
+        assert runtime.tracker_queries_failed == 2
+        assert any("STOPPED-Aufraeumen schlug bei 2 Anfrage(n) fehl" in item for item in notices)
+        assert any("STOPPED-Aufraeumen" in item for item in progress_messages)
+        metric = monitor._build_target_metrics(
+            config,
+            store,
+            {target.info_hash_hex: runtime},
+        )[0]
+        assert metric.tracker_queries_failed == 2
+
+    asyncio.run(scenario())
+
+
+def test_dht_and_tracker_rounds_start_in_parallel_with_two_source_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        target = Target(
+            "Parallel-Ziel",
+            HASH_A,
+            trackers=("udp://tracker.example:6969/announce",),
+        )
+        config = AppConfig(
+            targets=(target,),
+            dht=DhtSettings(
+                timeout_seconds=1.0,
+                overall_timeout_seconds=1.1,
+                concurrency=1,
+                quiet_seconds=0.0,
+                refresh_interval_seconds=0.0,
+                bootstrap_nodes=(("bootstrap.invalid", 6881),),
+            ),
+        )
+        store = RunStore(tmp_path / "parallel-sources.sqlite3")
+        runtime = monitor._TargetRuntimeMetrics(target=target)
+        active_sources = 0
+        peak_sources = 0
+        dht_calls = 0
+        tracker_calls = 0
+        timeline: list[str] = []
+        both_sources_started = asyncio.Event()
+
+        async def enter_source(kind: str) -> None:
+            nonlocal active_sources, peak_sources
+            active_sources += 1
+            peak_sources = max(peak_sources, active_sources)
+            timeline.append(f"{kind}-start")
+            if active_sources == 2:
+                both_sources_started.set()
+            try:
+                await asyncio.wait_for(both_sources_started.wait(), timeout=0.5)
+            finally:
+                timeline.append(f"{kind}-end")
+                active_sources -= 1
+
+        class ParallelCrawler:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                self.queries_started = 1
+                self.queries_completed = 1
+                self.queries_failed = 0
+                self.issue_count = 0
+                self.has_pending_work = False
+
+            async def discover(self, *_args: object, **_kwargs: object) -> list[PeerCandidate]:
+                nonlocal dht_calls
+                dht_calls += 1
+                await enter_source("dht")
+                self.queries_completed = int(dht_calls == 1)
+                if dht_calls == 2:
+                    raise OSError("simuliertes DHT-Teilproblem")
+                return []
+
+            def close(self) -> None:
+                return None
+
+        async def parallel_tracker(
+            *_args: object,
+            stats: monitor.TrackerDiscoveryStats,
+            **_kwargs: object,
+        ) -> list[PeerCandidate]:
+            nonlocal tracker_calls
+            tracker_calls += 1
+            await enter_source("tracker")
+            stats.queries_completed += 1
+            return []
+
+        monkeypatch.setattr(monitor, "DHTCrawler", ParallelCrawler)
+        monkeypatch.setattr(monitor, "discover_tracker_peers", parallel_tracker)
+
+        await asyncio.wait_for(
+            monitor._discover_target_until_quiet(
+                config,
+                target,
+                (("9.9.9.9", 6881),),
+                b"n" * 20,
+                store,
+                runtime,
+                tmp_path,
+                [],
+                lambda _message: None,
+            ),
+            timeout=1.0,
+        )
+
+        assert timeline[:2] == ["dht-start", "tracker-start"]
+        assert "dht-end" not in timeline[:2]
+        assert "tracker-end" not in timeline[:2]
+        assert peak_sources == 2
+        assert dht_calls == 2
+        assert tracker_calls == 2
+        assert runtime.dht_queries_completed == 1
+        assert runtime.dht_queries_failed == 1
+        assert runtime.tracker_queries_completed == 2
+
+    asyncio.run(scenario())
+
+
+def test_unexpected_source_failure_cancels_and_drains_parallel_sibling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        target = Target(
+            "Fehler-Ziel",
+            HASH_A,
+            trackers=("udp://tracker.example:6969/announce",),
+        )
+        config = AppConfig(targets=(target,))
+        store = RunStore(tmp_path / "source-drain.sqlite3")
+        runtime = monitor._TargetRuntimeMetrics(target=target)
+        tracker_started = asyncio.Event()
+        tracker_drained = asyncio.Event()
+        never_finishes = asyncio.Event()
+        crawler_closed = False
+
+        class FailingCrawler:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                self.queries_started = 1
+                self.queries_completed = 0
+                self.queries_failed = 0
+                self.issue_count = 0
+                self.has_pending_work = False
+
+            async def discover(self, *_args: object, **_kwargs: object) -> list[PeerCandidate]:
+                await tracker_started.wait()
+                raise RuntimeError("simulierter interner DHT-Fehler")
+
+            def close(self) -> None:
+                nonlocal crawler_closed
+                crawler_closed = True
+
+        async def blocking_tracker(*_args: object, **_kwargs: object) -> list[PeerCandidate]:
+            tracker_started.set()
+            try:
+                await never_finishes.wait()
+            finally:
+                tracker_drained.set()
+            return []
+
+        monkeypatch.setattr(monitor, "DHTCrawler", FailingCrawler)
+        monkeypatch.setattr(monitor, "discover_tracker_peers", blocking_tracker)
+
+        with pytest.raises(RuntimeError, match="interner DHT-Fehler"):
+            await asyncio.wait_for(
+                monitor._discover_target_until_quiet(
+                    config,
+                    target,
+                    (("9.9.9.9", 6881),),
+                    b"n" * 20,
+                    store,
+                    runtime,
+                    tmp_path,
+                    [],
+                    lambda _message: None,
+                ),
+                timeout=1.0,
+            )
+
+        assert tracker_started.is_set()
+        assert tracker_drained.is_set()
+        assert crawler_closed
 
     asyncio.run(scenario())

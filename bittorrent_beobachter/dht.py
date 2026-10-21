@@ -34,6 +34,7 @@ MAX_BOOTSTRAP_NODES = 16
 CANDIDATE_BATCH_SIZE = 5
 DHT_MIN_FREE_SPACE_BYTES = 100_000_000
 DHT_K_CLOSEST_NODES = 8
+DHT_MAX_ENDPOINTS_PER_NODE_ID = 3
 DHT_QUERY_SCHEDULING_MARGIN_SECONDS = 0.1
 
 BOOTSTRAP_ISSUE_DNS = "dns"
@@ -123,6 +124,7 @@ class DHTResponse:
 
     source: Endpoint
     transaction_id: bytes
+    responder_id: bytes
     nodes: tuple[DHTNode, ...]
     peers: tuple[Endpoint, ...]
     response_sha256: str
@@ -325,6 +327,7 @@ def parse_get_peers_response(
         nodes=tuple(nodes),
         peers=peers,
         response_sha256=hashlib.sha256(packet).hexdigest(),
+        responder_id=responder_id,
     )
 
 
@@ -482,6 +485,8 @@ class _DHTNodeFrontier:
                 ON node_frontier(state, priority, distance, id);
                 CREATE INDEX node_frontier_closest
                 ON node_frontier(priority, distance, id, state);
+                CREATE INDEX node_frontier_identity
+                ON node_frontier(priority, node_id, state, id);
                 """
             )
         except BaseException:
@@ -578,7 +583,12 @@ class _DHTNodeFrontier:
                     INSERT INTO node_frontier (
                         ip, port, node_id, distance, priority, state
                     )
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    SELECT ?, ?, ?, ?, ?, ?
+                    WHERE (
+                        SELECT COUNT(*)
+                        FROM node_frontier
+                        WHERE priority = 1 AND node_id = ?
+                    ) < ?
                     ON CONFLICT(ip, port) DO NOTHING
                     """,
                     (
@@ -588,11 +598,18 @@ class _DHTNodeFrontier:
                         distance,
                         1,
                         self._PENDING,
+                        node.node_id,
+                        DHT_MAX_ENDPOINTS_PER_NODE_ID,
                     ),
                 )
 
     def claim(self, size: int) -> tuple[Endpoint, ...]:
-        """Reserviert Bootstrap- oder k-nächste Zielknoten atomar zur Abfrage."""
+        """Reserviert Bootstrap- oder k-nächste Node-IDs atomar zur Abfrage.
+
+        Mehrere Endpunkte derselben bekannten Node-ID bilden eine geordnete
+        Failover-Kette. Solange der zuerst gespeicherte nicht fehlgeschlagen
+        ist, belegt nur er einen Platz im k-Nahbereich.
+        """
 
         if isinstance(size, bool) or not isinstance(size, int) or size < 1:
             raise ValueError("size muss eine positive Ganzzahl sein.")
@@ -605,10 +622,13 @@ class _DHTNodeFrontier:
                 FROM node_frontier
                 WHERE state = ? AND (
                     priority = 0 OR id IN (
-                        SELECT closest.id
+                        SELECT MIN(closest.id)
                         FROM node_frontier AS closest
-                        WHERE closest.priority = 1 AND closest.state != ?
-                        ORDER BY closest.distance, closest.id
+                        WHERE closest.priority = 1
+                          AND closest.state != ?
+                          AND closest.node_id IS NOT NULL
+                        GROUP BY closest.node_id
+                        ORDER BY MIN(closest.distance), MIN(closest.id)
                         LIMIT ?
                     )
                 )
@@ -626,6 +646,64 @@ class _DHTNodeFrontier:
             connection.rollback()
             raise
         return tuple((str(row[1]), int(row[2])) for row in rows)
+
+    def claimed_node_id(self, endpoint: Endpoint) -> bytes | None:
+        """Liefert die erwartete Node-ID eines reservierten Endpunkts."""
+
+        normalized = normalize_global_endpoint(*endpoint)
+        if normalized is None:
+            raise ValueError("DHT-Endpunkt muss global erreichbar sein.")
+        connection = self._require_connection()
+        row = connection.execute(
+            """
+            SELECT node_id
+            FROM node_frontier
+            WHERE ip = ? AND port = ? AND state = ?
+            """,
+            (normalized[0], normalized[1], self._IN_PROGRESS),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("DHT-Endpunkt war nicht als aktive Abfrage reserviert.")
+        node_id = row[0]
+        if node_id is None:
+            return None
+        if not isinstance(node_id, bytes) or len(node_id) != 20:
+            raise RuntimeError("Gespeicherte DHT-Knoten-ID ist ungültig.")
+        return node_id
+
+    def bind_node_id(self, endpoint: Endpoint, node_id: bytes, target_id: int) -> None:
+        """Bindet einen zunächst unbekannten Bootstrap-Endpunkt an seine Node-ID."""
+
+        normalized = normalize_global_endpoint(*endpoint)
+        if normalized is None:
+            raise ValueError("DHT-Endpunkt muss global erreichbar sein.")
+        if not isinstance(node_id, bytes) or len(node_id) != 20:
+            raise ValueError("DHT-Knoten-ID muss genau 20 Byte lang sein.")
+        if isinstance(target_id, bool) or not isinstance(target_id, int):
+            raise TypeError("target_id muss eine Ganzzahl sein.")
+        if not 0 <= target_id < 2**160:
+            raise ValueError("target_id muss eine 160-Bit-Ganzzahl sein.")
+        distance = (int.from_bytes(node_id, "big") ^ target_id).to_bytes(20, "big")
+        connection = self._require_connection()
+        with connection:
+            cursor = connection.execute(
+                """
+                UPDATE node_frontier
+                SET node_id = ?, distance = ?, priority = 1
+                WHERE ip = ? AND port = ? AND state = ?
+                  AND (node_id IS NULL OR node_id = ?)
+                """,
+                (
+                    node_id,
+                    distance,
+                    normalized[0],
+                    normalized[1],
+                    self._IN_PROGRESS,
+                    node_id,
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise RuntimeError("DHT-Endpunkt konnte nicht an seine Knoten-ID gebunden werden.")
 
     def mark_queried(self, endpoint: Endpoint) -> None:
         """Markiert eine beendete Abfrage endgültig als bearbeitet."""
@@ -678,10 +756,13 @@ class _DHTNodeFrontier:
                 FROM node_frontier
                 WHERE state IN (?, ?) AND (
                     priority = 0 OR id IN (
-                        SELECT closest.id
+                        SELECT MIN(closest.id)
                         FROM node_frontier AS closest
-                        WHERE closest.priority = 1 AND closest.state != ?
-                        ORDER BY closest.distance, closest.id
+                        WHERE closest.priority = 1
+                          AND closest.state != ?
+                          AND closest.node_id IS NOT NULL
+                        GROUP BY closest.node_id
+                        ORDER BY MIN(closest.distance), MIN(closest.id)
                         LIMIT ?
                     )
                 )
@@ -927,7 +1008,10 @@ class DHTCrawler:
         callback_batch: list[PeerCandidate] = []
         candidate_endpoints: set[Endpoint] | None = set() if collect else None
 
-        active: dict[asyncio.Task[DHTResponse], tuple[Endpoint, bytes]] = {}
+        active: dict[
+            asyncio.Task[DHTResponse],
+            tuple[Endpoint, bytes, bytes | None],
+        ] = {}
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.config.overall_timeout_seconds
         target_id = int.from_bytes(target.info_hash, "big")
@@ -945,11 +1029,12 @@ class DHTCrawler:
                     else ()
                 )
                 for endpoint in claimed:
+                    expected_node_id = frontier.claimed_node_id(endpoint)
                     transaction_id = self._new_transaction_id()
                     task = asyncio.create_task(
                         self._query_node(endpoint, target.info_hash, transaction_id)
                     )
-                    active[task] = (endpoint, transaction_id)
+                    active[task] = (endpoint, transaction_id, expected_node_id)
                     self.queries_started += 1
 
                 if not active:
@@ -973,7 +1058,7 @@ class DHTCrawler:
                     break
 
                 for task in done:
-                    endpoint, expected_transaction_id = active.pop(task)
+                    endpoint, expected_transaction_id, expected_node_id = active.pop(task)
                     try:
                         response = task.result()
                         if not isinstance(response, DHTResponse):
@@ -998,6 +1083,16 @@ class DHTCrawler:
                             )
                         ):
                             raise DHTProtocolError("DHT-Antworthash ist ungültig.")
+                        responder_id = response.responder_id
+                        if not isinstance(responder_id, bytes) or len(responder_id) != 20:
+                            raise DHTProtocolError("DHT-Antwort enthält keine gültige Knoten-ID.")
+                        if expected_node_id is not None and (
+                            not hmac.compare_digest(responder_id, expected_node_id)
+                        ):
+                            raise DHTProtocolError(
+                                "DHT-Antwort stammt nicht von der erwarteten Knoten-ID."
+                            )
+                        frontier.bind_node_id(endpoint, responder_id, target_id)
                     except DHTQueryError as exc:
                         self.queries_failed += 1
                         self._record_issue(errors, exc.category)

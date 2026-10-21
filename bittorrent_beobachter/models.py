@@ -3,7 +3,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
+
+OBSERVATION_ROUNDING_TOLERANCE_SECONDS = 1e-6
+OBSERVATION_WALL_CLOCK_TOLERANCE_SECONDS = 2.0
+REQUIRED_PEER_OBSERVATION_SECONDS = 60.0
+MAX_PEER_PIECE_INDEX = (1 << 32) - 1
+MAX_PEER_CONTROL_PAYLOAD_BYTES = 1_048_575
+MAX_PEER_OBSERVATION_BYTES = 4_194_304
+MAX_PEER_OBSERVATION_MESSAGES = 16_384
+MAX_RETAINED_PEER_CONTROL_EVENTS = 512
+TERMINAL_PEER_DIAGNOSTIC_KINDS = frozenset(
+    {
+        "extension_payload_rejected",
+        "request_rejected",
+        "piece_rejected",
+        "unknown_message_rejected",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,31 +129,222 @@ class HandshakeResult:
         """
         peer_choking = True
         pieces_available = False
+        bitfield_seen = False
+        offer_seen = False
         for event in observation.control_events:
             if event.kind == "unchoke":
+                if not HandshakeResult._is_empty_control_event(event):
+                    return False
                 peer_choking = False
             elif event.kind == "choke":
+                if not HandshakeResult._is_empty_control_event(event):
+                    return False
                 peer_choking = True
-            elif event.kind == "have" or (event.kind == "bitfield" and event.non_empty):
+            elif event.kind == "have":
+                if not HandshakeResult._is_valid_have_event(event):
+                    return False
                 pieces_available = True
+            elif event.kind == "bitfield":
+                if bitfield_seen or not HandshakeResult._is_valid_bitfield_event(event):
+                    return False
+                bitfield_seen = True
+                pieces_available = event.non_empty is True
+            elif event.kind == "have_none":
+                if not HandshakeResult._is_empty_control_event(event):
+                    return False
+                pieces_available = False
             if pieces_available and not peer_choking:
-                return True
+                offer_seen = True
+        return offer_seen
+
+    @staticmethod
+    def _is_empty_control_event(event: PeerControlEvent) -> bool:
         return bool(
-            observation.piece_availability_announced and not observation.peer_choking_at_end
+            type(event.payload_length) is int
+            and event.payload_length == 0
+            and event.piece_index is None
+            and event.non_empty is None
+            and event.payload_sha256 is None
+            and event.set_bits is None
         )
+
+    @staticmethod
+    def _is_valid_have_event(event: PeerControlEvent) -> bool:
+        return bool(
+            type(event.payload_length) is int
+            and event.payload_length == 4
+            and type(event.piece_index) is int
+            and 0 <= event.piece_index <= MAX_PEER_PIECE_INDEX
+            and event.non_empty is None
+            and event.payload_sha256 is None
+            and event.set_bits is None
+        )
+
+    @staticmethod
+    def _is_valid_bitfield_event(event: PeerControlEvent) -> bool:
+        digest = event.payload_sha256
+        return bool(
+            type(event.payload_length) is int
+            and event.payload_length >= 1
+            and event.piece_index is None
+            and type(event.non_empty) is bool
+            and isinstance(digest, str)
+            and len(digest) == 64
+            and all(character in "0123456789abcdef" for character in digest)
+            and type(event.set_bits) is int
+            and 0 <= event.set_bits <= event.payload_length * 8
+            and event.non_empty == (event.set_bits > 0)
+        )
+
+    @staticmethod
+    def _minimum_recorded_control_bytes(
+        events: tuple[PeerControlEvent, ...],
+    ) -> int | None:
+        """Berechnet eine konservative Untergrenze der empfangenen Wire-Bytes."""
+        total = 0
+        regular_kinds = {
+            "choke",
+            "unchoke",
+            "peer_interested",
+            "peer_not_interested",
+            "have",
+            "bitfield",
+            "port",
+            "suggest_piece",
+            "have_all",
+            "have_none",
+            "reject_request",
+            "allowed_fast",
+            "extension_handshake",
+        }
+        header_only_kinds = {
+            "request_rejected",
+            "piece_rejected",
+            "unknown_message_rejected",
+        }
+        for event in events:
+            if (
+                type(event.payload_length) is not int
+                or event.payload_length < 0
+                or event.payload_length > MAX_PEER_CONTROL_PAYLOAD_BYTES
+            ):
+                return None
+            if event.kind == "keepalive":
+                total += 4
+            elif event.kind in regular_kinds:
+                total += 5 + event.payload_length
+            elif event.kind == "extension_payload_rejected":
+                total += 6
+            elif event.kind in header_only_kinds:
+                total += 5
+            else:
+                return None
+        return total
+
+    @staticmethod
+    def _wall_clock_duration_is_consistent(
+        observation: PeerAvailabilityObservation,
+    ) -> bool:
+        try:
+            started_at = datetime.fromisoformat(observation.started_at_utc.replace("Z", "+00:00"))
+            ended_at = datetime.fromisoformat(observation.ended_at_utc.replace("Z", "+00:00"))
+            wall_clock_duration = (ended_at - started_at).total_seconds()
+        except (AttributeError, TypeError, ValueError):
+            return False
+        return bool(
+            started_at.utcoffset() is not None
+            and ended_at.utcoffset() is not None
+            and wall_clock_duration >= 0
+            and abs(wall_clock_duration - observation.duration_seconds)
+            <= OBSERVATION_WALL_CLOCK_TOLERANCE_SECONDS
+        )
+
+    @staticmethod
+    def _control_event_times_are_consistent(
+        observation: PeerAvailabilityObservation,
+    ) -> bool:
+        try:
+            started_at = datetime.fromisoformat(observation.started_at_utc.replace("Z", "+00:00"))
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if started_at.utcoffset() is None:
+            return False
+        previous_elapsed: float | None = None
+        for event in observation.control_events:
+            try:
+                observed_at = datetime.fromisoformat(event.observed_at_utc.replace("Z", "+00:00"))
+                elapsed = float(event.elapsed_seconds)
+                wall_clock_elapsed = (observed_at - started_at).total_seconds()
+            except (AttributeError, TypeError, ValueError):
+                return False
+            if (
+                observed_at.utcoffset() is None
+                or isinstance(event.elapsed_seconds, bool)
+                or elapsed < 0
+                or (previous_elapsed is not None and elapsed < previous_elapsed)
+                or abs(wall_clock_elapsed - elapsed) > OBSERVATION_WALL_CLOCK_TOLERANCE_SECONDS
+            ):
+                return False
+            previous_elapsed = elapsed
+        return True
 
     @property
     def offering_observed(self) -> bool:
         """Ein fehlerfrei über das volle Zeitfenster validierter Angebotsbefund."""
         observation = self.availability
+        minimum_control_bytes = (
+            self._minimum_recorded_control_bytes(observation.control_events)
+            if observation is not None
+            else None
+        )
+        if (
+            observation is not None
+            and type(observation.messages_received) is int
+            and len(observation.control_events)
+            == min(observation.messages_received, MAX_RETAINED_PEER_CONTROL_EVENTS)
+            and minimum_control_bytes is not None
+        ):
+            minimum_control_bytes += 4 * (
+                observation.messages_received - len(observation.control_events)
+            )
+        exact_control_bytes = bool(
+            observation is not None
+            and minimum_control_bytes is not None
+            and (
+                observation.bytes_received == minimum_control_bytes
+                if observation.messages_received <= MAX_RETAINED_PEER_CONTROL_EVENTS
+                else observation.bytes_received >= minimum_control_bytes
+            )
+        )
         return bool(
             self.confirmed
+            and self.error is None
+            and self.bytes_sent == 73
             and observation is not None
+            and self.bytes_received == 68 + observation.bytes_received
             and observation.completed_full_window
             and observation.error is None
+            and abs(observation.requested_duration_seconds - REQUIRED_PEER_OBSERVATION_SECONDS)
+            <= OBSERVATION_ROUNDING_TOLERANCE_SECONDS
+            and observation.duration_seconds + OBSERVATION_ROUNDING_TOLERANCE_SECONDS
+            >= observation.requested_duration_seconds
+            and self._wall_clock_duration_is_consistent(observation)
+            and self._control_event_times_are_consistent(observation)
+            and observation.termination_reason == "duration_elapsed"
             and observation.interested_sent
             and observation.piece_availability_announced
             and observation.unchoked
+            and type(observation.messages_received) is int
+            and 0 <= observation.messages_received <= MAX_PEER_OBSERVATION_MESSAGES
+            and len(observation.control_events)
+            == min(observation.messages_received, MAX_RETAINED_PEER_CONTROL_EVENTS)
+            and type(observation.bytes_received) is int
+            and 0 <= observation.bytes_received <= MAX_PEER_OBSERVATION_BYTES
+            and minimum_control_bytes is not None
+            and exact_control_bytes
+            and not any(
+                event.kind in TERMINAL_PEER_DIAGNOSTIC_KINDS for event in observation.control_events
+            )
             and self._simultaneous_offer_observed(observation)
             and observation.request_messages_sent == 0
             and observation.piece_payload_bytes_received == 0

@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import tempfile
 import unittest
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import patch
 
 import bittorrent_beobachter.peer as peer_module
-from bittorrent_beobachter.models import PeerCandidate, ScanResult
+from bittorrent_beobachter.models import HandshakeResult, PeerCandidate, ScanResult
 from bittorrent_beobachter.peer import (
     HANDSHAKE_LENGTH,
     INTERESTED_MESSAGE,
+    MAX_OBSERVATION_MESSAGES,
     MAX_PEER_MESSAGE_LENGTH,
     PROTOCOL_NAME,
     PeerHandshakeError,
@@ -19,6 +24,7 @@ from bittorrent_beobachter.peer import (
     build_handshake,
     parse_handshake_response,
 )
+from bittorrent_beobachter.run_store import RunStore
 
 INFO_HASH = b"h" * 20
 LOCAL_PEER_ID = b"-TEST00-123456789012"
@@ -114,6 +120,26 @@ async def run_verifier(
     return result, fake_socket, fake_loop
 
 
+def as_production_window(result: HandshakeResult) -> HandshakeResult:
+    availability = result.availability
+    assert availability is not None
+    started_at = datetime.fromisoformat(availability.started_at_utc.replace("Z", "+00:00"))
+    ended_at = (
+        (started_at.astimezone(UTC) + timedelta(seconds=60))
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+    return replace(
+        result,
+        availability=replace(
+            availability,
+            ended_at_utc=ended_at,
+            requested_duration_seconds=60.0,
+            duration_seconds=60.0,
+        ),
+    )
+
+
 class PeerHandshakeTests(unittest.TestCase):
     def test_outgoing_handshake_is_exactly_standard_and_featureless(self) -> None:
         handshake = build_handshake(INFO_HASH, LOCAL_PEER_ID)
@@ -151,7 +177,8 @@ class PeerVerifierTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(result.confirmed)
-        self.assertTrue(result.offering_observed)
+        production_result = as_production_window(result)
+        self.assertTrue(production_result.offering_observed)
         self.assertEqual(
             fake_loop.sent,
             [build_handshake(INFO_HASH, LOCAL_PEER_ID), INTERESTED_MESSAGE],
@@ -184,11 +211,80 @@ class PeerVerifierTests(unittest.IsolatedAsyncioTestCase):
         scan_result = ScanResult(
             run_id="test-run",
             started_at_utc="2026-10-20T12:00:00Z",
-            handshakes=[result],
+            handshakes=[production_result],
         )
         self.assertEqual(scan_result.offering_count, 1)
         self.assertFalse(fake_socket.blocking)
         self.assertTrue(fake_socket.closed)
+
+    async def test_event_storage_bound_does_not_stop_an_early_offer(self) -> None:
+        have_messages = b"".join(peer_message(4, index.to_bytes(4, "big")) for index in range(513))
+        wire = peer_message(1) + peer_message(5, b"\x80") + have_messages + peer_message(0)
+
+        result, _fake_socket, fake_loop = await run_verifier(
+            wire,
+            close_when_empty=False,
+            observation_seconds=0.5,
+        )
+
+        observation = result.availability
+        assert observation is not None
+        self.assertTrue(as_production_window(result).offering_observed)
+        self.assertTrue(observation.completed_full_window)
+        self.assertIsNone(observation.error)
+        self.assertTrue(observation.peer_choking_at_end)
+        self.assertEqual(observation.termination_reason, "duration_elapsed")
+        self.assertEqual(observation.messages_received, 516)
+        self.assertEqual(len(observation.control_events), peer_module.MAX_CONTROL_EVENTS)
+        self.assertEqual(fake_loop.incoming, bytearray())
+
+    async def test_event_storage_bound_preserves_an_offer_observed_after_it(self) -> None:
+        wire = (
+            b"\x00\x00\x00\x00" * 513
+            + peer_message(1)
+            + peer_message(4, (23).to_bytes(4, "big"))
+            + peer_message(0)
+        )
+
+        result, _fake_socket, fake_loop = await run_verifier(
+            wire,
+            close_when_empty=False,
+            observation_seconds=0.5,
+        )
+
+        observation = result.availability
+        assert observation is not None
+        self.assertTrue(as_production_window(result).offering_observed)
+        self.assertTrue(observation.completed_full_window)
+        self.assertIsNone(observation.error)
+        self.assertTrue(observation.peer_choking_at_end)
+        self.assertEqual(observation.termination_reason, "duration_elapsed")
+        self.assertEqual(observation.messages_received, 516)
+        self.assertEqual(len(observation.control_events), peer_module.MAX_CONTROL_EVENTS)
+        self.assertEqual(
+            [event.kind for event in observation.control_events[-2:]],
+            ["unchoke", "have"],
+        )
+        self.assertEqual(fake_loop.incoming, bytearray())
+
+    async def test_keepalive_flood_stops_at_bounded_message_limit(self) -> None:
+        wire = b"\x00\x00\x00\x00" * (MAX_OBSERVATION_MESSAGES + 1)
+
+        result, _fake_socket, fake_loop = await run_verifier(
+            wire,
+            close_when_empty=False,
+            observation_seconds=1.0,
+        )
+
+        observation = result.availability
+        assert observation is not None
+        self.assertFalse(result.offering_observed)
+        self.assertFalse(observation.completed_full_window)
+        self.assertEqual(observation.termination_reason, "message_limit")
+        self.assertIn("Nachrichten", observation.error or "")
+        self.assertEqual(observation.messages_received, MAX_OBSERVATION_MESSAGES + 1)
+        self.assertEqual(len(observation.control_events), peer_module.MAX_CONTROL_EVENTS)
+        self.assertEqual(fake_loop.incoming, bytearray())
 
     async def test_choke_timeline_records_end_state(self) -> None:
         wire = peer_message(1) + peer_message(0) + peer_message(5, b"\x80")
@@ -207,6 +303,54 @@ class PeerVerifierTests(unittest.IsolatedAsyncioTestCase):
             [event.kind for event in observation.control_events],
             ["unchoke", "choke", "bitfield"],
         )
+
+    async def test_repeated_bitfield_is_rejected_without_false_offer(self) -> None:
+        second_bitfield = b"\x00"
+        wire = peer_message(5, b"\x80") + peer_message(5, second_bitfield) + peer_message(1)
+
+        result, _fake_socket, fake_loop = await run_verifier(
+            wire,
+            close_when_empty=False,
+        )
+
+        observation = result.availability
+        assert observation is not None
+        self.assertTrue(result.confirmed)
+        self.assertFalse(result.offering_observed)
+        self.assertFalse(observation.completed_full_window)
+        self.assertEqual(observation.termination_reason, "protocol_or_network_error")
+        self.assertIn("mehr als eine BITFIELD", observation.error or "")
+        self.assertEqual(
+            [event.kind for event in observation.control_events],
+            ["bitfield"],
+        )
+        self.assertEqual(fake_loop.incoming, bytearray(second_bitfield + peer_message(1)))
+
+    async def test_terminal_partial_frames_remain_persistable_diagnostics(self) -> None:
+        cases = (
+            ("oversized", (MAX_PEER_MESSAGE_LENGTH + 1).to_bytes(4, "big")),
+            ("malformed-have", peer_message(4, b"bad")),
+            ("repeated-bitfield", peer_message(5, b"\x80") + peer_message(5, b"\x00")),
+            ("incomplete-have", b"\x00\x00\x00\x05\x04\x00\x01"),
+        )
+        for label, wire in cases:
+            with self.subTest(label=label):
+                result, _fake_socket, _fake_loop = await run_verifier(
+                    wire,
+                    close_when_empty=True,
+                )
+                observation = result.availability
+                assert observation is not None
+                self.assertFalse(result.offering_observed)
+                self.assertIsNotNone(observation.error)
+                with tempfile.TemporaryDirectory() as temp_name:
+                    store = RunStore(Path(temp_name) / "run.sqlite3")
+                    self.assertEqual(store.add_candidates([result.candidate]), 1)
+                    self.assertEqual(
+                        store.claim_candidate_batch([result.candidate.info_hash_hex]),
+                        [result.candidate],
+                    )
+                    self.assertEqual(store.store_handshake_batch([result]), 1)
 
     async def test_early_disconnect_preserves_signals_without_positive_gate(self) -> None:
         wire = peer_message(1) + peer_message(5, b"\x80")
@@ -332,6 +476,38 @@ class PeerVerifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [event.kind for event in observation.control_events],
             ["unchoke", "have_none"],
+        )
+
+    async def test_have_none_clears_prior_piece_state_before_unchoke(self) -> None:
+        result, _fake_socket, _fake_loop = await run_verifier(
+            peer_message(4, (1).to_bytes(4, "big")) + peer_message(15) + peer_message(1),
+            close_when_empty=False,
+        )
+
+        observation = result.availability
+        assert observation is not None
+        self.assertTrue(observation.completed_full_window)
+        self.assertIsNone(observation.error)
+        self.assertFalse(result.offering_observed)
+        self.assertEqual(
+            [event.kind for event in observation.control_events],
+            ["have", "have_none", "unchoke"],
+        )
+
+    async def test_empty_bitfield_clears_prior_piece_state_before_unchoke(self) -> None:
+        result, _fake_socket, _fake_loop = await run_verifier(
+            peer_message(4, (1).to_bytes(4, "big")) + peer_message(5, b"\x00") + peer_message(1),
+            close_when_empty=False,
+        )
+
+        observation = result.availability
+        assert observation is not None
+        self.assertTrue(observation.completed_full_window)
+        self.assertIsNone(observation.error)
+        self.assertFalse(result.offering_observed)
+        self.assertEqual(
+            [event.kind for event in observation.control_events],
+            ["have", "bitfield", "unchoke"],
         )
 
     async def test_malformed_supported_control_frames_stop_before_payload(self) -> None:

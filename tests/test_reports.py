@@ -23,6 +23,7 @@ from bittorrent_beobachter.models import (
     NetworkEnrichment,
     PeerAvailabilityObservation,
     PeerCandidate,
+    PeerControlEvent,
     ScanResult,
     TargetScanMetrics,
     VpnClassification,
@@ -98,6 +99,13 @@ def _evidence_record(
         response_sha256=f"{sequence:064x}",
         source_note=source_note,
     )
+    effective_availability = (
+        availability
+        if availability is not None
+        else _availability_observation()
+        if confirmed and reportable
+        else None
+    )
     handshake = HandshakeResult(
         candidate=candidate,
         attempted_at_utc=f"2026-10-20T10:{minute}:01Z",
@@ -107,16 +115,16 @@ def _evidence_record(
         reserved_bits_hex=("0000000000100005" if confirmed else None),
         local_ip="203.0.113.200",
         local_port=40000 + sequence,
-        bytes_sent=68,
-        bytes_received=68 if confirmed else 0,
-        error=None if confirmed else "Verbindung abgelehnt",
-        availability=(
-            availability
-            if availability is not None
-            else _availability_observation()
-            if confirmed and reportable
-            else None
+        bytes_sent=73 if effective_availability is not None else 68,
+        bytes_received=(
+            68 + effective_availability.bytes_received
+            if effective_availability is not None
+            else 68
+            if confirmed
+            else 0
         ),
+        error=None if confirmed else "Verbindung abgelehnt",
+        availability=effective_availability,
     )
     enrichment = NetworkEnrichment(
         ip=ip,
@@ -163,13 +171,29 @@ def _availability_observation() -> PeerAvailabilityObservation:
         unchoked=True,
         peer_choking_at_end=False,
         unchoked_duration_seconds=59.5,
-        messages_received=4,
-        bytes_received=128,
+        messages_received=2,
+        bytes_received=11,
         request_messages_sent=0,
         piece_payload_bytes_received=0,
         metadata_requests_sent=0,
-        termination_reason="Beobachtungszeit vollständig erreicht",
-        control_events=(),
+        termination_reason="duration_elapsed",
+        control_events=(
+            PeerControlEvent(
+                observed_at_utc="2026-10-20T10:09:02.200Z",
+                elapsed_seconds=0.2,
+                kind="bitfield",
+                payload_length=1,
+                non_empty=True,
+                payload_sha256="12" * 32,
+                set_bits=1,
+            ),
+            PeerControlEvent(
+                observed_at_utc="2026-10-20T10:09:02.300Z",
+                elapsed_seconds=0.3,
+                kind="unchoke",
+                payload_length=0,
+            ),
+        ),
     )
 
 
@@ -1330,6 +1354,33 @@ class FilenameAndValidationTests(unittest.TestCase):
             safe_ip_filename("../../bericht")
         self.assertEqual(_format_endpoint("198.51.100.7", 6881), "198.51.100.7:6881")
         self.assertEqual(_format_endpoint("2001:db8::7", 6881), "[2001:db8::7]:6881")
+
+    def test_report_output_directory_must_not_be_a_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            external = root / "external"
+            external.mkdir()
+            linked_output = root / "linked-output"
+            linked_output.symlink_to(external, target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, "Symlink"):
+                generate_reports(_scan_result(), linked_output, ReportConfig())
+
+            self.assertEqual(list(external.iterdir()), [])
+
+    @unittest.skipIf(os.name == "nt", "Symlink-Erzeugung ist unter Windows eingeschränkt")
+    def test_report_output_directory_must_not_have_symlink_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            external = root / "external-parent"
+            external.mkdir()
+            alias = root / "alias"
+            alias.symlink_to(external, target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, "Symlink-Komponente"):
+                generate_reports(_scan_result(), alias / "reports", ReportConfig())
+
+            self.assertEqual(list(external.iterdir()), [])
 
     @unittest.skipUnless(REPORTLAB_AVAILABLE, "ReportLab ist nicht installiert")
     def test_header_injection_is_rejected_before_writing(self) -> None:

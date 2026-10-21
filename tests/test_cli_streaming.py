@@ -41,6 +41,90 @@ def test_setup_logging_preserves_existing_custom_parent_permissions(tmp_path: Pa
     assert configured is logger
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Symlink-Erzeugung ist unter Windows eingeschränkt")
+def test_setup_logging_rejects_symlink_without_touching_target(tmp_path: Path) -> None:
+    target = tmp_path / "external.log"
+    target.write_text("unverändert", encoding="utf-8")
+    target.chmod(0o644)
+    linked = tmp_path / "monitor.log"
+    linked.symlink_to(target)
+    logger = logging.getLogger("bittorrent_beobachter")
+    previous_handlers = logger.handlers[:]
+    logger.handlers.clear()
+
+    try:
+        with pytest.raises(OSError, match="Symlink"):
+            cli.setup_logging(linked)
+    finally:
+        logger.handlers[:] = previous_handlers
+
+    assert target.read_text(encoding="utf-8") == "unverändert"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o644
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Symlink-Erzeugung ist unter Windows eingeschränkt")
+def test_cli_rejects_symlink_data_root_before_creating_logs(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    target = tmp_path / "external-data"
+    target.mkdir(mode=0o755)
+    target.chmod(0o755)
+    linked = tmp_path / "linked-data"
+    linked.symlink_to(target, target_is_directory=True)
+
+    assert cli.main(["--data-dir", str(linked), "verify-journal"]) == 2
+
+    captured = capsys.readouterr()
+    assert "Datenpfad darf keine Symlink-Komponente enthalten" in captured.err
+    assert tuple(target.iterdir()) == ()
+    assert stat.S_IMODE(target.stat().st_mode) == 0o755
+
+
+def test_cli_reports_unreadable_path_without_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def deny_path_inspection(_path: Path) -> bool:
+        raise PermissionError("Pfad darf nicht gelesen werden")
+
+    monkeypatch.setattr(cli, "_path_has_symlink_component", deny_path_inspection)
+
+    assert cli.main(["--data-dir", str(tmp_path / "blocked"), "verify-journal"]) == 2
+
+    captured = capsys.readouterr()
+    assert "Pfad darf nicht gelesen werden" in captured.err
+    assert "Traceback" not in captured.err
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Symlink-Erzeugung ist unter Windows eingeschränkt")
+@pytest.mark.parametrize(
+    ("environment_name", "suffix"),
+    (
+        ("BITTORRENT_BEOBACHTER_DATA_DIR", "data"),
+        ("BITTORRENT_BEOBACHTER_CONFIG", "config.json"),
+    ),
+)
+def test_cli_rejects_symlink_component_from_environment_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    environment_name: str,
+    suffix: str,
+) -> None:
+    external = tmp_path / "external"
+    external.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(external, target_is_directory=True)
+    monkeypatch.setenv(environment_name, str(alias / suffix))
+
+    assert cli.main(["verify-journal"]) == 2
+
+    assert "Symlink-Komponente" in capsys.readouterr().err
+    assert tuple(external.iterdir()) == ()
+
+
 def test_cli_logging_start_error_is_readable_without_traceback(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -265,6 +349,76 @@ def test_watch_passes_stop_event_to_active_scan(
     assert cli._watch(tmp_path / "config.json", tmp_path, mock.Mock()) == 0
     assert len(received_events) == 1
     assert received_events[0].is_set()
+
+
+def test_watch_continues_after_monitor_error_then_stops_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received_events: list[threading.Event] = []
+
+    def fake_scan_once(
+        _config_path: Path,
+        _data_dir: Path,
+        _logger: object,
+        *,
+        cancel_event: threading.Event | None,
+    ) -> int:
+        assert cancel_event is not None
+        received_events.append(cancel_event)
+        if len(received_events) == 1:
+            raise monitor.MonitorError("temporärer Laufabbruch")
+        cancel_event.set()
+        return 0
+
+    logger = mock.Mock()
+    monkeypatch.setattr(cli.signal, "signal", lambda *_args: signal.SIG_DFL)
+    monkeypatch.setattr(cli, "_scan_once", fake_scan_once)
+    monkeypatch.setattr(
+        cli,
+        "load_config",
+        lambda _path: types.SimpleNamespace(interval_minutes=0),
+    )
+
+    assert cli._watch(tmp_path / "config.json", tmp_path, logger) == 0
+    assert len(received_events) == 2
+    assert received_events[0] is received_events[1]
+    assert received_events[1].is_set()
+    logger.exception.assert_called_once_with(
+        "Prüflauf fehlgeschlagen; die Überwachung wird nach dem Intervall fortgesetzt"
+    )
+    logger.info.assert_any_call(
+        "Nächster Prüflauf in %d Minuten (letzter Exitcode %d)",
+        0,
+        1,
+    )
+
+
+def test_verify_journal_reports_missing_file_without_creating_it(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    journal_path = tmp_path / "evidence" / "events.jsonl"
+
+    assert cli._verify_journal(tmp_path) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == f"FEHLER: Kein Evidenzjournal vorhanden: {journal_path}\n"
+    assert not journal_path.parent.exists()
+
+
+def test_verify_journal_accepts_existing_empty_chain(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    journal_path = tmp_path / "evidence" / "events.jsonl"
+    journal_path.parent.mkdir()
+    journal_path.write_bytes(b"")
+
+    assert cli._verify_journal(tmp_path) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == f"Hash-Kette ist gültig: {journal_path} (0 Ereignis(se))\n"
 
 
 @pytest.mark.parametrize(

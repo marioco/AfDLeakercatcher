@@ -51,7 +51,16 @@ def _candidate(info_hash: str, index: int) -> PeerCandidate:
 
 
 def _handshake(candidate: PeerCandidate) -> HandshakeResult:
-    event = PeerControlEvent(
+    bitfield_event = PeerControlEvent(
+        observed_at_utc="2026-10-20T10:00:01.500Z",
+        elapsed_seconds=0.5,
+        kind="bitfield",
+        payload_length=1,
+        non_empty=True,
+        payload_sha256="12" * 32,
+        set_bits=1,
+    )
+    unchoke_event = PeerControlEvent(
         observed_at_utc="2026-10-20T10:00:02.000Z",
         elapsed_seconds=1.0,
         kind="unchoke",
@@ -71,12 +80,12 @@ def _handshake(candidate: PeerCandidate) -> HandshakeResult:
         peer_choking_at_end=False,
         unchoked_duration_seconds=59.0,
         messages_received=2,
-        bytes_received=9,
+        bytes_received=11,
         request_messages_sent=0,
         piece_payload_bytes_received=0,
         metadata_requests_sent=0,
         termination_reason="duration_elapsed",
-        control_events=(event,),
+        control_events=(bitfield_event, unchoke_event),
     )
     return HandshakeResult(
         candidate=candidate,
@@ -88,7 +97,7 @@ def _handshake(candidate: PeerCandidate) -> HandshakeResult:
         local_ip="192.0.2.20",
         local_port=50_000,
         bytes_sent=73,
-        bytes_received=77,
+        bytes_received=79,
         error=None,
         availability=availability,
     )
@@ -159,7 +168,6 @@ def test_four_candidate_batch_is_atomic_streamed_and_private(tmp_path: Path) -> 
             base_results[2].availability,
             non_empty_bitfield=False,
             piece_availability_announced=False,
-            termination_reason="peer_closed",
         ),
     )
     assert base_results[3].availability is not None
@@ -189,7 +197,7 @@ def test_four_candidate_batch_is_atomic_streamed_and_private(tmp_path: Path) -> 
             "confirmation:not_confirmed": 1,
             "error:availability": 1,
             "error:handshake": 1,
-            "termination:peer_closed": 1,
+            "termination:duration_elapsed": 1,
             "termination:protocol_or_network_error": 1,
         },
         HASH_B: {},
@@ -222,6 +230,553 @@ def test_five_candidates_are_deduplicated_claimed_and_stored(tmp_path: Path) -> 
     assert metrics.offering_observed == 5
     assert metrics.terminal_failures == 0
     assert store.failure_reasons_by_hash([HASH_A]) == {HASH_A: {}}
+
+
+def test_handshake_result_count_reports_unique_stored_progress(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run.sqlite3")
+    candidates_a = [_candidate(HASH_A, index) for index in range(3)]
+    candidates_b = [_candidate(HASH_B, 10 + index) for index in range(2)]
+    assert store.add_candidates([*candidates_a, *candidates_b]) == 5
+    assert store.handshake_result_count() == 0
+
+    claimed_a = store.claim_candidate_batch([HASH_A], size=2)
+    assert store.store_handshake_batch(_handshake(candidate) for candidate in claimed_a) == 2
+    claimed_b = store.claim_candidate_batch([HASH_B], size=1)
+    assert store.store_handshake_batch(_handshake(candidate) for candidate in claimed_b) == 1
+
+    assert store.handshake_result_count() == 3
+    assert store.handshake_result_count([HASH_A]) == 2
+    assert store.handshake_result_count([HASH_B, HASH_B]) == 1
+    with pytest.raises(RunStoreError, match="Infohash"):
+        store.handshake_result_count(["kein-infohash"])
+
+
+@pytest.mark.parametrize(
+    ("corruption", "expected_error"),
+    (
+        ("short_full_window", "unterschreitet"),
+        ("wrong_full_window_reason", "Abschlussgrund"),
+        ("wall_clock_duration_mismatch", "UTC-Zeitfenster"),
+        ("event_wall_clock_mismatch", "UTC-Zeitpunkt"),
+        ("impossible_have", "HAVE-Kontrollereignis"),
+        ("oversized_piece_index", "vier Byte breite Wire-Feld"),
+        ("oversized_payload", "Peer-Wire-Limit"),
+        ("impossible_bitfield", "BITFIELD-Kontrollereignis"),
+        ("duplicate_bitfield", "nur ein BITFIELD"),
+        ("nonmonotonic_events", "nicht monoton"),
+        ("event_after_duration", "hinter der protokollierten"),
+    ),
+)
+def test_store_handshake_batch_rejects_invalid_availability_timeline(
+    tmp_path: Path,
+    corruption: str,
+    expected_error: str,
+) -> None:
+    store = RunStore(tmp_path / "run.sqlite3")
+    candidate = _candidate(HASH_A, 20)
+    handshake = _handshake(candidate)
+    availability = handshake.availability
+    assert availability is not None
+    first_event = availability.control_events[0]
+    if corruption == "short_full_window":
+        availability = replace(availability, duration_seconds=59.0)
+    elif corruption == "wrong_full_window_reason":
+        availability = replace(availability, termination_reason="peer_closed")
+    elif corruption == "wall_clock_duration_mismatch":
+        availability = replace(
+            availability,
+            ended_at_utc=availability.started_at_utc,
+            control_events=tuple(
+                replace(event, observed_at_utc=availability.started_at_utc)
+                for event in availability.control_events
+            ),
+        )
+    elif corruption == "event_wall_clock_mismatch":
+        availability = replace(
+            availability,
+            control_events=(
+                replace(first_event, observed_at_utc="2026-10-20T10:01:00.000Z"),
+                replace(
+                    availability.control_events[1],
+                    observed_at_utc="2026-10-20T10:00:02.000Z",
+                ),
+            ),
+        )
+    elif corruption == "impossible_have":
+        handshake = replace(handshake, bytes_received=73)
+        availability = replace(
+            availability,
+            messages_received=1,
+            bytes_received=5,
+            control_events=(
+                replace(
+                    first_event,
+                    kind="have",
+                    payload_length=0,
+                    piece_index=None,
+                    non_empty=None,
+                    payload_sha256=None,
+                    set_bits=None,
+                ),
+            ),
+        )
+    elif corruption == "oversized_piece_index":
+        handshake = replace(handshake, bytes_received=82)
+        availability = replace(
+            availability,
+            bytes_received=14,
+            control_events=(
+                replace(
+                    first_event,
+                    kind="have",
+                    payload_length=4,
+                    piece_index=1 << 32,
+                    non_empty=None,
+                    payload_sha256=None,
+                    set_bits=None,
+                ),
+                availability.control_events[1],
+            ),
+        )
+    elif corruption == "oversized_payload":
+        oversized_length = 1_048_576
+        availability = replace(
+            availability,
+            bytes_received=oversized_length + 10,
+            control_events=(
+                replace(first_event, payload_length=oversized_length),
+                availability.control_events[1],
+            ),
+        )
+        handshake = replace(
+            handshake,
+            bytes_received=68 + availability.bytes_received,
+        )
+    elif corruption == "impossible_bitfield":
+        handshake = replace(handshake, bytes_received=73)
+        availability = replace(
+            availability,
+            messages_received=1,
+            bytes_received=5,
+            control_events=(replace(first_event, payload_length=0),),
+        )
+    elif corruption == "duplicate_bitfield":
+        handshake = replace(handshake, bytes_received=85)
+        availability = replace(
+            availability,
+            messages_received=3,
+            bytes_received=17,
+            control_events=(
+                first_event,
+                replace(
+                    first_event,
+                    observed_at_utc="2026-10-20T10:00:01.750Z",
+                    elapsed_seconds=0.75,
+                    non_empty=False,
+                    set_bits=0,
+                    payload_sha256="34" * 32,
+                ),
+                availability.control_events[1],
+            ),
+        )
+    elif corruption == "nonmonotonic_events":
+        handshake = replace(handshake, bytes_received=83)
+        availability = replace(
+            availability,
+            bytes_received=15,
+            control_events=(
+                first_event,
+                replace(
+                    first_event,
+                    observed_at_utc="2026-10-20T10:00:03.000Z",
+                    elapsed_seconds=0.25,
+                    kind="have",
+                    payload_length=4,
+                    piece_index=1,
+                    non_empty=None,
+                    payload_sha256=None,
+                    set_bits=None,
+                ),
+            ),
+        )
+    elif corruption == "event_after_duration":
+        handshake = replace(handshake, bytes_received=74)
+        availability = replace(
+            availability,
+            messages_received=1,
+            bytes_received=6,
+            control_events=(replace(first_event, elapsed_seconds=60.000002),),
+        )
+    else:
+        raise AssertionError(f"Unbekannter Testfall: {corruption}")
+
+    assert store.add_candidates([candidate]) == 1
+    assert store.claim_candidate_batch([HASH_A]) == [candidate]
+    with pytest.raises(RunStoreError, match=expected_error):
+        store.store_handshake_batch([replace(handshake, availability=availability)])
+    assert store.handshake_result_count() == 0
+
+
+def test_summary_flags_without_control_event_proof_are_not_an_offer(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run.sqlite3")
+    candidate = _candidate(HASH_A, 22)
+    handshake = _handshake(candidate)
+    availability = handshake.availability
+    assert availability is not None
+    without_proof = replace(
+        availability,
+        messages_received=0,
+        bytes_received=0,
+        control_events=(),
+    )
+    result = replace(handshake, bytes_received=68, availability=without_proof)
+
+    assert not result.offering_observed
+    assert store.add_candidates([candidate]) == 1
+    assert store.claim_candidate_batch([HASH_A]) == [candidate]
+    assert store.store_handshake_batch([result]) == 1
+    assert store.metrics_by_hash()[HASH_A].offering_observed == 0
+
+    unchoke = availability.control_events[1]
+    impossible_have = replace(
+        availability.control_events[0],
+        kind="have",
+        payload_length=0,
+        piece_index=None,
+        non_empty=None,
+        payload_sha256=None,
+        set_bits=None,
+    )
+    assert not replace(
+        handshake,
+        availability=replace(
+            availability,
+            control_events=(impossible_have, unchoke),
+        ),
+    ).offering_observed
+    assert not replace(
+        handshake,
+        bytes_received=82,
+        availability=replace(
+            availability,
+            bytes_received=14,
+            control_events=(
+                replace(
+                    availability.control_events[0],
+                    kind="have",
+                    payload_length=4,
+                    piece_index=1 << 32,
+                    non_empty=None,
+                    payload_sha256=None,
+                    set_bits=None,
+                ),
+                unchoke,
+            ),
+        ),
+    ).offering_observed
+
+    duplicate_bitfield = replace(
+        availability.control_events[0],
+        observed_at_utc="2026-10-20T10:00:01.750Z",
+        elapsed_seconds=0.75,
+        non_empty=False,
+        set_bits=0,
+        payload_sha256="34" * 32,
+    )
+    assert not replace(
+        handshake,
+        bytes_received=85,
+        availability=replace(
+            availability,
+            messages_received=3,
+            bytes_received=17,
+            control_events=(
+                availability.control_events[0],
+                duplicate_bitfield,
+                unchoke,
+            ),
+        ),
+    ).offering_observed
+
+    have_none = replace(
+        unchoke,
+        observed_at_utc="2026-10-20T10:00:01.750Z",
+        elapsed_seconds=0.75,
+        kind="have_none",
+    )
+    assert not replace(
+        handshake,
+        bytes_received=84,
+        availability=replace(
+            availability,
+            messages_received=3,
+            bytes_received=16,
+            control_events=(availability.control_events[0], have_none, unchoke),
+        ),
+    ).offering_observed
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    (
+        ({"bytes_sent": 0}, "mindestens 68"),
+        ({"bytes_received": 0}, "mindestens 68"),
+        ({"bytes_sent": 74}, "genau 73"),
+    ),
+)
+def test_confirmed_handshake_rejects_impossible_wire_counters(
+    tmp_path: Path,
+    mutation: dict[str, int],
+    expected_error: str,
+) -> None:
+    store = RunStore(tmp_path / "run.sqlite3")
+    candidate = _candidate(HASH_A, 25)
+    result = replace(_handshake(candidate), **mutation)
+
+    assert not result.offering_observed
+    assert store.add_candidates([candidate]) == 1
+    assert store.claim_candidate_batch([HASH_A]) == [candidate]
+    with pytest.raises(RunStoreError, match=expected_error):
+        store.store_handshake_batch([result])
+
+
+def test_positive_handshake_rejects_impossible_observation_counters(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run.sqlite3")
+    candidate = _candidate(HASH_A, 26)
+    handshake = _handshake(candidate)
+    availability = handshake.availability
+    assert availability is not None
+    impossible = replace(
+        handshake,
+        bytes_received=68,
+        availability=replace(
+            availability,
+            messages_received=0,
+            bytes_received=0,
+        ),
+    )
+
+    assert not impossible.offering_observed
+    assert store.add_candidates([candidate]) == 1
+    assert store.claim_candidate_batch([HASH_A]) == [candidate]
+    with pytest.raises(RunStoreError, match="Kontrollnachrichten"):
+        store.store_handshake_batch([impossible])
+
+
+def test_positive_handshake_rejects_message_count_without_wire_bytes(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run.sqlite3")
+    candidate = _candidate(HASH_A, 27)
+    handshake = _handshake(candidate)
+    availability = handshake.availability
+    assert availability is not None
+    impossible = replace(
+        handshake,
+        availability=replace(availability, messages_received=1_000_000),
+    )
+
+    assert not impossible.offering_observed
+    assert store.add_candidates([candidate]) == 1
+    assert store.claim_candidate_batch([HASH_A]) == [candidate]
+    with pytest.raises(RunStoreError, match="gespeicherte Ereigniszahl"):
+        store.store_handshake_batch([impossible])
+
+
+@pytest.mark.parametrize(
+    ("messages_received", "bytes_received", "expected_error"),
+    (
+        (3, 15, "gespeicherte Ereigniszahl"),
+        (2, 12, "passen nicht exakt"),
+    ),
+)
+def test_positive_handshake_rejects_omitted_or_surplus_control_bytes(
+    tmp_path: Path,
+    messages_received: int,
+    bytes_received: int,
+    expected_error: str,
+) -> None:
+    store = RunStore(tmp_path / "run.sqlite3")
+    candidate = _candidate(HASH_A, 28)
+    handshake = _handshake(candidate)
+    availability = handshake.availability
+    assert availability is not None
+    impossible = replace(
+        handshake,
+        bytes_received=68 + bytes_received,
+        availability=replace(
+            availability,
+            messages_received=messages_received,
+            bytes_received=bytes_received,
+        ),
+    )
+
+    assert not impossible.offering_observed
+    assert store.add_candidates([candidate]) == 1
+    assert store.claim_candidate_batch([HASH_A]) == [candidate]
+    with pytest.raises(RunStoreError, match=expected_error):
+        store.store_handshake_batch([impossible])
+
+
+def test_offer_property_rejects_counters_beyond_live_observation_limits() -> None:
+    handshake = _handshake(_candidate(HASH_A, 29))
+    availability = handshake.availability
+    assert availability is not None
+
+    too_many_messages = replace(
+        handshake,
+        bytes_received=80_071,
+        availability=replace(
+            availability,
+            messages_received=20_000,
+            bytes_received=80_003,
+        ),
+    )
+    too_many_bytes = replace(
+        handshake,
+        bytes_received=68 + 4_194_305,
+        availability=replace(
+            availability,
+            bytes_received=4_194_305,
+        ),
+    )
+
+    assert not too_many_messages.offering_observed
+    assert not too_many_bytes.offering_observed
+
+
+@pytest.mark.parametrize(
+    ("kind", "payload_length", "availability_bytes"),
+    (
+        ("unknown_message_rejected", 0, 16),
+        ("request_rejected", 12, 16),
+        ("piece_rejected", 12, 16),
+        ("extension_payload_rejected", 1, 17),
+    ),
+)
+def test_positive_handshake_rejects_terminal_diagnostic_event(
+    tmp_path: Path,
+    kind: str,
+    payload_length: int,
+    availability_bytes: int,
+) -> None:
+    store = RunStore(tmp_path / "run.sqlite3")
+    candidate = _candidate(HASH_A, 30)
+    handshake = _handshake(candidate)
+    availability = handshake.availability
+    assert availability is not None
+    diagnostic = PeerControlEvent(
+        observed_at_utc="2026-10-20T10:00:02.500Z",
+        elapsed_seconds=1.5,
+        kind=kind,
+        payload_length=payload_length,
+    )
+    impossible = replace(
+        handshake,
+        bytes_received=68 + availability_bytes,
+        availability=replace(
+            availability,
+            messages_received=3,
+            bytes_received=availability_bytes,
+            control_events=(*availability.control_events, diagnostic),
+        ),
+    )
+
+    assert not impossible.offering_observed
+    assert store.add_candidates([candidate]) == 1
+    assert store.claim_candidate_batch([HASH_A]) == [candidate]
+    with pytest.raises(RunStoreError, match="terminales Diagnoseereignis"):
+        store.store_handshake_batch([impossible])
+
+
+def test_offer_property_rejects_short_or_wrongly_terminated_window() -> None:
+    result = _handshake(_candidate(HASH_A, 24))
+    availability = result.availability
+    assert availability is not None
+
+    assert not replace(
+        result,
+        availability=replace(availability, duration_seconds=1.0),
+    ).offering_observed
+    assert not replace(
+        result,
+        availability=replace(
+            availability,
+            control_events=(
+                replace(
+                    availability.control_events[0],
+                    observed_at_utc="2026-10-20T10:01:00.000Z",
+                ),
+                replace(
+                    availability.control_events[1],
+                    observed_at_utc="2026-10-20T10:00:02.000Z",
+                ),
+            ),
+        ),
+    ).offering_observed
+    assert not replace(
+        result,
+        availability=replace(availability, termination_reason="peer_closed"),
+    ).offering_observed
+    assert not replace(
+        result,
+        availability=replace(
+            availability,
+            ended_at_utc=availability.started_at_utc,
+            control_events=tuple(
+                replace(event, observed_at_utc=availability.started_at_utc)
+                for event in availability.control_events
+            ),
+        ),
+    ).offering_observed
+
+
+def test_offer_property_requires_configured_sixty_second_window(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run.sqlite3")
+    candidate = _candidate(HASH_A, 31)
+    handshake = _handshake(candidate)
+    availability = handshake.availability
+    assert availability is not None
+    one_second = replace(
+        handshake,
+        availability=replace(
+            availability,
+            ended_at_utc="2026-10-20T10:00:02.000Z",
+            requested_duration_seconds=1.0,
+            duration_seconds=1.0,
+            unchoked_duration_seconds=0.5,
+        ),
+    )
+
+    assert not one_second.offering_observed
+    assert store.add_candidates([candidate]) == 1
+    assert store.claim_candidate_batch([HASH_A]) == [candidate]
+    assert store.store_handshake_batch([one_second]) == 1
+    assert store.metrics_by_hash()[HASH_A].offering_observed == 0
+
+
+def test_confirmed_handshake_with_top_level_error_is_rejected(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run.sqlite3")
+    candidate = _candidate(HASH_A, 23)
+    result = replace(_handshake(candidate), error="PeerProtocolError: widerspruechlich")
+
+    assert not result.offering_observed
+    assert store.add_candidates([candidate]) == 1
+    assert store.claim_candidate_batch([HASH_A]) == [candidate]
+    with pytest.raises(RunStoreError, match="keinen Handshake-Fehler"):
+        store.store_handshake_batch([result])
+    assert store.handshake_result_count() == 0
+
+
+def test_full_window_accepts_only_microsecond_rounding_difference(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "run.sqlite3")
+    candidate = _candidate(HASH_A, 21)
+    handshake = _handshake(candidate)
+    availability = handshake.availability
+    assert availability is not None
+    rounded = replace(availability, duration_seconds=59.9999995)
+    assert store.add_candidates([candidate]) == 1
+    assert store.claim_candidate_batch([HASH_A]) == [candidate]
+
+    assert store.store_handshake_batch([replace(handshake, availability=rounded)]) == 1
 
 
 def test_six_candidates_survive_crash_and_evidence_is_stored_five_plus_one(
@@ -466,8 +1021,14 @@ def test_late_sighting_requeues_only_completed_negative_candidate(tmp_path: Path
     assert duplicate.requeued_negative_candidates == 0
     assert duplicate.ignored_sightings == 1
     assert store.claim_candidate_batch([HASH_A]) == [late]
-    assert store.store_handshake_batch([replace(_handshake(late), availability=None)]) == 1
-    assert list(store.iter_handshake_results()) == [replace(_handshake(late), availability=None)]
+    late_result = replace(
+        _handshake(late),
+        attempted_at_utc=_offset_utc(late.discovered_at_utc, seconds=0.5),
+        completed_at_utc=_offset_utc(late.discovered_at_utc, seconds=0.75),
+        availability=None,
+    )
+    assert store.store_handshake_batch([late_result]) == 1
+    assert list(store.iter_handshake_results()) == [late_result]
 
     repeated = store.ingest_candidates(
         [late],
@@ -697,6 +1258,15 @@ def test_decode_evidence_journal_event_binds_run_hashes_and_record() -> None:
     assert decoded.record == replace(evidence, evidence_event_sha256=event_sha256)
 
 
+def test_decode_evidence_journal_event_rejects_short_completed_window() -> None:
+    evidence = _evidence(_handshake(_candidate(HASH_A, 81)), 0)
+    event = _journal_event(evidence)
+    event["handshake"]["availability"]["duration_seconds"] = 0.1  # type: ignore[index]
+
+    with pytest.raises(RunStoreError, match="unterschreitet"):
+        decode_evidence_journal_event(event, "c" * 64)
+
+
 @pytest.mark.parametrize(
     ("corruption", "expected_error"),
     [
@@ -869,7 +1439,7 @@ def test_new_candidates_are_checked_before_hot_negative_rechecks(tmp_path: Path)
     assert store.add_candidates([hot]) == 1
     assert store.claim_candidate_batch([HASH_A, HASH_B]) == [hot]
     first_negative = replace(_handshake(hot), availability=None)
-    assert store.store_handshake_batch([first_negative]) == 1
+    assert store.store_handshake_batch([first_negative], count_new_only=True) == 1
 
     first_completion = _stored_completion(database_path)
     first_rediscovery = replace(
@@ -921,8 +1491,13 @@ def test_new_candidates_are_checked_before_hot_negative_rechecks(tmp_path: Path)
         ).deferred_negative_rechecks
         == 1
     )
-    second_negative = replace(_handshake(first_rediscovery), availability=None)
-    assert store.store_handshake_batch([second_negative]) == 1
+    second_negative = replace(
+        _handshake(first_rediscovery),
+        attempted_at_utc=_offset_utc(first_rediscovery.discovered_at_utc, seconds=0.5),
+        completed_at_utc=_offset_utc(first_rediscovery.discovered_at_utc, seconds=0.75),
+        availability=None,
+    )
+    assert store.store_handshake_batch([second_negative], count_new_only=True) == 0
 
     later_fresh = [_candidate(HASH_B, 400 + index) for index in range(3)]
     assert store.add_candidates(later_fresh) == 3

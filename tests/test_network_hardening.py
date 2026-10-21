@@ -36,6 +36,7 @@ from bittorrent_beobachter.models import (
     NetworkEnrichment,
     PeerAvailabilityObservation,
     PeerCandidate,
+    PeerControlEvent,
     ScanResult,
     Target,
 )
@@ -66,6 +67,23 @@ def _candidate(
 
 
 def _confirmed(candidate: PeerCandidate) -> HandshakeResult:
+    control_events = (
+        PeerControlEvent(
+            observed_at_utc="2026-10-20T12:00:01.300Z",
+            elapsed_seconds=0.2,
+            kind="bitfield",
+            payload_length=1,
+            non_empty=True,
+            payload_sha256="12" * 32,
+            set_bits=1,
+        ),
+        PeerControlEvent(
+            observed_at_utc="2026-10-20T12:00:01.400Z",
+            elapsed_seconds=0.3,
+            kind="unchoke",
+            payload_length=0,
+        ),
+    )
     availability = PeerAvailabilityObservation(
         started_at_utc="2026-10-20T12:00:01.100Z",
         ended_at_utc="2026-10-20T12:01:01.100Z",
@@ -80,12 +98,12 @@ def _confirmed(candidate: PeerCandidate) -> HandshakeResult:
         peer_choking_at_end=False,
         unchoked_duration_seconds=59.0,
         messages_received=2,
-        bytes_received=8,
+        bytes_received=11,
         request_messages_sent=0,
         piece_payload_bytes_received=0,
         metadata_requests_sent=0,
         termination_reason="duration_elapsed",
-        control_events=(),
+        control_events=control_events,
     )
     return HandshakeResult(
         candidate=candidate,
@@ -96,8 +114,8 @@ def _confirmed(candidate: PeerCandidate) -> HandshakeResult:
         reserved_bits_hex="0" * 16,
         local_ip="192.0.2.10",
         local_port=40_000,
-        bytes_sent=68,
-        bytes_received=68,
+        bytes_sent=73,
+        bytes_received=79,
         error=None,
         availability=availability,
     )
@@ -214,6 +232,7 @@ def test_dht_issue_count_is_not_truncated_and_errors_do_not_leak_ips() -> None:
                 return DHTResponse(
                     source=endpoint,
                     transaction_id=transaction_id,
+                    responder_id=b"b" * 20,
                     nodes=returned_nodes,
                     peers=(),
                     response_sha256="a" * 64,
@@ -546,6 +565,8 @@ def test_all_six_hundred_eleven_candidates_are_checked_in_persisted_five_batches
         peak = 0
         real_sleep = asyncio.sleep
         original_store = RunStore.store_handshake_batch
+        original_metrics = RunStore.metrics_by_hash
+        metric_aggregations = 0
 
         class FakeVerifier:
             def __init__(self, **_kwargs: object) -> None:
@@ -567,13 +588,28 @@ def test_all_six_hundred_eleven_candidates_are_checked_in_persisted_five_batches
         def recording_store(
             current_store: RunStore,
             results: object,
+            *,
+            count_new_only: bool = False,
         ) -> int:
             materialized = tuple(results)
             persisted.append(len(materialized))
-            return original_store(current_store, materialized)
+            return original_store(
+                current_store,
+                materialized,
+                count_new_only=count_new_only,
+            )
+
+        def recording_metrics(
+            current_store: RunStore,
+            target_hashes: object = (),
+        ) -> object:
+            nonlocal metric_aggregations
+            metric_aggregations += 1
+            return original_metrics(current_store, target_hashes)
 
         monkeypatch.setattr(monitor_module, "PeerVerifier", FakeVerifier)
         monkeypatch.setattr(RunStore, "store_handshake_batch", recording_store)
+        monkeypatch.setattr(RunStore, "metrics_by_hash", recording_metrics)
         await monitor_module._verify_all_candidates(
             config,
             store,
@@ -582,7 +618,8 @@ def test_all_six_hundred_eleven_candidates_are_checked_in_persisted_five_batches
             lambda _message: None,
         )
 
-        metrics = store.metrics_by_hash((first.info_hash_hex, second.info_hash_hex))
+        assert metric_aggregations == 1
+        metrics = original_metrics(store, (first.info_hash_hex, second.info_hash_hex))
         assert len(calls) == 611
         assert len(set(calls)) == 611
         assert metrics[first.info_hash_hex].done == 306
@@ -772,6 +809,118 @@ def test_verifier_error_persists_successful_sibling_batch(
     asyncio.run(scenario())
 
 
+def test_conclusive_full_window_negative_is_not_retried() -> None:
+    from dataclasses import replace
+
+    async def scenario() -> None:
+        target = Target("Ziel", INFO_HASH)
+        candidate = _candidate(target)
+        full_positive = _confirmed(candidate)
+        assert full_positive.availability is not None
+        full_negative = replace(
+            full_positive,
+            bytes_received=68,
+            availability=replace(
+                full_positive.availability,
+                non_empty_bitfield=False,
+                piece_availability_announced=False,
+                unchoked=False,
+                peer_choking_at_end=True,
+                unchoked_duration_seconds=0.0,
+                messages_received=0,
+                bytes_received=0,
+                control_events=(),
+            ),
+        )
+        config = AppConfig(
+            targets=(target,),
+            peer=PeerSettings(retry_attempts=3, retry_backoff_seconds=0.0),
+        )
+        runtime = monitor_module._TargetRuntimeMetrics(target=target)
+        attempts = 0
+
+        class FullNegativeVerifier:
+            async def verify(
+                self,
+                _candidate_value: PeerCandidate,
+                _info_hash: bytes,
+            ) -> HandshakeResult:
+                nonlocal attempts
+                attempts += 1
+                return full_negative
+
+        result = await monitor_module._verify_candidate_with_retries(
+            candidate,
+            target.info_hash,
+            FullNegativeVerifier(),  # type: ignore[arg-type]
+            config,
+            runtime,
+        )
+
+        assert not result.offering_observed
+        assert result.availability is not None
+        assert result.availability.completed_full_window
+        assert attempts == 1
+        assert runtime.verification_attempts == 1
+
+    asyncio.run(scenario())
+
+
+def test_internally_inconsistent_full_window_negative_is_retried() -> None:
+    from dataclasses import replace
+
+    async def scenario() -> None:
+        target = Target("Ziel", INFO_HASH)
+        candidate = _candidate(target)
+        full_result = _confirmed(candidate)
+        assert full_result.availability is not None
+        inconsistent_negative = replace(
+            full_result,
+            bytes_received=68,
+            availability=replace(
+                full_result.availability,
+                non_empty_bitfield=False,
+                piece_availability_announced=False,
+                unchoked=False,
+                peer_choking_at_end=True,
+                unchoked_duration_seconds=0.0,
+                messages_received=1,
+                bytes_received=0,
+                control_events=(),
+            ),
+        )
+        config = AppConfig(
+            targets=(target,),
+            peer=PeerSettings(retry_attempts=3, retry_backoff_seconds=0.0),
+        )
+        runtime = monitor_module._TargetRuntimeMetrics(target=target)
+        attempts = 0
+
+        class InconsistentVerifier:
+            async def verify(
+                self,
+                _candidate_value: PeerCandidate,
+                _info_hash: bytes,
+            ) -> HandshakeResult:
+                nonlocal attempts
+                attempts += 1
+                return inconsistent_negative
+
+        result = await monitor_module._verify_candidate_with_retries(
+            candidate,
+            target.info_hash,
+            InconsistentVerifier(),  # type: ignore[arg-type]
+            config,
+            runtime,
+        )
+
+        assert not result.offering_observed
+        assert attempts == 3
+        assert runtime.verification_attempts == 3
+
+    asyncio.run(scenario())
+
+
 def test_retries_after_partial_signals_and_keep_best_diagnostic_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -810,8 +959,10 @@ def test_retries_after_partial_signals_and_keep_best_diagnostic_result(
                     assert result.availability is not None
                     observation = replace(
                         result.availability,
+                        ended_at_utc="2026-10-20T12:00:03.100Z",
                         completed_full_window=False,
                         duration_seconds=2.0,
+                        unchoked_duration_seconds=2.0,
                         termination_reason="peer_closed",
                         error=None,
                     )

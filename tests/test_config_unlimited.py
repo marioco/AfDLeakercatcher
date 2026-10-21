@@ -1,4 +1,4 @@
-"""Regressionstests für die unbegrenzte, trackerfähige Konfiguration."""
+"""Regressionstests für mengenunbegrenzte Funde und trackerfähige Konfiguration."""
 
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ from bittorrent_beobachter.config import (
     BUNDLED_PRESET_REVISION,
     DEFAULT_TARGETS,
     DEFAULT_TRACKERS,
+    MAX_CONFIG_BYTES,
+    MAX_TRACKERS_PER_TARGET,
     AppConfig,
     ConfigError,
     DhtSettings,
@@ -281,3 +283,55 @@ def test_save_config_makes_only_new_application_directories_private(tmp_path: Pa
     assert stat.S_IMODE(first_new.stat().st_mode) == 0o700
     assert stat.S_IMODE(second_new.stat().st_mode) == 0o700
     assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+
+
+def test_tracker_source_limit_is_high_but_explicit() -> None:
+    trackers = [
+        f"udp://tracker-{index}.example.invalid:1337/announce"
+        for index in range(MAX_TRACKERS_PER_TARGET + 1)
+    ]
+    raw = config_to_dict(AppConfig(targets=()))
+    raw["targets"] = [
+        {
+            "label": "Ziel",
+            "info_hash": "23" * 20,
+            "trackers": trackers[:MAX_TRACKERS_PER_TARGET],
+        }
+    ]
+
+    accepted = config_from_dict(raw)
+
+    assert MAX_TRACKERS_PER_TARGET >= 100
+    assert len(accepted.targets[0].trackers) == MAX_TRACKERS_PER_TARGET
+    raw["targets"][0]["trackers"] = trackers
+    with pytest.raises(ConfigError, match=rf"höchstens {MAX_TRACKERS_PER_TARGET} Tracker"):
+        config_from_dict(raw)
+
+
+def test_save_config_rejects_oversized_payload_before_replacing_existing_file(
+    tmp_path: Path,
+) -> None:
+    long_label = "a" * 60
+    trackers = tuple(
+        f"udp://tracker-{index}.{long_label}.{long_label}.example:6969/announce"
+        for index in range(MAX_TRACKERS_PER_TARGET)
+    )
+    oversized = AppConfig(
+        targets=tuple(
+            Target(
+                label=f"Ziel {index}",
+                info_hash=index.to_bytes(20, "big"),
+                trackers=trackers,
+            )
+            for index in range(20)
+        )
+    )
+    config_path = tmp_path / "config.json"
+    original_payload = b"bestehende Konfiguration bleibt unveraendert\n"
+    config_path.write_bytes(original_payload)
+
+    with pytest.raises(ConfigError, match=rf"größer als {MAX_CONFIG_BYTES} Byte"):
+        save_config(config_path, oversized)
+
+    assert config_path.read_bytes() == original_payload
+    assert list(tmp_path.iterdir()) == [config_path]

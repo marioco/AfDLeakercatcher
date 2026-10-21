@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from .models import EvidenceRecord, HandshakeResult, NetworkEnrichment, VpnClassification
+from .path_safety import is_link_like, path_has_link_like_component
 
 JOURNAL_FORMAT_VERSION = 1
 JOURNAL_TRANSACTION_FORMAT_VERSION = 1
@@ -35,6 +36,7 @@ SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 MAX_JOURNAL_LINE_BYTES = 4_000_000
 MAX_TRANSACTION_HEADER_BYTES = 4_096
 MAX_VERIFIED_BATCH_ENTRIES = 5
+MAX_PENDING_TRANSACTION_BYTES = MAX_JOURNAL_LINE_BYTES * MAX_VERIFIED_BATCH_ENTRIES
 
 INTEGRITY_LIMITATION = (
     "Die SHA-256-Kette macht Aenderungen am vorhandenen Journal sichtbar, "
@@ -170,14 +172,27 @@ def _set_private_mode(path: Path, mode: int) -> None:
 
 
 def _ensure_private_directory(path: Path) -> None:
+    if path_has_link_like_component(path):
+        raise EvidenceJournalError(f"Unsichere Link-Komponente im Evidenzverzeichnis: {path}")
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path_has_link_like_component(path):
+        raise EvidenceJournalError(f"Unsichere Link-Komponente im Evidenzverzeichnis: {path}")
     _set_private_mode(path, 0o700)
 
 
 def _open_private_append(path: Path) -> BinaryIO:
-    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+    if is_link_like(path):
+        raise EvidenceJournalError(f"Unsicherer symbolischer Link statt regulaerer Datei: {path}")
+    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
     try:
-        _set_private_mode(path, 0o600)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise EvidenceJournalError(f"Keine regulaere Datei: {path}")
+        if hasattr(os, "fchmod") and stat.S_IMODE(metadata.st_mode) != 0o600:
+            os.fchmod(descriptor, 0o600)
         return os.fdopen(descriptor, "a+b", buffering=0)
     except BaseException:
         os.close(descriptor)
@@ -417,10 +432,12 @@ def _write_pending_transaction(
     """Schreibt den vorbereiteten Append vor der Journalveraenderung dauerhaft."""
 
     pending_path = _pending_transaction_path(journal_path)
-    if pending_path.exists():
+    if is_link_like(pending_path) or pending_path.exists():
         raise EvidenceJournalError(
             "Eine fruehere Journaltransaktion muss zuerst wiederhergestellt werden"
         )
+    if len(transaction.payload) > MAX_PENDING_TRANSACTION_BYTES:
+        raise EvidenceJournalError("Journaltransaktion ueberschreitet das Nutzlastlimit")
     header = {
         "transaction_format_version": JOURNAL_TRANSACTION_FORMAT_VERSION,
         "base_size": transaction.base_size,
@@ -448,12 +465,11 @@ def _write_pending_transaction(
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = -1
-        if pending_path.exists():
+        if is_link_like(pending_path) or pending_path.exists():
             raise EvidenceJournalError(
                 "Eine fruehere Journaltransaktion wurde gleichzeitig angelegt"
             )
         os.replace(temporary_path, pending_path)
-        _set_private_mode(pending_path, 0o600)
         _fsync_directory(journal_path.parent)
     except BaseException as exc:
         if descriptor >= 0:
@@ -471,6 +487,8 @@ def _write_pending_transaction(
 def _read_pending_transaction(pending_path: Path) -> _PendingTransaction | None:
     """Liest eine vollstaendige vorbereitete Transaktion ohne Symlink-Folgen."""
 
+    if is_link_like(pending_path):
+        raise EvidenceJournalError("Journaltransaktion darf kein symbolischer Link sein")
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -478,6 +496,10 @@ def _read_pending_transaction(pending_path: Path) -> _PendingTransaction | None:
         descriptor = os.open(pending_path, flags)
     except FileNotFoundError:
         return None
+    except OSError as exc:
+        raise EvidenceJournalError(
+            "Journaltransaktion konnte nicht sicher geoeffnet werden"
+        ) from exc
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
@@ -497,7 +519,7 @@ def _read_pending_transaction(pending_path: Path) -> _PendingTransaction | None:
                     encoded_header.decode("utf-8"),
                     object_pairs_hook=_reject_duplicate_keys,
                 )
-            except (UnicodeError, TypeError, ValueError) as exc:
+            except (RecursionError, UnicodeError, TypeError, ValueError) as exc:
                 raise EvidenceJournalError(
                     "Journaltransaktion enthaelt keinen eindeutigen JSON-Kopf"
                 ) from exc
@@ -513,10 +535,13 @@ def _read_pending_transaction(pending_path: Path) -> _PendingTransaction | None:
             }
             if not isinstance(header, dict) or set(header) != expected_keys:
                 raise EvidenceJournalError("Journaltransaktion hat unerwartete Felder")
-            if canonical_json_bytes(header) != encoded_header:
+            try:
+                if canonical_json_bytes(header) != encoded_header:
+                    raise ValueError("nicht kanonisch serialisiert")
+            except (RecursionError, TypeError, ValueError) as exc:
                 raise EvidenceJournalError(
-                    "Journaltransaktions-Kopf ist nicht kanonisch serialisiert"
-                )
+                    "Journaltransaktion enthaelt keinen kanonischen JSON-Kopf"
+                ) from exc
 
             integer_fields = (
                 "transaction_format_version",
@@ -549,10 +574,19 @@ def _read_pending_transaction(pending_path: Path) -> _PendingTransaction | None:
                         f"Journaltransaktion enthaelt keinen gueltigen Wert fuer {field}"
                     )
 
-            payload = file_handle.read(header["payload_length"] + 1)
-            if len(payload) != header["payload_length"]:
+            payload_length = header["payload_length"]
+            if payload_length > MAX_PENDING_TRANSACTION_BYTES:
+                raise EvidenceJournalError("Journaltransaktion ueberschreitet das Nutzlastlimit")
+            payload_offset = file_handle.tell()
+            remaining_size = os.fstat(file_handle.fileno()).st_size - payload_offset
+            if remaining_size != payload_length:
                 raise EvidenceJournalError(
                     "Journaltransaktion ist unvollstaendig oder enthaelt Zusatzdaten"
+                )
+            payload = file_handle.read(payload_length + 1)
+            if len(payload) != payload_length:
+                raise EvidenceJournalError(
+                    "Journaltransaktion wurde waehrend des Lesens veraendert"
                 )
             if not payload.endswith(b"\n"):
                 raise EvidenceJournalError(
@@ -758,7 +792,12 @@ class EvidenceJournal:
             # einen append-stabilen Snapshot, ohne Schreiber waehrend der Ausgabe
             # aller Batches zu blockieren.
             with _journal_process_lock(self.path, exclusive=True):
-                if not self.path.exists() and not pending_path.exists():
+                if (
+                    not self.path.exists()
+                    and not is_link_like(self.path)
+                    and not pending_path.exists()
+                    and not is_link_like(pending_path)
+                ):
                     self._head = None
                     return
                 file_handle = _open_private_append(self.path)
@@ -929,7 +968,14 @@ class EvidenceJournal:
         """Pruefe die ganze Hash-Kette und beende vorbereitete Crash-Appends."""
 
         pending_path = _pending_transaction_path(self.path)
-        if not self.path.exists() and not pending_path.exists():
+        lock_path = self.path.with_name(f".{self.path.name}.lock")
+        if (
+            not self.path.exists()
+            and not is_link_like(self.path)
+            and not pending_path.exists()
+            and not is_link_like(pending_path)
+            and not is_link_like(lock_path)
+        ):
             self._head = None
             return JournalVerification(
                 valid=True,

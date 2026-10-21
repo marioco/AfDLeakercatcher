@@ -12,6 +12,7 @@ from unittest.mock import patch
 import pytest
 
 import bittorrent_beobachter.tracker as tracker_module
+from bittorrent_beobachter.config import MAX_TRACKERS_PER_TARGET
 from bittorrent_beobachter.models import PeerCandidate, Target
 from bittorrent_beobachter.tracker import (
     ANNOUNCE_REQUEST_BYTES,
@@ -835,6 +836,66 @@ def test_streaming_mode_requires_callback_and_rejects_non_udp_before_network() -
             await discover_tracker_peers(
                 TARGET,
                 ("https://tracker.example/announce",),
+                timeout=1.0,
+                candidate_callback=lambda _batch: asyncio.sleep(0),
+            )
+
+    asyncio.run(scenario())
+
+
+def test_tracker_sources_use_constant_bounded_worker_tasks() -> None:
+    async def scenario() -> None:
+        resolved_ports: list[int] = []
+        real_create_task = asyncio.create_task
+        created_tasks = 0
+
+        async def fake_resolve(
+            tracker: TrackerURL,
+            *,
+            timeout: float,
+        ) -> AsyncIterator[tuple[str, int]]:
+            assert timeout == 1.0
+            resolved_ports.append(tracker.port)
+            await asyncio.sleep(0)
+            if tracker.port < 0:  # pragma: no cover - macht die Funktion zum Async-Generator
+                yield ("1.1.1.1", tracker.port)
+
+        def counting_create_task(coroutine: object, *args: object, **kwargs: object) -> object:
+            nonlocal created_tasks
+            created_tasks += 1
+            return real_create_task(coroutine, *args, **kwargs)
+
+        tracker_urls = tuple(
+            f"udp://tracker-{index}.example:{10_000 + index}/announce"
+            for index in range(MAX_TRACKERS_PER_TARGET)
+        )
+        with (
+            patch.object(tracker_module, "iter_resolved_tracker_endpoints", new=fake_resolve),
+            patch.object(tracker_module.asyncio, "create_task", new=counting_create_task),
+        ):
+            await discover_tracker_peers(
+                TARGET,
+                tracker_urls,
+                timeout=1.0,
+                candidate_callback=lambda _batch: asyncio.sleep(0),
+            )
+
+        assert len(resolved_ports) == MAX_TRACKERS_PER_TARGET
+        assert created_tasks <= tracker_module.TRACKER_DISCOVERY_CONCURRENCY + 1
+
+    asyncio.run(scenario())
+
+
+def test_tracker_discovery_rejects_more_than_configured_source_limit() -> None:
+    async def scenario() -> None:
+        tracker_urls = tuple(
+            f"udp://tracker-{index}.example:{10_000 + index}/announce"
+            for index in range(MAX_TRACKERS_PER_TARGET + 1)
+        )
+        with pytest.raises(ValueError, match=rf"Höchstens {MAX_TRACKERS_PER_TARGET} Tracker"):
+            await discover_tracker_peers(
+                TARGET,
+                tracker_urls,
                 timeout=1.0,
                 candidate_callback=lambda _batch: asyncio.sleep(0),
             )
