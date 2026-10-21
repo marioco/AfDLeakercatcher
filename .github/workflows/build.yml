@@ -400,9 +400,21 @@ jobs:
           Copy-Item -LiteralPath $pdfSource `
             -Destination "dist/AfDLeakerCatcher/Cybercrime-E-Mail-Kontakte_BKA-und-LKA_Deutschland_Stand-2026-10-20.pdf" `
             -Force
+          $onePagerName = "AfDLeakerCatcher-Kurzuebersicht.pdf"
+          $expectedOnePagerHash = `
+            "8c3ab4ec26ffa978a5059b2367b7d52669d3da195627ca2c5b9ec0b46522fbd1"
+          $actualOnePagerHash = (
+            Get-FileHash -Algorithm SHA256 -LiteralPath $onePagerName
+          ).Hash.ToLowerInvariant()
+          if ($actualOnePagerHash -ne $expectedOnePagerHash) {
+            throw "Die Prüfsumme der Kurzuebersicht stimmt nicht."
+          }
+          Copy-Item -LiteralPath $onePagerName `
+            -Destination "dist/AfDLeakerCatcher/$onePagerName" -Force
           $checksums = @(
             "AfDLeakerCatcher.exe",
-            "Cybercrime-E-Mail-Kontakte_BKA-und-LKA_Deutschland_Stand-2026-10-20.pdf"
+            "Cybercrime-E-Mail-Kontakte_BKA-und-LKA_Deutschland_Stand-2026-10-20.pdf",
+            $onePagerName
           ) | ForEach-Object {
             $filePath = Join-Path "dist/AfDLeakerCatcher" $_
             $hash = (

@@ -1,10 +1,12 @@
 # AfDLeakerCatcher
 
-## Windows-Download – Version 0.3.7
+## Windows-Download – Version 0.3.8
 
-### [⬇ AfDLeakerCatcher für Windows herunterladen](https://github.com/marioco/AfDLeakercatcher/releases/download/afdleakercatcher-v0.3.7/AfDLeakerCatcher-Windows-x64.zip)
+### [⬇ AfDLeakerCatcher für Windows herunterladen](https://github.com/marioco/AfDLeakercatcher/releases/download/afdleakercatcher-v0.3.8/AfDLeakerCatcher-Windows-x64.zip)
 
-[SHA-256-Prüfsumme zum Download](https://github.com/marioco/AfDLeakercatcher/releases/download/afdleakercatcher-v0.3.7/AfDLeakerCatcher-Windows-x64.zip.sha256)
+[SHA-256-Prüfsumme zum Download](https://github.com/marioco/AfDLeakercatcher/releases/download/afdleakercatcher-v0.3.8/AfDLeakerCatcher-Windows-x64.zip.sha256)
+
+[Einseitige Kurzbeschreibung: So funktioniert AfDLeakerCatcher (PDF)](AfDLeakerCatcher-Kurzuebersicht.pdf)
 
 Keine GitHub-Kenntnisse nötig: Auf den Link klicken, die ZIP-Datei **einmal**
 entpacken und anschließend `AfDLeakerCatcher.exe` doppelklicken. Es gibt keinen
@@ -297,7 +299,7 @@ gh attestation verify AfDLeakerCatcher-Windows-x64.zip -R marioco/AfDLeakercatch
 
 Ein Push auf `main` erzeugt nach erfolgreichem Build ein GitHub-Release, sofern für die
 eingetragene Version noch keines existiert. Dasselbe gilt für einen exakt zur
-Paket- und App-Version passenden Tag wie `afdleakercatcher-v0.3.7`. Ein bereits
+Paket- und App-Version passenden Tag wie `afdleakercatcher-v0.3.8`. Ein bereits
 vorhandenes Release wird nicht überschrieben, sondern auf Ziel-Commit, Entwurfsstatus,
 exakt erwartete Assets und ZIP-Prüfsumme kontrolliert. Pull Requests und manuell
 gestartete Läufe stellen nur Actions-Artefakte bereit.

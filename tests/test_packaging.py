@@ -13,6 +13,8 @@ EXE_NAME = f"{PRODUCT_NAME}.exe"
 PACKAGE_DIRECTORY = f"dist/{PRODUCT_NAME}"
 PDF_NAME = "Cybercrime-E-Mail-Kontakte_BKA-und-LKA_Deutschland_Stand-2026-10-20.pdf"
 PDF_SHA256 = "75585bb562b705f5644734299f78d1b26f1bd083a4acd962d21704041feb2f12"
+ONEPAGER_NAME = "AfDLeakerCatcher-Kurzuebersicht.pdf"
+ONEPAGER_SHA256 = "8c3ab4ec26ffa978a5059b2367b7d52669d3da195627ca2c5b9ec0b46522fbd1"
 RESULT_ILLUSTRATION = "bittorrent_beobachter/assets/leaker_chase.png"
 RESULT_ILLUSTRATION_SHA256 = "9ea29e8488c1459390c528c3caebab9fc38e3b264439d721fce6b1c59a721902"
 ARCHIVE_NAME = f"{PRODUCT_NAME}-Windows-x64.zip"
@@ -203,6 +205,21 @@ def test_windows_build_places_pdf_beside_executable() -> None:
     assert PDF_SHA256 in local_build
 
 
+def test_onepager_is_linked_and_packaged_beside_executable() -> None:
+    payload = (PROJECT_ROOT / ONEPAGER_NAME).read_bytes()
+    workflow = _text(".github/workflows/build.yml")
+    local_build = _text("build_windows.ps1")
+    readme = _text("README.md")
+
+    assert payload.startswith(b"%PDF-1.4")
+    assert hashlib.sha256(payload).hexdigest() == ONEPAGER_SHA256
+    assert f"]({ONEPAGER_NAME})" in readme
+    for build_source in (workflow, local_build):
+        assert ONEPAGER_NAME in build_source
+        assert ONEPAGER_SHA256 in build_source
+        assert "Die Prüfsumme der Kurzuebersicht stimmt nicht." in build_source
+
+
 def test_package_exposes_the_exact_build_dependency_lock() -> None:
     workflow = _text(".github/workflows/build.yml")
     local_build = _text("build_windows.ps1")
@@ -284,7 +301,7 @@ def test_version_sources_tag_checks_and_direct_download_are_consistent() -> None
     project = tomllib.loads(_text("pyproject.toml"))
     version = project["project"]["version"]
 
-    assert version == _app_version() == "0.3.7"
+    assert version == _app_version() == "0.3.8"
     assert f"Windows-Download \N{EN DASH} Version {version}" in readme
     release_path = f"releases/download/afdleakercatcher-v{version}/"
     assert readme.count(release_path) >= 2
