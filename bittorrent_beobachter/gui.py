@@ -9,7 +9,8 @@ import tempfile
 import threading
 from collections.abc import Iterable
 from contextlib import suppress
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from itertools import islice
 from pathlib import Path
 from tkinter import (
@@ -46,6 +47,10 @@ from .models import EvidenceRecord, ScanResult
 from .run_store import RunStore
 
 MAX_GUI_RESULT_ROWS = 100
+MAX_GUI_ACTIVITY_ROWS = 120
+MAX_PENDING_ACTIVITY_EVENTS = 240
+ACTIVITY_DRAIN_BATCH_SIZE = 40
+MAX_ACTIVITY_DETAIL_LENGTH = 320
 DESIRED_WINDOW_WIDTH = 1040
 DESIRED_WINDOW_HEIGHT = 700
 DESIRED_MIN_WINDOW_WIDTH = 880
@@ -59,21 +64,20 @@ DESIRED_MIN_SETTINGS_DIALOG_WIDTH = 320
 DESIRED_MIN_SETTINGS_DIALOG_HEIGHT = 240
 
 CYBER_COLORS = {
-    "background": "#07111F",
-    "surface": "#0B1728",
-    "surface_raised": "#10243A",
-    "surface_active": "#12324A",
-    "positive_surface": "#0D2A2B",
-    "warning_surface": "#2D2511",
-    "text": "#F3F8FF",
-    "muted": "#A7B8CC",
-    "accent": "#19E6FF",
-    "accent_hover": "#7CF2FF",
-    "magenta": "#FF4FD8",
-    "success": "#45F0A1",
-    "warning": "#FFC857",
-    "danger": "#FF6B8A",
-    "border": "#36708F",
+    "background": "#11161D",
+    "surface": "#181F27",
+    "surface_raised": "#202A34",
+    "surface_active": "#293641",
+    "accent_surface": "#203840",
+    "positive_surface": "#1B2C28",
+    "warning_surface": "#2C2921",
+    "text": "#E7EDF3",
+    "muted": "#AAB5BF",
+    "accent": "#78AFC1",
+    "success": "#91C7AF",
+    "warning": "#D7BD7B",
+    "danger": "#D99A9A",
+    "border": "#465461",
 }
 GUIStatusState = Literal["ready", "running", "success", "warning", "error"]
 STATUS_STYLE_BY_STATE: dict[GUIStatusState, str] = {
@@ -83,6 +87,171 @@ STATUS_STYLE_BY_STATE: dict[GUIStatusState, str] = {
     "warning": "Status.Warning.TLabel",
     "error": "Status.Error.TLabel",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityEvent:
+    """Eine echte Fortschrittsmeldung in kompakter, anzeigbarer Form."""
+
+    recorded_at_utc: str
+    context: str
+    operation: str
+    status: str
+    detail: str
+
+
+def _progress_semantics_without_target(message: str) -> tuple[str | None, str]:
+    """Trennt nur bekannte Zielplatzhalter von ihrer festen Meldungsschablone."""
+
+    candidate_tail = " neue eindeutige kandidat(en) dauerhaft gespeichert."
+    lowered = message.casefold()
+    if lowered.endswith(candidate_tail):
+        stem = message[: -len(candidate_tail)]
+        boundary = stem.rfind(": ")
+        if boundary >= 0:
+            target = stem[:boundary].strip()
+            candidate_count = stem[boundary + 2 :]
+            if target and candidate_count.isdecimal():
+                return target, f"<Ziel>: {candidate_count}{message[len(stem) :]}"
+
+    patterns = (
+        ("DHT-Runde fuer ", " hatte "),
+        ("DHT-Suche fuer ", ": "),
+        ("Tracker-Runde fuer ", " hatte "),
+        ("Tracker-Suche fuer ", ": "),
+        ("Peer-Suche fuer ", " nach "),
+        ("Peer-Suche ", ": Runde "),
+    )
+    for prefix, separator in patterns:
+        if not message.startswith(prefix):
+            continue
+        remainder = message[len(prefix) :]
+        boundary = remainder.rfind(separator)
+        if boundary < 0:
+            break
+        target = remainder[:boundary].strip()
+        if not target:
+            break
+        semantics = f"{prefix}<Ziel>{remainder[boundary:]}"
+        return target, semantics
+
+    return None, message
+
+
+def _activity_event_from_progress(
+    message: object,
+    *,
+    recorded_at: datetime | None = None,
+) -> ActivityEvent:
+    """Ordnet eine echte Monitor-Meldung ohne erfundene Netzwerkdaten ein."""
+
+    normalized_message = " ".join(str(message).split())
+    if not normalized_message:
+        normalized_message = "Leere Fortschrittsmeldung"
+    target, semantics = _progress_semantics_without_target(normalized_message)
+    detail = normalized_message
+    if len(detail) > MAX_ACTIVITY_DETAIL_LENGTH:
+        detail = f"{detail[: MAX_ACTIVITY_DETAIL_LENGTH - 1]}…"
+
+    moment = recorded_at or datetime.now(UTC)
+    if moment.tzinfo is None:
+        raise ValueError("Der Aktivitaetszeitpunkt muss eine Zeitzone enthalten.")
+    recorded_at_utc = moment.astimezone(UTC).strftime("%H:%M:%S")
+
+    lowered = semantics.casefold()
+    if lowered.startswith(("dht-", "bootstrap-")):
+        source = "DHT"
+        operation = "Bootstrap" if lowered.startswith("bootstrap-") else "Endpunktsuche"
+    elif lowered.startswith("tracker-"):
+        source = "Tracker"
+        operation = "Endpunktsuche"
+    elif lowered.startswith("peer-suche"):
+        source = "Peer-Suche"
+        operation = "Endpunktsuche"
+    elif "neue eindeutige kandidat" in lowered:
+        source = "Discovery"
+        operation = "Kandidaten speichern"
+    elif "peer-pruefung" in lowered or "kandidatenpruefung" in lowered:
+        source = "Peer"
+        operation = "Direktprüfung"
+    elif "netzregistrierungsabfrage" in lowered or "netzauskunft" in lowered:
+        source = "Öffentliche Netzauskunft"
+        operation = "Netzauskunft"
+    elif any(
+        term in lowered
+        for term in ("journalisierte", "laufdatenbank", "wiederhergestellt", "legacy-lauf")
+    ):
+        source = "Laufdaten"
+        operation = "Wiederherstellung"
+    elif any(term in lowered for term in ("evidenz", "ergebnisordner", "berichte")):
+        source = "Evidenz"
+        operation = "Speichern"
+    elif "prueflauf" in lowered:
+        source = "Lauf"
+        operation = "Steuerung"
+    else:
+        source = "System"
+        operation = "Status"
+
+    if any(
+        term in lowered
+        for term in ("fehlerabschluss", "fehlgeschlagen", "netzwerkfehler", "scheiterte")
+    ) or ("schlug" in lowered and "fehl" in lowered):
+        status = "Fehler"
+    elif any(
+        term in lowered
+        for term in (
+            "teilmeldung",
+            "teilproblem",
+            "unvollstaendig",
+            "nicht erreichbar",
+            "nicht automatisch fertiggestellt",
+            "nicht mehr verfuegbar",
+            "nicht migriert",
+            "warnung",
+        )
+    ):
+        status = "Hinweis"
+    elif any(term in lowered for term in ("abgebrochen", "abbruch", "kontrolliert beendet")):
+        status = "Abbruch"
+    elif any(
+        term in lowered
+        for term in (
+            "abgeschlossen",
+            "dauerhaft geprueft",
+            "dauerhaft geprüft",
+            "gespeichert",
+            "bereitgestellt",
+            "beendet",
+            "uebernommen",
+        )
+    ):
+        status = "OK"
+    elif any(term in lowered for term in ("gestartet", "laeuft", "läuft", "abfrage", "eingeplant")):
+        status = "Aktiv"
+    else:
+        status = "Info"
+
+    context = source if target is None else f"{source} · {target}"
+    return ActivityEvent(
+        recorded_at_utc=recorded_at_utc,
+        context=context,
+        operation=operation,
+        status=status,
+        detail=detail,
+    )
+
+
+def _activity_view_is_near_bottom(view: object, *, has_rows: bool) -> bool:
+    """Entscheidet defensiv, ob neue Zeilen sichtbar nachgefuehrt werden duerfen."""
+
+    if not has_rows:
+        return True
+    try:
+        _first, last = view  # type: ignore[misc]
+        return float(last) >= 0.98
+    except (TypeError, ValueError):
+        return False
 
 
 def _fit_window_to_screen(
@@ -120,7 +289,7 @@ def _configure_window_geometry(root: Tk) -> None:
 
 
 def _configure_cyberpunk_theme(root: Tk) -> ttk.Style:
-    """Konfiguriert ein kontrastreiches, plattformunabhängiges Dark-Theme."""
+    """Konfiguriert ein dezentes, plattformunabhaengiges Dark-Theme."""
 
     colors = CYBER_COLORS
     root.configure(background=colors["background"])
@@ -145,18 +314,18 @@ def _configure_cyberpunk_theme(root: Tk) -> ttk.Style:
         "Hero.TLabel",
         background=colors["surface_raised"],
         foreground=colors["text"],
-        font=("TkDefaultFont", 20, "bold"),
+        font=("TkDefaultFont", 18, "bold"),
     )
     style.configure(
         "Kicker.TLabel",
         background=colors["surface_raised"],
-        foreground=colors["magenta"],
+        foreground=colors["muted"],
         font=("TkDefaultFont", 9, "bold"),
     )
     style.configure(
         "HeroAccent.TLabel",
         background=colors["surface_raised"],
-        foreground=colors["accent"],
+        foreground=colors["muted"],
     )
     style.configure("Muted.TLabel", foreground=colors["muted"])
     style.configure(
@@ -176,8 +345,8 @@ def _configure_cyberpunk_theme(root: Tk) -> ttk.Style:
         font=("TkDefaultFont", 8, "bold"),
     )
     for state, foreground in (
-        ("Ready", colors["accent"]),
-        ("Running", colors["warning"]),
+        ("Ready", colors["muted"]),
+        ("Running", colors["accent"]),
         ("Success", colors["success"]),
         ("Warning", colors["warning"]),
         ("Error", colors["danger"]),
@@ -201,7 +370,7 @@ def _configure_cyberpunk_theme(root: Tk) -> ttk.Style:
     style.configure(
         "TLabelframe.Label",
         background=colors["surface"],
-        foreground=colors["accent"],
+        foreground=colors["text"],
         font=("TkDefaultFont", 10, "bold"),
     )
     style.configure("Notice.TLabelframe", bordercolor=colors["warning"])
@@ -228,35 +397,35 @@ def _configure_cyberpunk_theme(root: Tk) -> ttk.Style:
     )
     style.configure(
         "Accent.TButton",
-        background=colors["accent"],
-        foreground=colors["background"],
+        background=colors["accent_surface"],
+        foreground=colors["text"],
         bordercolor=colors["accent"],
     )
     style.map(
         "Accent.TButton",
         background=[
             ("disabled", colors["surface_raised"]),
-            ("pressed", colors["accent"]),
-            ("active", colors["accent_hover"]),
+            ("pressed", colors["surface_active"]),
+            ("active", colors["surface_active"]),
         ],
-        foreground=[("disabled", colors["muted"]), ("!disabled", colors["background"])],
+        foreground=[("disabled", colors["muted"]), ("!disabled", colors["text"])],
         bordercolor=[("disabled", colors["border"]), ("focus", colors["accent"])],
     )
     style.configure(
         "Danger.TButton",
-        background=colors["magenta"],
-        foreground=colors["background"],
-        bordercolor=colors["magenta"],
+        background=colors["surface_raised"],
+        foreground=colors["danger"],
+        bordercolor=colors["danger"],
     )
     style.map(
         "Danger.TButton",
         background=[
             ("disabled", colors["surface_raised"]),
-            ("pressed", colors["danger"]),
-            ("active", colors["danger"]),
+            ("pressed", colors["surface_active"]),
+            ("active", colors["surface_active"]),
         ],
-        foreground=[("disabled", colors["muted"]), ("!disabled", colors["background"])],
-        bordercolor=[("disabled", colors["border"]), ("focus", colors["magenta"])],
+        foreground=[("disabled", colors["muted"]), ("!disabled", colors["danger"])],
+        bordercolor=[("disabled", colors["border"]), ("focus", colors["danger"])],
     )
 
     style.configure(
@@ -309,13 +478,13 @@ def _configure_cyberpunk_theme(root: Tk) -> ttk.Style:
     )
     style.map(
         "Treeview",
-        background=[("selected", colors["accent"])],
-        foreground=[("selected", colors["background"])],
+        background=[("selected", colors["accent_surface"])],
+        foreground=[("selected", colors["text"])],
     )
     style.configure(
         "Treeview.Heading",
         background=colors["surface_raised"],
-        foreground=colors["accent"],
+        foreground=colors["text"],
         bordercolor=colors["border"],
         lightcolor=colors["border"],
         darkcolor=colors["border"],
@@ -326,7 +495,34 @@ def _configure_cyberpunk_theme(root: Tk) -> ttk.Style:
     style.map(
         "Treeview.Heading",
         background=[("active", colors["surface_active"])],
-        foreground=[("active", colors["accent_hover"])],
+        foreground=[("active", colors["text"])],
+    )
+    style.configure(
+        "Activity.Treeview",
+        background=colors["surface"],
+        fieldbackground=colors["surface"],
+        foreground=colors["text"],
+        bordercolor=colors["border"],
+        lightcolor=colors["border"],
+        darkcolor=colors["border"],
+        rowheight=23,
+        font=("TkFixedFont", 9),
+    )
+    style.map(
+        "Activity.Treeview",
+        background=[("selected", colors["accent_surface"])],
+        foreground=[("selected", colors["text"])],
+    )
+    style.configure(
+        "Activity.Treeview.Heading",
+        background=colors["surface_raised"],
+        foreground=colors["text"],
+        bordercolor=colors["border"],
+        lightcolor=colors["border"],
+        darkcolor=colors["border"],
+        relief="flat",
+        padding=(7, 5),
+        font=("TkDefaultFont", 9, "bold"),
     )
     style.configure(
         "Vertical.TScrollbar",
@@ -543,11 +739,17 @@ class ObserverApp:
         self.root = root
         self.config_path = config_path
         self.data_dir = data_dir
-        # Abschlussereignisse bleiben in einer eigenen, unbegrenzten Queue. So kann
-        # eine hohe Fortschrittsrate weder "done" noch "error" verdrängen.
+        # Nur die einmaligen Abschlussereignisse bleiben in der unbegrenzten Queue.
+        # Fortschritt und Zwischenberichte werden getrennt begrenzt zusammengefuehrt.
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.progress_events: queue.Queue[str] = queue.Queue(maxsize=1)
+        self.report_events: queue.Queue[tuple[Path, int]] = queue.Queue(maxsize=1)
+        self.activity_events: queue.Queue[ActivityEvent] = queue.Queue(
+            maxsize=MAX_PENDING_ACTIVITY_EVENTS
+        )
         self._progress_event_lock = threading.Lock()
+        self._report_event_lock = threading.Lock()
+        self._activity_event_lock = threading.Lock()
         self.running = False
         self.scan_thread: threading.Thread | None = None
         self.cancel_event = threading.Event()
@@ -652,7 +854,7 @@ class ObserverApp:
         hero.pack(fill=X, pady=(0, 12))
         ttk.Label(
             hero,
-            text=f"NETWORK EVIDENCE CONSOLE  //  v{VERSION}",
+            text=f"Netzwerkprüfung  ·  Version {VERSION}",
             style="Kicker.TLabel",
         ).pack(anchor="w")
         ttk.Label(hero, text=APP_NAME, style="Hero.TLabel").pack(anchor="w", pady=(2, 2))
@@ -660,7 +862,7 @@ class ObserverApp:
             ttk.Label(
                 hero,
                 text=(
-                    "Inhaltsfreie Verfügbarkeitsprüfung // Keine Datei- oder "
+                    "Inhaltsfreie Verfügbarkeitsprüfung. Keine Datei- oder "
                     "Metadatenblöcke werden angefordert, heruntergeladen oder hochgeladen."
                 ),
                 style="HeroAccent.TLabel",
@@ -670,7 +872,7 @@ class ObserverApp:
 
         notice = ttk.LabelFrame(
             outer,
-            text="WICHTIGE AUSSAGEGRENZE",
+            text="Wichtige Aussagegrenze",
             padding=12,
             style="Notice.TLabelframe",
         )
@@ -692,7 +894,7 @@ class ObserverApp:
 
         target_box = ttk.LabelFrame(
             outer,
-            text="ZIELE FÜR MANUELLE PRÜFLÄUFE",
+            text="Ziele für manuelle Prüfläufe",
             padding=12,
         )
         target_box.pack(fill=X, pady=(0, 12))
@@ -751,7 +953,7 @@ class ObserverApp:
         self.settings_button.pack(side=LEFT)
         privacy_box = ttk.LabelFrame(
             outer,
-            text="OPTIONALE ÖFFENTLICHE NETZAUSKUNFT",
+            text="Optionale öffentliche Netzauskunft",
             padding=12,
         )
         privacy_box.pack(fill=X, pady=(0, 12))
@@ -826,7 +1028,7 @@ class ObserverApp:
         status_panel.pack(fill=X, pady=(0, 12))
         ttk.Label(
             status_panel,
-            text="SYSTEMSTATUS",
+            text="Status",
             style="StatusCaption.TLabel",
         ).pack(anchor="w")
         self.status_text = StringVar(value="Bereit. Fügen Sie einen Magnet-Link hinzu.")
@@ -840,7 +1042,75 @@ class ObserverApp:
         )
         self.status_label.pack(anchor="w", fill=X, pady=(2, 0))
 
-        result_box = ttk.LabelFrame(outer, text="LETZTER PRÜFLAUF", padding=12)
+        activity_box = ttk.LabelFrame(outer, text="Technische Laufaktivität", padding=12)
+        activity_box.pack(fill=X, pady=(0, 12))
+        remember_label(
+            ttk.Label(
+                activity_box,
+                text=(
+                    "Echte Statusmeldungen aus Endpunktsuche, Direktprüfung und "
+                    "Ergebnisspeicherung. Keine Animation oder erfundenen Verbindungsdaten; "
+                    "die UTC-Zeit wird beim Eingang erfasst."
+                ),
+                style="Muted.Panel.TLabel",
+                wraplength=930,
+            )
+        ).pack(anchor="w", fill=X, pady=(0, 7))
+        activity_table = ttk.Frame(activity_box, style="Panel.TFrame")
+        activity_table.pack(fill=X, expand=True)
+        activity_table.columnconfigure(0, weight=1)
+        activity_table.rowconfigure(0, weight=1)
+        self.activity_tree = ttk.Treeview(
+            activity_table,
+            columns=("time", "context", "operation", "status", "detail"),
+            show="headings",
+            height=6,
+            selectmode="browse",
+            style="Activity.Treeview",
+        )
+        activity_headings = {
+            "time": "UTC",
+            "context": "Quelle / Ziel",
+            "operation": "Vorgang",
+            "status": "Status",
+            "detail": "Details",
+        }
+        activity_widths = {
+            "time": (80, 74, False),
+            "context": (245, 150, True),
+            "operation": (145, 115, False),
+            "status": (82, 72, False),
+            "detail": (560, 260, True),
+        }
+        for name, title in activity_headings.items():
+            width, minimum, stretch = activity_widths[name]
+            self.activity_tree.heading(name, text=title)
+            self.activity_tree.column(
+                name,
+                width=width,
+                minwidth=minimum,
+                anchor="w",
+                stretch=stretch,
+            )
+        activity_vertical_scrollbar = ttk.Scrollbar(
+            activity_table,
+            orient="vertical",
+            command=self.activity_tree.yview,
+        )
+        activity_horizontal_scrollbar = ttk.Scrollbar(
+            activity_table,
+            orient="horizontal",
+            command=self.activity_tree.xview,
+        )
+        self.activity_tree.configure(
+            yscrollcommand=activity_vertical_scrollbar.set,
+            xscrollcommand=activity_horizontal_scrollbar.set,
+        )
+        self.activity_tree.grid(row=0, column=0, sticky="nsew")
+        activity_vertical_scrollbar.grid(row=0, column=1, sticky="ns")
+        activity_horizontal_scrollbar.grid(row=1, column=0, sticky="ew")
+
+        result_box = ttk.LabelFrame(outer, text="Letzter Prüflauf", padding=12)
         result_box.pack(fill=BOTH, expand=True)
         result_box.columnconfigure(0, weight=1)
         result_box.rowconfigure(0, weight=1)
@@ -885,7 +1155,7 @@ class ObserverApp:
         self.result_tree.tag_configure(
             "availability",
             background=CYBER_COLORS["positive_surface"],
-            foreground=CYBER_COLORS["accent"],
+            foreground=CYBER_COLORS["text"],
         )
         self.result_tree.tag_configure(
             "known_vpn",
@@ -911,7 +1181,7 @@ class ObserverApp:
         self.root.bind("<Button-5>", self._scroll_main_view, add="+")
 
     def _scroll_main_view(self, event: Any) -> str | None:
-        if event.widget is self.result_tree:
+        if event.widget in (self.result_tree, self.activity_tree):
             return None
         try:
             delta = int(getattr(event, "delta", 0))
@@ -1097,7 +1367,10 @@ class ObserverApp:
         self.open_button.configure(state="disabled")
         self.progress.start(10)
         self.result_tree.delete(*self.result_tree.get_children())
+        self.activity_tree.delete(*self.activity_tree.get_children())
         self._discard_pending_progress()
+        self._discard_pending_report()
+        self._discard_pending_activity()
         self._set_status("Prüflauf wird vorbereitet …", state="running")
         self.scan_thread = threading.Thread(
             target=self._scan_worker,
@@ -1125,15 +1398,30 @@ class ObserverApp:
             self.events.put_nowait(("done", result))
 
     def _publish_progress(self, message: str) -> None:
-        """Ersetzt einen alten Fortschritt atomar durch den neuesten Text."""
+        """Haelt den neuesten Status sowie eine begrenzte echte Aktivitaetshistorie."""
 
+        activity_event = _activity_event_from_progress(message)
+        with self._activity_event_lock:
+            while True:
+                try:
+                    self.activity_events.put_nowait(activity_event)
+                    break
+                except queue.Full:
+                    with suppress(queue.Empty):
+                        self.activity_events.get_nowait()
         with self._progress_event_lock:
             with suppress(queue.Empty):
                 self.progress_events.get_nowait()
             self.progress_events.put_nowait(str(message))
 
     def _publish_reports_ready(self, output_dir: Path, result_count: int) -> None:
-        self.events.put_nowait(("reports_ready", (Path(output_dir), int(result_count))))
+        """Haelt atomar nur den neuesten Stand der inkrementellen Berichte."""
+
+        report_event = (Path(output_dir), int(result_count))
+        with self._report_event_lock:
+            with suppress(queue.Empty):
+                self.report_events.get_nowait()
+            self.report_events.put_nowait(report_event)
 
     def _discard_pending_progress(self) -> None:
         """Entfernt den aktuell vorgemerkten Fortschritt, sofern vorhanden."""
@@ -1141,8 +1429,70 @@ class ObserverApp:
         with suppress(queue.Empty):
             self.progress_events.get_nowait()
 
+    def _discard_pending_report(self) -> None:
+        """Entfernt einen noch nicht angezeigten Zwischenstand des vorigen Laufs."""
+
+        with self._report_event_lock, suppress(queue.Empty):
+            self.report_events.get_nowait()
+
+    def _discard_pending_activity(self) -> None:
+        """Leert noch nicht angezeigte Aktivitaetsmeldungen eines vorigen Laufs."""
+
+        with self._activity_event_lock:
+            while True:
+                try:
+                    self.activity_events.get_nowait()
+                except queue.Empty:
+                    break
+
+    def _append_activity_event(self, event: ActivityEvent) -> None:
+        """Fuegt eine echte Meldung ein und respektiert die Leseposition."""
+
+        children_before = self.activity_tree.get_children()
+        keep_at_bottom = _activity_view_is_near_bottom(
+            self.activity_tree.yview(),
+            has_rows=bool(children_before),
+        )
+        self.activity_tree.insert(
+            "",
+            END,
+            values=(
+                event.recorded_at_utc,
+                event.context,
+                event.operation,
+                event.status,
+                event.detail,
+            ),
+        )
+        children_after = self.activity_tree.get_children()
+        overflow = len(children_after) - MAX_GUI_ACTIVITY_ROWS
+        if overflow > 0:
+            self.activity_tree.delete(*children_after[:overflow])
+        if keep_at_bottom:
+            self.activity_tree.yview_moveto(1.0)
+
+    def _drain_activity_events(self) -> None:
+        """Uebernimmt begrenzt viele Meldungen pro UI-Takt, damit Tk responsiv bleibt."""
+
+        for _index in range(ACTIVITY_DRAIN_BATCH_SIZE):
+            try:
+                event = self.activity_events.get_nowait()
+            except queue.Empty:
+                break
+            self._append_activity_event(event)
+
     def _poll_events(self) -> None:
         terminal_event_seen = False
+        try:
+            latest_report = self.report_events.get_nowait()
+        except queue.Empty:
+            latest_report = None
+        if latest_report is not None:
+            output_dir, _result_count = latest_report
+            self.latest_output_dir = Path(output_dir)
+            self._run_output_dir = self.latest_output_dir
+            self.open_button.configure(state="normal")
+
         while True:
             try:
                 event, payload = self.events.get_nowait()
@@ -1171,17 +1521,21 @@ class ObserverApp:
                     self._finish_running_state()
                 else:
                     self._show_result(payload)
-            elif event == "reports_ready":
-                output_dir, result_count = payload
-                self.latest_output_dir = Path(output_dir)
-                self._run_output_dir = self.latest_output_dir
-                self.open_button.configure(state="normal")
-                if not self.close_requested:
-                    self._set_status(
-                        f"{result_count} positive Befund(e) sind bereits fertig gespeichert. "
-                        "Der Prüflauf sucht weiter.",
-                        state="running",
-                    )
+
+        if (
+            latest_report is not None
+            and not terminal_event_seen
+            and self.running
+            and not self.close_requested
+        ):
+            _output_dir, result_count = latest_report
+            self._set_status(
+                f"{result_count} positive Befund(e) sind bereits fertig gespeichert. "
+                "Der Prüflauf sucht weiter.",
+                state="running",
+            )
+
+        self._drain_activity_events()
 
         try:
             latest_progress = self.progress_events.get_nowait()

@@ -9,6 +9,7 @@ import sys
 import threading
 import types
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -89,12 +90,23 @@ class _WidgetDouble:
         self.started = False
         self.stopped = False
         self.scroll_calls: list[tuple[int, str]] = []
+        self.yview_value: tuple[float, float] = (0.0, 1.0)
+        self.yview_moveto_calls: list[float] = []
 
     def get_children(self) -> tuple[str, ...]:
         return tuple(str(index) for index, _item in enumerate(self.inserted))
 
-    def delete(self, *_args: Any) -> None:
-        self.inserted.clear()
+    def delete(self, *args: Any) -> None:
+        if not args:
+            return
+        try:
+            indexes = sorted((int(item) for item in args), reverse=True)
+        except (TypeError, ValueError):
+            self.inserted.clear()
+            return
+        for index in indexes:
+            if 0 <= index < len(self.inserted):
+                self.inserted.pop(index)
 
     def insert(self, *args: Any, **kwargs: Any) -> None:
         self.inserted.append((args, kwargs))
@@ -116,6 +128,12 @@ class _WidgetDouble:
 
     def yview_scroll(self, amount: int, units: str) -> None:
         self.scroll_calls.append((amount, units))
+
+    def yview(self) -> tuple[float, float]:
+        return self.yview_value
+
+    def yview_moveto(self, fraction: float) -> None:
+        self.yview_moveto_calls.append(fraction)
 
 
 class _RootDouble:
@@ -198,7 +216,11 @@ def _runtime_app(tmp_path: Path, config: AppConfig | None = None) -> Any:
     app.data_dir = tmp_path / "data"
     app.events = queue.Queue()
     app.progress_events = queue.Queue(maxsize=1)
+    app.report_events = queue.Queue(maxsize=1)
+    app.activity_events = queue.Queue(maxsize=gui.MAX_PENDING_ACTIVITY_EVENTS)
     app._progress_event_lock = threading.Lock()
+    app._report_event_lock = threading.Lock()
+    app._activity_event_lock = threading.Lock()
     app.running = False
     app.scan_thread = None
     app.cancel_event = threading.Event()
@@ -211,6 +233,7 @@ def _runtime_app(tmp_path: Path, config: AppConfig | None = None) -> Any:
     app.open_button = _WidgetDouble()
     app.progress = _WidgetDouble()
     app.result_tree = _WidgetDouble()
+    app.activity_tree = _WidgetDouble()
     app.status_text = _WidgetDouble()
     app.status_label = _WidgetDouble()
     app.config_controls = (_WidgetDouble(), _WidgetDouble(), _WidgetDouble())
@@ -392,6 +415,8 @@ def test_cyberpunk_theme_configures_cross_platform_focus_and_disabled_states(
         "Danger.TButton",
         "Treeview",
         "Treeview.Heading",
+        "Activity.Treeview",
+        "Activity.Treeview.Heading",
         "Cyber.Horizontal.TProgressbar",
     }.issubset(style.configurations)
     assert style.configurations["Treeview"]["rowheight"] >= 28
@@ -403,9 +428,20 @@ def test_cyberpunk_theme_configures_cross_platform_focus_and_disabled_states(
             gui.CYBER_COLORS["surface_raised"],
         ) in style.mappings[button_style]["background"]
         assert ("disabled", gui.CYBER_COLORS["muted"]) in style.mappings[button_style]["foreground"]
+    assert ("!disabled", gui.CYBER_COLORS["danger"]) in style.mappings["Danger.TButton"][
+        "foreground"
+    ]
     assert ("selected", gui.CYBER_COLORS["accent"]) in style.mappings["TCheckbutton"][
         "indicatorcolor"
     ]
+    assert style.configurations["Kicker.TLabel"]["foreground"] == gui.CYBER_COLORS["muted"]
+    assert (
+        style.configurations["Danger.TButton"]["background"] == gui.CYBER_COLORS["surface_raised"]
+    )
+    assert (
+        style.configurations["Activity.Treeview"]["rowheight"]
+        < style.configurations["Treeview"]["rowheight"]
+    )
 
 
 def test_cyberpunk_text_and_status_colors_have_accessible_contrast() -> None:
@@ -425,6 +461,9 @@ def test_cyberpunk_text_and_status_colors_have_accessible_contrast() -> None:
         return (light + 0.05) / (dark + 0.05)
 
     colors = gui.CYBER_COLORS
+    assert "magenta" not in colors
+    assert "#19E6FF" not in colors.values()
+    assert "#FF4FD8" not in colors.values()
     text_pairs = (
         ("text", "background"),
         ("muted", "background"),
@@ -435,13 +474,225 @@ def test_cyberpunk_text_and_status_colors_have_accessible_contrast() -> None:
         ("warning", "surface"),
         ("danger", "surface"),
         ("background", "accent"),
-        ("background", "magenta"),
-        ("accent", "positive_surface"),
+        ("text", "accent_surface"),
+        ("success", "positive_surface"),
         ("warning", "warning_surface"),
+        ("muted", "surface_raised"),
     )
 
     for foreground, background in text_pairs:
         assert contrast_ratio(colors[foreground], colors[background]) >= 4.5
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_context", "expected_operation", "expected_status"),
+    (
+        (
+            "Peer-Suche Infohash 852795102149: Runde 2 gestartet.",
+            "Peer-Suche · Infohash 852795102149",
+            "Endpunktsuche",
+            "Aktiv",
+        ),
+        (
+            "DHT-Runde fuer Ziel Alpha hatte ein technisches Teilproblem (TimeoutError).",
+            "DHT · Ziel Alpha",
+            "Endpunktsuche",
+            "Hinweis",
+        ),
+        (
+            "Tracker-Suche fuer Ziel Beta: 1 Runde mit technischen Teilproblemen.",
+            "Tracker · Ziel Beta",
+            "Endpunktsuche",
+            "Hinweis",
+        ),
+        (
+            "Direkte Peer-Pruefung abgeschlossen: 5 Kandidat(en), 2 Handshake(s).",
+            "Peer",
+            "Direktprüfung",
+            "OK",
+        ),
+        (
+            "Netzregistrierungsabfrage fuer positiven Befund 1.",
+            "Öffentliche Netzauskunft",
+            "Netzauskunft",
+            "Aktiv",
+        ),
+    ),
+)
+def test_activity_event_uses_real_progress_semantics(
+    message: str,
+    expected_context: str,
+    expected_operation: str,
+    expected_status: str,
+) -> None:
+    event = gui._activity_event_from_progress(
+        message,
+        recorded_at=datetime(2026, 10, 21, 13, 14, 15, tzinfo=UTC),
+    )
+
+    assert event.recorded_at_utc == "13:14:15"
+    assert event.context == expected_context
+    assert event.operation == expected_operation
+    assert event.status == expected_status
+    assert event.detail == message
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_context", "expected_source_status"),
+    (
+        (
+            "Peer-Suche Ziel fehlgeschlagen: Runde 2 gestartet.",
+            "Peer-Suche · Ziel fehlgeschlagen",
+            "Aktiv",
+        ),
+        (
+            "Peer-Suche Ziel abgebrochen: Runde 3 gestartet.",
+            "Peer-Suche · Ziel abgebrochen",
+            "Aktiv",
+        ),
+        (
+            "DHT-Runde fuer Ziel hatte intern hatte ein technisches Teilproblem (TimeoutError).",
+            "DHT · Ziel hatte intern",
+            "Hinweis",
+        ),
+        (
+            "Peer-Suche Ziel: Runde intern: Runde 4 gestartet.",
+            "Peer-Suche · Ziel: Runde intern",
+            "Aktiv",
+        ),
+        (
+            "DHT-Suche fehlgeschlagen: 2 neue eindeutige Kandidat(en) dauerhaft gespeichert.",
+            "Discovery · DHT-Suche fehlgeschlagen",
+            "OK",
+        ),
+        (
+            "neue eindeutige Kandidaten fehlgeschlagen: 2 neue eindeutige "
+            "Kandidat(en) dauerhaft gespeichert.",
+            "Discovery · neue eindeutige Kandidaten fehlgeschlagen",
+            "OK",
+        ),
+        (
+            "Ziel: 9 neue eindeutige Kandidaten: Fragment abgebrochen: 2 neue "
+            "eindeutige Kandidat(en) dauerhaft gespeichert.",
+            "Discovery · Ziel: 9 neue eindeutige Kandidaten: Fragment abgebrochen",
+            "OK",
+        ),
+        (
+            "DHT-Runde fuer Ziel hatte fehlgeschlagen: 2 neue eindeutige "
+            "Kandidat(en) dauerhaft gespeichert.",
+            "Discovery · DHT-Runde fuer Ziel hatte fehlgeschlagen",
+            "OK",
+        ),
+        (
+            "Peer-Suche fuer Ziel nach abgebrochen: 2 neue eindeutige "
+            "Kandidat(en) dauerhaft gespeichert.",
+            "Discovery · Peer-Suche fuer Ziel nach abgebrochen",
+            "OK",
+        ),
+    ),
+)
+def test_user_target_words_cannot_change_activity_source_status_or_boundary(
+    message: str,
+    expected_context: str,
+    expected_source_status: str,
+) -> None:
+    event = gui._activity_event_from_progress(
+        message,
+        recorded_at=datetime(2026, 10, 21, tzinfo=UTC),
+    )
+
+    assert event.context == expected_context
+    assert event.status == expected_source_status
+
+
+def test_activity_event_normalizes_and_caps_untrusted_detail() -> None:
+    event = gui._activity_event_from_progress(
+        "  System\n" + "x" * (gui.MAX_ACTIVITY_DETAIL_LENGTH + 20),
+        recorded_at=datetime(2026, 10, 21, tzinfo=UTC),
+    )
+
+    assert "\n" not in event.detail
+    assert len(event.detail) == gui.MAX_ACTIVITY_DETAIL_LENGTH
+    assert event.detail.endswith("…")
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_status"),
+    (
+        ("Fehlerabschluss: 3 eindeutige Kandidat(en) dauerhaft geprüft.", "Fehler"),
+        ("STOPPED-Aufraeumen schlug bei 1 Anfrage fehl.", "Fehler"),
+        ("DHT-Suche: 2 technische Teilmeldung(en).", "Hinweis"),
+        (
+            "Legacy-Lauf alt wurde nicht migriert: Konfiguration fehlt.",
+            "Hinweis",
+        ),
+        (
+            "Prueflauf wird kontrolliert beendet; Restbefunde werden gespeichert.",
+            "Abbruch",
+        ),
+    ),
+)
+def test_activity_status_covers_real_failure_and_cancellation_phrases(
+    message: str,
+    expected_status: str,
+) -> None:
+    event = gui._activity_event_from_progress(
+        message,
+        recorded_at=datetime(2026, 10, 21, tzinfo=UTC),
+    )
+
+    assert event.status == expected_status
+
+
+def test_activity_recovery_message_is_not_mislabelled_as_network_traffic() -> None:
+    event = gui._activity_event_from_progress(
+        "2 journalisierte Befund(e) wurden vor dem neuen Lauf in ihre Laufdatenbank uebernommen.",
+        recorded_at=datetime(2026, 10, 21, tzinfo=UTC),
+    )
+
+    assert event.context == "Laufdaten"
+    assert event.operation == "Wiederherstellung"
+    assert event.status == "OK"
+
+
+def test_activity_autoscroll_requires_empty_or_near_bottom_view() -> None:
+    assert gui._activity_view_is_near_bottom((0.0, 0.3), has_rows=False) is True
+    assert gui._activity_view_is_near_bottom((0.8, 0.99), has_rows=True) is True
+    assert gui._activity_view_is_near_bottom((0.2, 0.75), has_rows=True) is False
+    assert gui._activity_view_is_near_bottom("ungueltig", has_rows=True) is False
+
+
+def test_activity_table_caps_rows_and_only_follows_existing_bottom(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _runtime_app(tmp_path)
+    monkeypatch.setattr(gui, "MAX_GUI_ACTIVITY_ROWS", 3)
+    moment = datetime(2026, 10, 21, tzinfo=UTC)
+
+    for sequence in range(4):
+        app._append_activity_event(
+            gui._activity_event_from_progress(
+                f"Prueflauf Schritt {sequence} gestartet.",
+                recorded_at=moment,
+            )
+        )
+
+    assert len(app.activity_tree.inserted) == 3
+    assert app.activity_tree.inserted[0][1]["values"][-1].endswith("Schritt 1 gestartet.")
+    assert app.activity_tree.yview_moveto_calls == [1.0, 1.0, 1.0, 1.0]
+
+    app.activity_tree.yview_value = (0.0, 0.5)
+    app._append_activity_event(
+        gui._activity_event_from_progress(
+            "Prueflauf Schritt 4 gestartet.",
+            recorded_at=moment,
+        )
+    )
+
+    assert len(app.activity_tree.inserted) == 3
+    assert app.activity_tree.inserted[-1][1]["values"][-1].endswith("Schritt 4 gestartet.")
+    assert app.activity_tree.yview_moveto_calls == [1.0, 1.0, 1.0, 1.0]
 
 
 @pytest.mark.parametrize(
@@ -511,10 +762,14 @@ def test_main_mousewheel_scrolls_page_but_not_result_table(tmp_path: Path) -> No
     result_table_event = app._scroll_main_view(
         types.SimpleNamespace(widget=app.result_tree, delta=-120, num=0)
     )
+    activity_table_event = app._scroll_main_view(
+        types.SimpleNamespace(widget=app.activity_tree, delta=-120, num=0)
+    )
 
     assert handled == "break"
     assert app._content_canvas.scroll_calls == [(1, "units")]
     assert result_table_event is None
+    assert activity_table_event is None
 
 
 def _candidate(*, ipv6: bool = False) -> PeerCandidate:
@@ -1070,6 +1325,36 @@ def test_start_scan_is_explicit_and_disables_mutating_controls(
     assert "als Peer" in confirmations[0]
 
 
+def test_start_scan_clears_visible_and_pending_activity_from_previous_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _runtime_app(tmp_path)
+    old_event = gui._activity_event_from_progress(
+        "Prueflauf alt abgeschlossen.",
+        recorded_at=datetime(2026, 10, 21, tzinfo=UTC),
+    )
+    app.activity_tree.insert("", gui.END, values=("alter", "sichtbarer", "Eintrag"))
+    app.activity_events.put_nowait(old_event)
+    app._publish_reports_ready(tmp_path / "alter-zwischenstand", 3)
+
+    class _IdleThread:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+    monkeypatch.setattr(gui.messagebox, "askyesno", lambda *_args, **_kwargs: True, raising=False)
+    monkeypatch.setattr(gui.threading, "Thread", _IdleThread)
+
+    app._start_scan()
+
+    assert app.activity_tree.get_children() == ()
+    assert app.activity_events.empty()
+    assert app.report_events.empty()
+
+
 def test_start_scan_cancel_or_missing_target_does_not_start_thread(
     tmp_path: Path,
     monkeypatch: Any,
@@ -1171,6 +1456,8 @@ def test_many_progress_updates_keep_only_latest_text(tmp_path: Path) -> None:
     assert failures == []
     assert app.progress_events.maxsize == 1
     assert app.progress_events.qsize() == 1
+    assert app.activity_events.maxsize == gui.MAX_PENDING_ACTIVITY_EVENTS
+    assert app.activity_events.qsize() == gui.MAX_PENDING_ACTIVITY_EVENTS
     assert app.events.qsize() == 0
 
     app._poll_events()
@@ -1199,6 +1486,52 @@ def test_terminal_event_is_not_blocked_by_progress_flood(tmp_path: Path) -> None
     assert app.root.after_calls
 
 
+def test_terminal_done_is_not_delayed_or_overwritten_by_report_flood(tmp_path: Path) -> None:
+    app = _runtime_app(tmp_path)
+    app.running = True
+    app.status_text.set("Prüflauf läuft")
+    output_dir = tmp_path / "reports" / "lauf"
+    output_dir.mkdir(parents=True)
+    result = ScanResult(run_id="offline", started_at_utc="2026-10-20T10:00:00Z")
+    shown: list[ScanResult] = []
+    app._show_result = shown.append
+
+    for result_count in range(10_000):
+        app._publish_reports_ready(output_dir, result_count)
+
+    assert app.report_events.maxsize == 1
+    assert app.report_events.qsize() == 1
+    assert app.events.empty()
+    app.events.put_nowait(("done", result))
+
+    app._poll_events()
+
+    assert shown == [result]
+    assert app.events.empty()
+    assert app.report_events.empty()
+    assert app.latest_output_dir == output_dir
+    assert app.status_text.value == "Prüflauf läuft"
+
+
+def test_one_poll_drains_only_configured_activity_batch(tmp_path: Path) -> None:
+    app = _runtime_app(tmp_path)
+    event_count = gui.ACTIVITY_DRAIN_BATCH_SIZE + 3
+    moment = datetime(2026, 10, 21, tzinfo=UTC)
+    for sequence in range(event_count):
+        app.activity_events.put_nowait(
+            gui._activity_event_from_progress(
+                f"Prueflauf Schritt {sequence} gestartet.",
+                recorded_at=moment,
+            )
+        )
+
+    app._poll_events()
+
+    assert len(app.activity_tree.inserted) == gui.ACTIVITY_DRAIN_BATCH_SIZE
+    assert app.activity_events.qsize() == 3
+    assert app.root.after_calls
+
+
 def test_error_event_is_explained_without_closing_window(
     tmp_path: Path,
     monkeypatch: Any,
@@ -1220,6 +1553,41 @@ def test_error_event_is_explained_without_closing_window(
     assert errors == ["MonitorError: keine Antwort"]
     assert "fehlgeschlagen" in app.status_text.value
     assert app.root.destroy_count == 0
+
+
+def test_terminal_error_survives_activity_and_report_flood(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _runtime_app(tmp_path)
+    app.running = True
+    output_dir = tmp_path / "reports" / "teilstand"
+    output_dir.mkdir(parents=True)
+    for sequence in range(gui.MAX_PENDING_ACTIVITY_EVENTS + 25):
+        app._publish_progress(f"Peer-Suche Ziel: Runde {sequence} gestartet.")
+    for result_count in range(10_000):
+        app._publish_reports_ready(output_dir, result_count)
+    app.events.put_nowait(("error", "MonitorError: keine Peer-Quelle erreichbar"))
+    errors: list[str] = []
+    monkeypatch.setattr(
+        gui.messagebox,
+        "showerror",
+        lambda _title, message, **_kwargs: errors.append(message),
+        raising=False,
+    )
+
+    app._poll_events()
+
+    assert app.running is False
+    assert errors == ["MonitorError: keine Peer-Quelle erreichbar"]
+    assert "Fehler" in app.status_text.value
+    assert "Teilergebnisse" in app.status_text.value
+    assert app.report_events.empty()
+    assert app.events.empty()
+    assert len(app.activity_tree.inserted) == gui.ACTIVITY_DRAIN_BATCH_SIZE
+    assert app.activity_events.qsize() == (
+        gui.MAX_PENDING_ACTIVITY_EVENTS - gui.ACTIVITY_DRAIN_BATCH_SIZE
+    )
 
 
 def test_error_event_closes_silently_after_confirmed_window_close(

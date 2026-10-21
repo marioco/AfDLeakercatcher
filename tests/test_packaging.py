@@ -260,7 +260,7 @@ def test_version_sources_tag_checks_and_direct_download_are_consistent() -> None
     project = tomllib.loads(_text("pyproject.toml"))
     version = project["project"]["version"]
 
-    assert version == _app_version() == "0.3.5"
+    assert version == _app_version() == "0.3.6"
     assert f"Windows-Download \N{EN DASH} Version {version}" in readme
     release_path = f"releases/download/afdleakercatcher-v{version}/"
     assert readme.count(release_path) >= 2
