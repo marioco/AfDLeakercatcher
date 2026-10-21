@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bittorrent-beobachter"
-version = "0.3.6"
+version = "0.3.7"
 description = "Inhaltsfreie Verfügbarkeitsprüfung ausdrücklich konfigurierter BitTorrent-Schwärme"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -37,6 +37,9 @@ dev = [
 
 [tool.setuptools]
 packages = ["bittorrent_beobachter"]
+
+[tool.setuptools.package-data]
+bittorrent_beobachter = ["assets/*.png"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

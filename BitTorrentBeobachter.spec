@@ -38,6 +38,9 @@ if (
 
 PROJECT_ROOT = Path(SPECPATH)
 THIRD_PARTY_LICENSES_DIR = PROJECT_ROOT / "THIRD_PARTY_LICENSES"
+RESULT_ILLUSTRATION_PATH = (
+    PROJECT_ROOT / "bittorrent_beobachter" / "assets" / "leaker_chase.png"
+)
 
 analysis = Analysis(
     [str(PROJECT_ROOT / "164_bittorrent_beobachter.py")],
@@ -49,6 +52,10 @@ analysis = Analysis(
         (str(PROJECT_ROOT / "THIRD_PARTY_NOTICES.md"), "."),
         (str(PROJECT_ROOT / "requirements-build.lock"), "."),
         (str(THIRD_PARTY_LICENSES_DIR), "THIRD_PARTY_LICENSES"),
+        (
+            str(RESULT_ILLUSTRATION_PATH),
+            "bittorrent_beobachter/assets",
+        ),
     ],
     hiddenimports=[],
     hookspath=[],

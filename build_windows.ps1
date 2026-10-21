@@ -4,6 +4,8 @@ $ErrorActionPreference = "Stop"
 $ExpectedPythonVersion = "3.14.8"
 $ExpectedTclTkVersion = "9.0.4"
 $ExpectedOpenSslVersion = "OpenSSL 3.5.9 29 Sep 2026"
+$ResultIllustrationRelativePath = "_internal/bittorrent_beobachter/assets/leaker_chase.png"
+$ExpectedResultIllustrationHash = "9ea29e8488c1459390c528c3caebab9fc38e3b264439d721fce6b1c59a721902"
 $ThirdPartyLicenseNames = @(
     "Python-3.14.8.txt",
     "Tcl-9.0.4.txt",
@@ -268,6 +270,16 @@ if (-not (Test-Path -LiteralPath $PackageDirectory -PathType Container)) {
     throw "PyInstaller hat das erwartete Paketverzeichnis nicht erstellt: $PackageDirectory"
 }
 Assert-BundledRuntimeInventory -PackageDirectory $PackageDirectory
+$ResultIllustration = Join-Path $PackageDirectory $ResultIllustrationRelativePath
+if (-not (Test-Path -LiteralPath $ResultIllustration -PathType Leaf)) {
+    throw "Das dekorative Ergebnisbild fehlt im Paket: $ResultIllustration"
+}
+$ActualResultIllustrationHash = (
+    Get-FileHash -Algorithm SHA256 -LiteralPath $ResultIllustration
+).Hash.ToLowerInvariant()
+if ($ActualResultIllustrationHash -ne $ExpectedResultIllustrationHash) {
+    throw "Die Prüfsumme des dekorativen Ergebnisbilds stimmt nicht."
+}
 $Executable = Join-Path $PackageDirectory "AfDLeakerCatcher.exe"
 if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) {
     throw "Die gebaute Programmdatei fehlt: $Executable"

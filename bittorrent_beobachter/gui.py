@@ -20,7 +20,9 @@ from tkinter import (
     RIGHT,
     BooleanVar,
     Canvas,
+    PhotoImage,
     StringVar,
+    TclError,
     Tk,
     Toplevel,
     X,
@@ -51,6 +53,12 @@ MAX_GUI_ACTIVITY_ROWS = 120
 MAX_PENDING_ACTIVITY_EVENTS = 240
 ACTIVITY_DRAIN_BATCH_SIZE = 40
 MAX_ACTIVITY_DETAIL_LENGTH = 320
+TARGET_TABLE_ROWS = 2
+ACTIVITY_TABLE_ROWS = 4
+RESULT_TABLE_ROWS = 4
+RESULT_ILLUSTRATION_MIN_VIEWPORT_WIDTH = 940
+RESULT_ILLUSTRATION_SUBSAMPLE = 7
+RESULT_ILLUSTRATION_PATH = Path(__file__).resolve().parent / "assets" / "leaker_chase.png"
 DESIRED_WINDOW_WIDTH = 1040
 DESIRED_WINDOW_HEIGHT = 700
 DESIRED_MIN_WINDOW_WIDTH = 880
@@ -254,6 +262,35 @@ def _activity_view_is_near_bottom(view: object, *, has_rows: bool) -> bool:
         return False
 
 
+def _should_show_result_illustration(viewport_width: int) -> bool:
+    """Zeigt die Dekoration nur, wenn sie der Ergebnistabelle keinen Platz nimmt."""
+
+    if (
+        isinstance(viewport_width, bool)
+        or not isinstance(viewport_width, int)
+        or viewport_width <= 0
+    ):
+        raise ValueError("Die Fensterbreite muss eine positive Ganzzahl sein.")
+    return viewport_width >= RESULT_ILLUSTRATION_MIN_VIEWPORT_WIDTH
+
+
+def _load_result_illustration(root: Tk) -> PhotoImage | None:
+    """Laedt die optionale Dekoration; ein Fehler darf die GUI nicht blockieren."""
+
+    try:
+        source = PhotoImage(master=root, file=str(RESULT_ILLUSTRATION_PATH))
+        return source.subsample(
+            RESULT_ILLUSTRATION_SUBSAMPLE,
+            RESULT_ILLUSTRATION_SUBSAMPLE,
+        )
+    except (OSError, TclError) as exc:
+        logging.getLogger("bittorrent_beobachter").warning(
+            "Dekoratives Ergebnisbild konnte nicht geladen werden: %s",
+            exc,
+        )
+        return None
+
+
 def _fit_window_to_screen(
     screen_width: int,
     screen_height: int,
@@ -373,13 +410,6 @@ def _configure_cyberpunk_theme(root: Tk) -> ttk.Style:
         foreground=colors["text"],
         font=("TkDefaultFont", 10, "bold"),
     )
-    style.configure("Notice.TLabelframe", bordercolor=colors["warning"])
-    style.configure(
-        "Notice.TLabelframe.Label",
-        background=colors["surface"],
-        foreground=colors["warning"],
-    )
-
     style.configure(
         "TButton",
         background=colors["surface_raised"],
@@ -756,6 +786,8 @@ class ObserverApp:
         self.close_requested = False
         self.latest_output_dir: Path | None = None
         self._run_output_dir: Path | None = None
+        self._result_illustration_image: PhotoImage | None = None
+        self._result_illustration_panel: ttk.Frame | None = None
 
         root.title(f"{APP_NAME} {VERSION}")
         _configure_cyberpunk_theme(root)
@@ -829,7 +861,7 @@ class ObserverApp:
         main_scrollbar.pack(side=RIGHT, fill="y")
         canvas.pack(side=LEFT, fill=BOTH, expand=True)
 
-        outer = ttk.Frame(canvas, padding=16)
+        outer = ttk.Frame(canvas, padding=10)
         content_window = canvas.create_window((0, 0), window=outer, anchor="nw")
         self._content_canvas = canvas
         self._responsive_labels: list[ttk.Label] = []
@@ -846,12 +878,13 @@ class ObserverApp:
             wrap_length = max(MIN_TEXT_WRAP_LENGTH, event.width - 64)
             for label in self._responsive_labels:
                 label.configure(wraplength=wrap_length)
+            self._update_result_illustration_visibility(event.width)
 
         outer.bind("<Configure>", update_scroll_region)
         canvas.bind("<Configure>", resize_content)
 
-        hero = ttk.Frame(outer, style="Hero.TFrame", padding=(18, 14))
-        hero.pack(fill=X, pady=(0, 12))
+        hero = ttk.Frame(outer, style="Hero.TFrame", padding=(12, 8))
+        hero.pack(fill=X, pady=(0, 6))
         ttk.Label(
             hero,
             text=f"Netzwerkprüfung  ·  Version {VERSION}",
@@ -870,53 +903,21 @@ class ObserverApp:
             )
         ).pack(anchor="w", fill=X)
 
-        notice = ttk.LabelFrame(
-            outer,
-            text="Wichtige Aussagegrenze",
-            padding=12,
-            style="Notice.TLabelframe",
-        )
-        notice.pack(fill=X, pady=(0, 12))
-        remember_label(
-            ttk.Label(
-                notice,
-                text=(
-                    "Ein positiver Befund bedeutet: Der Endpunkt bestätigte den Infohash, "
-                    "meldete verfügbare Teile und erlaubte während der einminütigen Verbindung "
-                    "das Stellen von Datenanfragen. Es werden keine Datenblöcke angefordert. "
-                    "Der Befund identifiziert keine Person und beweist keinen tatsächlichen "
-                    "Upload oder eine Straftat. Jede Anzeige muss vor dem Versand geprüft werden."
-                ),
-                style="Panel.TLabel",
-                wraplength=930,
-            )
-        ).pack(anchor="w", fill=X)
-
         target_box = ttk.LabelFrame(
             outer,
             text="Ziele für manuelle Prüfläufe",
-            padding=12,
+            padding=8,
         )
-        target_box.pack(fill=X, pady=(0, 12))
-        remember_label(
-            ttk.Label(
-                target_box,
-                text=(
-                    "Die beiden Voreinstellungen bestätigen keinen Inhalt. Ein Prüflauf "
-                    "beginnt erst nach „Jetzt prüfen“ und Ihrer ausdrücklichen Bestätigung."
-                ),
-                style="Muted.Panel.TLabel",
-                wraplength=930,
-            )
-        ).pack(anchor="w", fill=X, pady=(0, 8))
+        target_box.pack(fill=X, pady=(0, 6))
         target_table = ttk.Frame(target_box, style="Panel.TFrame")
         target_table.pack(fill=X, expand=True)
         target_table.columnconfigure(0, weight=1)
+        target_table.rowconfigure(0, weight=1)
         self.target_tree = ttk.Treeview(
             target_table,
             columns=("label", "hash"),
             show="headings",
-            height=4,
+            height=TARGET_TABLE_ROWS,
             selectmode="browse",
         )
         self.target_tree.heading("label", text="Bezeichnung")
@@ -928,8 +929,17 @@ class ObserverApp:
             orient="horizontal",
             command=self.target_tree.xview,
         )
-        self.target_tree.configure(xscrollcommand=target_scrollbar.set)
+        target_vertical_scrollbar = ttk.Scrollbar(
+            target_table,
+            orient="vertical",
+            command=self.target_tree.yview,
+        )
+        self.target_tree.configure(
+            xscrollcommand=target_scrollbar.set,
+            yscrollcommand=target_vertical_scrollbar.set,
+        )
         self.target_tree.grid(row=0, column=0, sticky="nsew")
+        target_vertical_scrollbar.grid(row=0, column=1, sticky="ns")
         target_scrollbar.grid(row=1, column=0, sticky="ew")
         target_buttons = ttk.Frame(target_box, style="Panel.TFrame")
         target_buttons.pack(fill=X, pady=(10, 0))
@@ -951,39 +961,19 @@ class ObserverApp:
             command=self._edit_settings,
         )
         self.settings_button.pack(side=LEFT)
-        privacy_box = ttk.LabelFrame(
-            outer,
-            text="Optionale öffentliche Netzauskunft",
-            padding=12,
-        )
-        privacy_box.pack(fill=X, pady=(0, 12))
         self.enrichment_enabled = BooleanVar(value=self.config.enrichment.enabled)
         self.enrichment_checkbox = ttk.Checkbutton(
-            privacy_box,
-            text="Öffentliche Netzauskunft für bestätigte IP-Adressen aktivieren",
+            target_box,
+            text="Optionale Netzauskunft für bestätigte IP-Adressen (RDAP / RIPEstat)",
             variable=self.enrichment_enabled,
             command=self._toggle_network_enrichment,
         )
-        self.enrichment_checkbox.pack(anchor="w")
-        remember_label(
-            ttk.Label(
-                privacy_box,
-                text=(
-                    "Bestätigte IP-Adressen werden an stat.ripe.net, rdap.org und das von "
-                    "rdap.org bestimmte Regionalregister gesendet. Standardmäßig ist dies "
-                    "aus. Bekannte VPN-IP-Bereiche werden zuerst offline erkannt und nicht "
-                    "extern abgefragt. Regionalregister wie RIPE, ARIN, APNIC, LACNIC oder "
-                    "AFRINIC können Anfragen protokollieren."
-                ),
-                style="Muted.Panel.TLabel",
-                wraplength=930,
-            )
-        ).pack(anchor="w", fill=X, pady=(4, 0))
+        self.enrichment_checkbox.pack(anchor="w", pady=(6, 0))
 
         action_bar = ttk.Frame(outer)
-        action_bar.pack(fill=X, pady=(0, 10))
+        action_bar.pack(fill=X, pady=(0, 6))
         action_buttons = ttk.Frame(action_bar)
-        action_buttons.pack(fill=X)
+        action_buttons.pack(side=LEFT)
         self.scan_button = ttk.Button(
             action_buttons,
             text="Jetzt prüfen",
@@ -1012,7 +1002,7 @@ class ObserverApp:
             length=210,
             style="Cyber.Horizontal.TProgressbar",
         )
-        self.progress.pack(anchor="w", pady=(8, 0))
+        self.progress.pack(side=RIGHT, padx=(12, 0))
         self.config_controls = (
             self.add_target_button,
             self.remove_target_button,
@@ -1023,14 +1013,14 @@ class ObserverApp:
         status_panel = ttk.Frame(
             outer,
             style="StatusPanel.TFrame",
-            padding=(12, 9),
+            padding=(8, 6),
         )
-        status_panel.pack(fill=X, pady=(0, 12))
+        status_panel.pack(fill=X, pady=(0, 6))
         ttk.Label(
             status_panel,
             text="Status",
             style="StatusCaption.TLabel",
-        ).pack(anchor="w")
+        ).pack(side=LEFT)
         self.status_text = StringVar(value="Bereit. Fügen Sie einen Magnet-Link hinzu.")
         self.status_label = remember_label(
             ttk.Label(
@@ -1040,22 +1030,14 @@ class ObserverApp:
                 wraplength=930,
             )
         )
-        self.status_label.pack(anchor="w", fill=X, pady=(2, 0))
+        self.status_label.pack(side=LEFT, fill=X, expand=True, padx=(8, 0))
 
-        activity_box = ttk.LabelFrame(outer, text="Technische Laufaktivität", padding=12)
-        activity_box.pack(fill=X, pady=(0, 12))
-        remember_label(
-            ttk.Label(
-                activity_box,
-                text=(
-                    "Echte Statusmeldungen aus Endpunktsuche, Direktprüfung und "
-                    "Ergebnisspeicherung. Keine Animation oder erfundenen Verbindungsdaten; "
-                    "die UTC-Zeit wird beim Eingang erfasst."
-                ),
-                style="Muted.Panel.TLabel",
-                wraplength=930,
-            )
-        ).pack(anchor="w", fill=X, pady=(0, 7))
+        activity_box = ttk.LabelFrame(
+            outer,
+            text="Technische Laufaktivität · echte Meldungen",
+            padding=8,
+        )
+        activity_box.pack(fill=X, pady=(0, 6))
         activity_table = ttk.Frame(activity_box, style="Panel.TFrame")
         activity_table.pack(fill=X, expand=True)
         activity_table.columnconfigure(0, weight=1)
@@ -1064,7 +1046,7 @@ class ObserverApp:
             activity_table,
             columns=("time", "context", "operation", "status", "detail"),
             show="headings",
-            height=6,
+            height=ACTIVITY_TABLE_ROWS,
             selectmode="browse",
             style="Activity.Treeview",
         )
@@ -1110,7 +1092,7 @@ class ObserverApp:
         activity_vertical_scrollbar.grid(row=0, column=1, sticky="ns")
         activity_horizontal_scrollbar.grid(row=1, column=0, sticky="ew")
 
-        result_box = ttk.LabelFrame(outer, text="Letzter Prüflauf", padding=12)
+        result_box = ttk.LabelFrame(outer, text="Letzter Prüflauf", padding=8)
         result_box.pack(fill=BOTH, expand=True)
         result_box.columnconfigure(0, weight=1)
         result_box.rowconfigure(0, weight=1)
@@ -1118,6 +1100,7 @@ class ObserverApp:
             result_box,
             columns=("time", "target", "endpoint", "status", "network", "class"),
             show="headings",
+            height=RESULT_TABLE_ROWS,
         )
         headings = {
             "time": "Zeit (UTC)",
@@ -1166,22 +1149,40 @@ class ObserverApp:
         vertical_scrollbar.grid(row=0, column=1, sticky="ns")
         horizontal_scrollbar.grid(row=1, column=0, sticky="ew")
 
-        remember_label(
+        self._result_illustration_image = _load_result_illustration(self.root)
+        if self._result_illustration_image is not None:
+            illustration_panel = ttk.Frame(result_box, style="Panel.TFrame", padding=(8, 4))
             ttk.Label(
-                outer,
+                illustration_panel,
+                image=self._result_illustration_image,
+                style="Panel.TLabel",
+            ).pack()
+            illustration_panel.grid(
+                row=0,
+                column=2,
+                rowspan=2,
+                sticky="se",
+                padx=(10, 0),
+            )
+            self._result_illustration_panel = illustration_panel
+
+        result_footer = remember_label(
+            ttk.Label(
+                result_box,
                 text=(
                     "Keine automatische Anzeige · Kein automatischer E-Mail-Versand · "
                     "Bekannte VPN-Endpunkte werden gekennzeichnet und gesondert berichtet"
                 ),
-                style="Muted.TLabel",
+                style="Muted.Panel.TLabel",
             )
-        ).pack(anchor="w", fill=X, pady=(10, 0))
+        )
+        result_footer.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         self.root.bind("<MouseWheel>", self._scroll_main_view, add="+")
         self.root.bind("<Button-4>", self._scroll_main_view, add="+")
         self.root.bind("<Button-5>", self._scroll_main_view, add="+")
 
     def _scroll_main_view(self, event: Any) -> str | None:
-        if event.widget in (self.result_tree, self.activity_tree):
+        if event.widget in (self.target_tree, self.result_tree, self.activity_tree):
             return None
         try:
             delta = int(getattr(event, "delta", 0))
@@ -1196,6 +1197,17 @@ class ObserverApp:
             return None
         self._content_canvas.yview_scroll(direction, "units")
         return "break"
+
+    def _update_result_illustration_visibility(self, viewport_width: int) -> None:
+        """Blendet die Dekoration aus, bevor sie Nutzflaeche verdraengt."""
+
+        panel = getattr(self, "_result_illustration_panel", None)
+        if panel is None:
+            return
+        if _should_show_result_illustration(viewport_width):
+            panel.grid()
+        else:
+            panel.grid_remove()
 
     def _set_status(self, message: str, *, state: GUIStatusState) -> None:
         """Aktualisiert Statusinhalt und die dazugehörige, nicht allein farbliche Anzeige."""

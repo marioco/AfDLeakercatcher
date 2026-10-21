@@ -310,6 +310,23 @@ jobs:
           Copy-Item -LiteralPath "requirements-build.lock" `
             -Destination "dist/AfDLeakerCatcher/requirements-build.lock" -Force
           $internalDirectory = "dist/AfDLeakerCatcher/_internal"
+          $resultIllustration = (
+            "dist/AfDLeakerCatcher/_internal/" +
+            "bittorrent_beobachter/assets/leaker_chase.png"
+          )
+          $expectedResultIllustrationHash = (
+            "9ea29e8488c1459390c528c3caebab9fc" +
+            "38e3b264439d721fce6b1c59a721902"
+          )
+          if (-not (Test-Path -LiteralPath $resultIllustration -PathType Leaf)) {
+            throw "Das dekorative Ergebnisbild fehlt im Paket: $resultIllustration"
+          }
+          $actualResultIllustrationHash = (
+            Get-FileHash -Algorithm SHA256 -LiteralPath $resultIllustration
+          ).Hash.ToLowerInvariant()
+          if ($actualResultIllustrationHash -ne $expectedResultIllustrationHash) {
+            throw "Die Prüfsumme des dekorativen Ergebnisbilds stimmt nicht."
+          }
           $cryptoLibraries = @(
             Get-ChildItem -LiteralPath $internalDirectory -File |
               Where-Object { $_.Name -like "libcrypto-3*.dll" }

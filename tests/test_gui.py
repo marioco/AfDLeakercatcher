@@ -50,11 +50,16 @@ def _install_headless_tkinter() -> None:
         class _TkBase:
             pass
 
+        class _TclError(Exception):
+            pass
+
         module.BOTH = "both"
         module.END = "end"
         module.LEFT = "left"
         module.RIGHT = "right"
         module.Canvas = _TkBase
+        module.PhotoImage = _TkBase
+        module.TclError = _TclError
         module.X = "x"
         module.BooleanVar = object
         module.StringVar = object
@@ -92,6 +97,8 @@ class _WidgetDouble:
         self.scroll_calls: list[tuple[int, str]] = []
         self.yview_value: tuple[float, float] = (0.0, 1.0)
         self.yview_moveto_calls: list[float] = []
+        self.grid_calls = 0
+        self.grid_remove_calls = 0
 
     def get_children(self) -> tuple[str, ...]:
         return tuple(str(index) for index, _item in enumerate(self.inserted))
@@ -134,6 +141,12 @@ class _WidgetDouble:
 
     def yview_moveto(self, fraction: float) -> None:
         self.yview_moveto_calls.append(fraction)
+
+    def grid(self, **_kwargs: Any) -> None:
+        self.grid_calls += 1
+
+    def grid_remove(self) -> None:
+        self.grid_remove_calls += 1
 
 
 class _RootDouble:
@@ -232,6 +245,7 @@ def _runtime_app(tmp_path: Path, config: AppConfig | None = None) -> Any:
     app.cancel_button = _WidgetDouble()
     app.open_button = _WidgetDouble()
     app.progress = _WidgetDouble()
+    app.target_tree = _WidgetDouble()
     app.result_tree = _WidgetDouble()
     app.activity_tree = _WidgetDouble()
     app.status_text = _WidgetDouble()
@@ -385,6 +399,82 @@ def test_main_window_keeps_normal_desktop_dimensions() -> None:
 
     assert root.geometry_value == "1040x700"
     assert root.minimum_size == (880, 600)
+
+
+def test_main_window_uses_compact_row_counts_and_has_no_statement_boundary() -> None:
+    gui_source = Path(gui.__file__).read_text(encoding="utf-8")
+
+    assert gui.TARGET_TABLE_ROWS == 2
+    assert gui.ACTIVITY_TABLE_ROWS == 4
+    assert gui.RESULT_TABLE_ROWS == 4
+    assert "Wichtige Aussagegrenze" not in gui_source
+    assert "Notice.TLabelframe" not in gui_source
+
+
+def test_result_illustration_loads_packaged_image_and_subsamples(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "leaker_chase.png"
+    scaled = object()
+    calls: list[tuple[object, str] | tuple[int, int]] = []
+
+    class SourceImage:
+        def subsample(self, x_factor: int, y_factor: int) -> object:
+            calls.append((x_factor, y_factor))
+            return scaled
+
+    def fake_photo_image(*, master: object, file: str) -> SourceImage:
+        calls.append((master, file))
+        return SourceImage()
+
+    root = object()
+    monkeypatch.setattr(gui, "RESULT_ILLUSTRATION_PATH", source_path)
+    monkeypatch.setattr(gui, "PhotoImage", fake_photo_image)
+
+    assert gui._load_result_illustration(root) is scaled
+    assert calls == [
+        (root, str(source_path)),
+        (
+            gui.RESULT_ILLUSTRATION_SUBSAMPLE,
+            gui.RESULT_ILLUSTRATION_SUBSAMPLE,
+        ),
+    ]
+
+
+def test_result_illustration_load_failure_is_logged_and_nonfatal(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def fail_photo_image(**_kwargs: object) -> object:
+        raise gui.TclError("PNG unlesbar")
+
+    monkeypatch.setattr(gui, "PhotoImage", fail_photo_image)
+
+    with caplog.at_level("WARNING", logger="bittorrent_beobachter"):
+        assert gui._load_result_illustration(object()) is None
+
+    assert "Dekoratives Ergebnisbild konnte nicht geladen werden" in caplog.text
+
+
+def test_result_illustration_only_uses_wide_viewports(tmp_path: Path) -> None:
+    assert gui._should_show_result_illustration(gui.RESULT_ILLUSTRATION_MIN_VIEWPORT_WIDTH) is True
+    assert (
+        gui._should_show_result_illustration(gui.RESULT_ILLUSTRATION_MIN_VIEWPORT_WIDTH - 1)
+        is False
+    )
+    for invalid in (True, 0, -1):
+        with pytest.raises(ValueError, match="Fensterbreite"):
+            gui._should_show_result_illustration(invalid)
+
+    app = _runtime_app(tmp_path)
+    panel = _WidgetDouble()
+    app._result_illustration_panel = panel
+    app._update_result_illustration_visibility(gui.RESULT_ILLUSTRATION_MIN_VIEWPORT_WIDTH - 1)
+    app._update_result_illustration_visibility(gui.RESULT_ILLUSTRATION_MIN_VIEWPORT_WIDTH)
+
+    assert panel.grid_remove_calls == 1
+    assert panel.grid_calls == 1
 
 
 def test_cyberpunk_theme_configures_cross_platform_focus_and_disabled_states(
@@ -765,11 +855,15 @@ def test_main_mousewheel_scrolls_page_but_not_result_table(tmp_path: Path) -> No
     activity_table_event = app._scroll_main_view(
         types.SimpleNamespace(widget=app.activity_tree, delta=-120, num=0)
     )
+    target_table_event = app._scroll_main_view(
+        types.SimpleNamespace(widget=app.target_tree, delta=-120, num=0)
+    )
 
     assert handled == "break"
     assert app._content_canvas.scroll_calls == [(1, "units")]
     assert result_table_event is None
     assert activity_table_event is None
+    assert target_table_event is None
 
 
 def _candidate(*, ipv6: bool = False) -> PeerCandidate:

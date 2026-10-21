@@ -1,10 +1,10 @@
 # AfDLeakerCatcher
 
-## Windows-Download – Version 0.3.6
+## Windows-Download – Version 0.3.7
 
-### [⬇ AfDLeakerCatcher für Windows herunterladen](https://github.com/marioco/AfDLeakercatcher/releases/download/afdleakercatcher-v0.3.6/AfDLeakerCatcher-Windows-x64.zip)
+### [⬇ AfDLeakerCatcher für Windows herunterladen](https://github.com/marioco/AfDLeakercatcher/releases/download/afdleakercatcher-v0.3.7/AfDLeakerCatcher-Windows-x64.zip)
 
-[SHA-256-Prüfsumme zum Download](https://github.com/marioco/AfDLeakercatcher/releases/download/afdleakercatcher-v0.3.6/AfDLeakerCatcher-Windows-x64.zip.sha256)
+[SHA-256-Prüfsumme zum Download](https://github.com/marioco/AfDLeakercatcher/releases/download/afdleakercatcher-v0.3.7/AfDLeakerCatcher-Windows-x64.zip.sha256)
 
 Keine GitHub-Kenntnisse nötig: Auf den Link klicken, die ZIP-Datei **einmal**
 entpacken und anschließend `AfDLeakerCatcher.exe` doppelklicken. Es gibt keinen
@@ -14,7 +14,7 @@ Eine leicht bedienbare, quelloffene Python-Anwendung zur **inhaltsfreien** Prüf
 ausdrücklich konfigurierter BitTorrent-v1-Infohashes. Die Anwendung fordert keine Datei-
 oder Torrent-Metadatenblöcke an, lädt keine davon hoch und verschickt keine Meldung
 automatisch.
-Die kontrastreiche Desktop-Oberfläche verwendet ein zurückhaltendes dunkles Design mit
+Die kompakte Desktop-Oberfläche verwendet ein zurückhaltendes dunkles Design mit
 Klartext-Statusmeldungen, sichtbaren Tastaturfokussen und responsiven Tabellen. Eine
 kleine, begrenzte Live-Tabelle zeigt ausschließlich echte technische Laufmeldungen aus
 Peer-Suche, Direktprüfung, Evidenzspeicherung und Berichtserzeugung.
@@ -297,7 +297,7 @@ gh attestation verify AfDLeakerCatcher-Windows-x64.zip -R marioco/AfDLeakercatch
 
 Ein Push auf `main` erzeugt nach erfolgreichem Build ein GitHub-Release, sofern für die
 eingetragene Version noch keines existiert. Dasselbe gilt für einen exakt zur
-Paket- und App-Version passenden Tag wie `afdleakercatcher-v0.3.6`. Ein bereits
+Paket- und App-Version passenden Tag wie `afdleakercatcher-v0.3.7`. Ein bereits
 vorhandenes Release wird nicht überschrieben, sondern auf Ziel-Commit, Entwurfsstatus,
 exakt erwartete Assets und ZIP-Prüfsumme kontrolliert. Pull Requests und manuell
 gestartete Läufe stellen nur Actions-Artefakte bereit.

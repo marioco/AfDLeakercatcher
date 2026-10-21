@@ -13,6 +13,8 @@ EXE_NAME = f"{PRODUCT_NAME}.exe"
 PACKAGE_DIRECTORY = f"dist/{PRODUCT_NAME}"
 PDF_NAME = "Cybercrime-E-Mail-Kontakte_BKA-und-LKA_Deutschland_Stand-2026-10-20.pdf"
 PDF_SHA256 = "75585bb562b705f5644734299f78d1b26f1bd083a4acd962d21704041feb2f12"
+RESULT_ILLUSTRATION = "bittorrent_beobachter/assets/leaker_chase.png"
+RESULT_ILLUSTRATION_SHA256 = "9ea29e8488c1459390c528c3caebab9fc38e3b264439d721fce6b1c59a721902"
 ARCHIVE_NAME = f"{PRODUCT_NAME}-Windows-x64.zip"
 CHECKSUM_NAME = f"{ARCHIVE_NAME}.sha256"
 RELEASE_ARTIFACT_NAME = f"{PRODUCT_NAME}-Windows-x64-release"
@@ -90,6 +92,28 @@ def test_reference_pdf_is_the_reviewed_document() -> None:
 
     assert payload.startswith(b"%PDF-1.4")
     assert hashlib.sha256(payload).hexdigest() == PDF_SHA256
+
+
+def test_result_illustration_is_exact_and_in_every_package_path() -> None:
+    payload = (PROJECT_ROOT / RESULT_ILLUSTRATION).read_bytes()
+    spec = _text("BitTorrentBeobachter.spec")
+    workflow = _text(".github/workflows/build.yml")
+    local_build = _text("build_windows.ps1")
+    project = tomllib.loads(_text("pyproject.toml"))
+
+    assert payload.startswith(b"\x89PNG\r\n\x1a\n")
+    assert payload[12:16] == b"IHDR"
+    assert int.from_bytes(payload[16:20], "big") == 1536
+    assert int.from_bytes(payload[20:24], "big") == 1024
+    assert hashlib.sha256(payload).hexdigest() == RESULT_ILLUSTRATION_SHA256
+    assert 'PROJECT_ROOT / "bittorrent_beobachter" / "assets" / "leaker_chase.png"' in spec
+    assert '"bittorrent_beobachter/assets"' in spec
+    assert project["tool"]["setuptools"]["package-data"]["bittorrent_beobachter"] == [
+        "assets/*.png"
+    ]
+    for build_source in (workflow, local_build):
+        assert "bittorrent_beobachter/assets/leaker_chase.png" in build_source
+        assert RESULT_ILLUSTRATION_SHA256 in build_source.replace('" +\n            "', "")
 
 
 def test_complete_third_party_license_texts_are_present_unchanged() -> None:
@@ -260,7 +284,7 @@ def test_version_sources_tag_checks_and_direct_download_are_consistent() -> None
     project = tomllib.loads(_text("pyproject.toml"))
     version = project["project"]["version"]
 
-    assert version == _app_version() == "0.3.6"
+    assert version == _app_version() == "0.3.7"
     assert f"Windows-Download \N{EN DASH} Version {version}" in readme
     release_path = f"releases/download/afdleakercatcher-v{version}/"
     assert readme.count(release_path) >= 2
