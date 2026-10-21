@@ -16,7 +16,6 @@ from bittorrent_beobachter.models import HandshakeResult, PeerCandidate, ScanRes
 from bittorrent_beobachter.peer import (
     HANDSHAKE_LENGTH,
     INTERESTED_MESSAGE,
-    MAX_OBSERVATION_MESSAGES,
     MAX_PEER_MESSAGE_LENGTH,
     PROTOCOL_NAME,
     PeerHandshakeError,
@@ -268,13 +267,15 @@ class PeerVerifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_loop.incoming, bytearray())
 
     async def test_keepalive_flood_stops_at_bounded_message_limit(self) -> None:
-        wire = b"\x00\x00\x00\x00" * (MAX_OBSERVATION_MESSAGES + 1)
+        message_limit = peer_module.MAX_CONTROL_EVENTS
+        wire = b"\x00\x00\x00\x00" * (message_limit + 1)
 
-        result, _fake_socket, fake_loop = await run_verifier(
-            wire,
-            close_when_empty=False,
-            observation_seconds=1.0,
-        )
+        with patch.object(peer_module, "MAX_OBSERVATION_MESSAGES", message_limit):
+            result, _fake_socket, fake_loop = await run_verifier(
+                wire,
+                close_when_empty=False,
+                observation_seconds=1.0,
+            )
 
         observation = result.availability
         assert observation is not None
@@ -282,7 +283,7 @@ class PeerVerifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(observation.completed_full_window)
         self.assertEqual(observation.termination_reason, "message_limit")
         self.assertIn("Nachrichten", observation.error or "")
-        self.assertEqual(observation.messages_received, MAX_OBSERVATION_MESSAGES + 1)
+        self.assertEqual(observation.messages_received, message_limit + 1)
         self.assertEqual(len(observation.control_events), peer_module.MAX_CONTROL_EVENTS)
         self.assertEqual(fake_loop.incoming, bytearray())
 
