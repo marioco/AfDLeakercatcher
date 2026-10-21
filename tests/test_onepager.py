@@ -35,16 +35,19 @@ def test_overview_is_exactly_two_deterministic_pages(tmp_path: Path) -> None:
     generate_overview(first)
     generate_overview(second)
 
-    payload = first.read_bytes()
-    assert payload == second.read_bytes() == COMMITTED_PDF.read_bytes()
-    assert payload.startswith(b"%PDF-1.4")
-    assert hashlib.sha256(payload).hexdigest() == EXPECTED_PDF_SHA256
-    assert len(re.findall(rb"/Type /Page(?!s)", payload)) == 2
-    assert b"/Count 2" in payload
-    assert payload.count(b"/MediaBox [ 0 0 841.8898 595.2756 ]") >= 1
-    assert payload.count(b"/Subtype /Image") == 2
-    assert b"/JavaScript" not in payload
-    assert len(payload) < 1_000_000
+    generated_payload = first.read_bytes()
+    committed_payload = COMMITTED_PDF.read_bytes()
+    assert generated_payload == second.read_bytes()
+    assert hashlib.sha256(committed_payload).hexdigest() == EXPECTED_PDF_SHA256
+
+    for payload in (generated_payload, committed_payload):
+        assert payload.startswith(b"%PDF-1.4")
+        assert len(re.findall(rb"/Type /Page(?!s)", payload)) == 2
+        assert b"/Count 2" in payload
+        assert payload.count(b"/MediaBox [ 0 0 841.8898 595.2756 ]") >= 1
+        assert payload.count(b"/Subtype /Image") == 2
+        assert b"/JavaScript" not in payload
+        assert len(payload) < 1_000_000
 
 
 def test_overview_uses_the_exact_supplied_screenshots() -> None:
