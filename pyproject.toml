@@ -11,7 +11,7 @@ requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "AfDLeakerCatcher contributors" }]
 dependencies = [
-    "reportlab==4.5.1",
+    "reportlab==5.1.0",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
